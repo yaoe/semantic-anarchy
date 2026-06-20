@@ -1,0 +1,159 @@
+# Semantic Anarchy — chaos by design
+
+> **Promptless image generation.** A faithful, hackable implementation of the
+> early Eden.art / Abraham **"Semantic Anarchy: Chaos by design"** method — now
+> running on **both Stable Diffusion 1.5 and SDXL** behind one `--backend` flag.
+
+Normal text-to-image runs `text → CLIP text encoder → conditioning → UNet → image`.
+The deck's move (slide 9): **X out the text encoder. "There is no prompt."**
+
+```
+   prompts.txt ──▶ CLIP text encoder ──▶ harvest conditioning c   (used ONCE, to mine the corpus)
+                                              │
+                                              ▼
+                          learn a distribution p(c)  ──────────┐
+                                              │                │  sample c ~ p(c)
+        ✗ CLIP text encoder ✗  (bypassed at generation time)   │  drift it (temperature / sampler)
+                                              ▼                ◀┘
+                       UNet(prompt_embeds = c)  ──▶  image      (no linguistics: pure AI aesthetic)
+```
+
+<p align="center">
+  <img src="assets/marginals_rug.png" width="46%" alt="sparse marginals (few samples)">
+  <img src="assets/marginals_hist.png" width="46%" alt="dense marginals (many samples)">
+  <br><em>The mined cloud as an independent Gaussian per coordinate (slides 6–7):
+  sparse "rug" vs dense histogram.</em>
+</p>
+
+## The idea
+
+1. **Mine** — encode a wide corpus of ~1000 "good" prompts once and harvest their
+   conditioning tensor(s). Learn that cloud's distribution.
+2. **Sample & drift** — draw brand-new conditioning straight from the distribution
+   and decode it. A `--temperature` knob and a `--sampler` choice control *where*
+   you draw from (see below). The text encoder is never touched at generation time.
+3. **Select / evolve** — keep what scores well ("aesthetic resonance"), and evolve
+   the distribution into personalized branches.
+
+## One method, two models — `--backend {sd15, sdxl}`
+
+The whole pipeline is model-agnostic once a model is described by its **named
+conditioning tensors**. A small [`Backend`](semantic_anarchy/backend.py)
+abstraction (`encode → fit → sample → generate`) makes the *identical* drift /
+sweep / evolution logic run on either model — flip only `--backend` (+ the right
+`--model`/`--ckpt`):
+
+| backend | conditioning tensors | pipeline (stock diffusers) | default knobs |
+|--------|----------------------|----------------------------|---------------|
+| `sd15` | `embeds` `(77, 768)` | `StableDiffusionPipeline` | `--steps 30 --guidance 7.5` |
+| `sdxl` | `prompt_embeds` `(77, 2048)` + `pooled` `(1280)` | `StableDiffusionXLPipeline` | turbo: `--steps 1 --guidance 0`; base: `--steps 30 --guidance 7` |
+
+No SAE, no hooks, no forked diffusers — both backends use **stock** pipelines'
+`prompt_embeds` / `pooled_prompt_embeds` arguments.
+
+## The knobs
+
+**`--temperature`** scales the whole deviation from the corpus mean.
+`c = mean + temperature · deviation`. Low → near the bland, typical center; high →
+out into the less-typical tails (chaos by design).
+
+**`--sampler`** chooses *where on the anarchy ↔ coherence axis* a sample is drawn:
+
+| sampler | what it does | interpolation vs extrapolation |
+|---------|--------------|-------------------------------|
+| `diagonal` | independent per-coordinate Gaussian (the deck's original model) | raw, off-manifold |
+| `pca` | draw within the low-rank corpus subspace (real axes of variation) | **`temperature > 1` extrapolates coherently OUTSIDE the corpus hull** |
+| `blend --coherence λ` | interpolate the diagonal & PCA covariances (`λ=1` pca, `λ=0` diagonal) | dial how far onto the manifold |
+| `hybrid` | SLERP-fuse two real corpus embeddings (concept fusion) | stays inside the hull |
+
+`--components` (top-N principal axes), `--truncation` (typical-set clip),
+`--neg-mode {mean,empty,zeros}` (SDXL CFG negative; `mean` pushes away from the
+average prompt toward the sample) round out the set.
+
+## Install
+
+Python **3.12** (torch has no 3.14 wheels; 3.13 lags).
+
+```bash
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt        # core: math, plots, evolution, demo, tests
+# full tier (render real images, either backend, stock diffusers):
+pip install torch diffusers transformers accelerate safetensors
+```
+
+## Run
+
+**Verifiable demo — no SD, no GPU** (synthetic embeddings, emits the slide 6/7 plots):
+
+```bash
+python scripts/demo_no_sd.py
+```
+
+**SD1.5** (single-file checkpoint, no HF download):
+
+```bash
+python scripts/mine_distribution.py --backend sd15 --ckpt ~/models/v1-5-pruned-emaonly.safetensors \
+    --prompts prompts_1000.txt --out outputs/dist
+python scripts/generate.py --backend sd15 --dist outputs/dist --n 8 --device mps
+python scripts/temperature_sweep.py --backend sd15 --dist outputs/dist \
+    --temps 0.5,1.0,1.5,2.0 --seeds 0,1,2
+```
+
+**SDXL** (same commands, only `--backend`/`--model` differ):
+
+```bash
+python scripts/mine_distribution.py --backend sdxl --model ~/models/sdxl-turbo \
+    --prompts prompts_1000.txt --out outputs/dist
+python scripts/generate.py --backend sdxl --dist outputs/dist --n 8 --device mps
+# coherent drift OUTSIDE the hull (base SDXL + CFG lets extrapolation bite):
+python scripts/temperature_sweep.py --backend sdxl --dist outputs/dist \
+    --model ~/models/sdxl-base --sampler pca --temps 1,2,3,4 --steps 30 --guidance 7
+```
+
+`prompts_1000.txt` is a wide, deterministic "good" corpus you can regenerate with
+`python gen_prompts.py`. Distributions are saved backend-namespaced (`sd15` keeps
+`outputs/dist`; `sdxl` writes `outputs/dist_sdxl__*`), so the two never clash.
+
+## Structure
+
+```
+semantic_anarchy/
+  distribution.py   EmbeddingDistribution — fit/sample/interpolate/project/evolve (pure numpy)
+  backend.py        Backend abstraction — sd15 (1 tensor) / sdxl (2); encode/fit/sample/generate
+  pipeline.py       SDModel (SD1.5) + SDXLModel (SDXL) — stock diffusers, lazy torch import
+  cli_args.py       shared --backend argparse wiring + per-family defaults
+  viz.py · aesthetic.py · evolve.py · cli.py
+scripts/
+  mine_distribution.py · generate.py · temperature_sweep.py · sampler_sweep.py
+  explore_session.py    unattended time-budgeted gallery
+  demo_no_sd.py         the torch-free demo
+tests/                  pytest — distribution + evolution + backend abstraction (all torch-free)
+```
+
+Everything that doesn't strictly need a GPU is pure NumPy; torch/diffusers are
+imported lazily, so the math, plots, evolution loop and the **whole test suite run
+with neither installed**.
+
+## Models not included
+
+Model weights are **not** committed (Stability AI licenses; large). Get them yourself:
+
+- **SD1.5** — a single-file `v1-5-pruned-emaonly.safetensors` (Hugging Face /
+  Civitai), passed via `--ckpt`. No HF download needed.
+- **SDXL** — `stabilityai/sdxl-turbo` or `stabilityai/stable-diffusion-xl-base-1.0`
+  (e.g. `huggingface-cli download … --local-dir ~/models/…`), passed via `--model`.
+
+## Test
+
+```bash
+pytest -q
+```
+
+Covers: fit recovers known mean/std; sampling shapes + temperature scaling; PCA
+extrapolation (no clipping); save/load round-trip; the backend abstraction
+(sd15/sdxl two-tensor fit/sample, sampler dispatch); evolution raising the mean
+score on an analytic objective.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

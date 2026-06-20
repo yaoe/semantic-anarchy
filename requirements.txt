@@ -1,0 +1,30 @@
+# Semantic Anarchy -- requirements, two tiers.
+#
+# Use Python 3.12: torch publishes no 3.14 wheels yet (and 3.13 lags). A clean
+# 3.12 venv is the supported path:
+#     python3.12 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt            # core tier (no SD)
+#     pip install torch diffusers transformers accelerate safetensors  # full tier
+
+# ---------------------------------------------------------------- core tier ---
+# Everything except actually rendering images: distribution mining math, the
+# slide 6/7 plots, the evolution loop, the no-SD demo, and the test suite
+# (including the torch-free backend-abstraction tests).
+numpy>=1.24
+matplotlib>=3.7
+pillow>=10.0
+pytest>=7.4
+
+# ---------------------------------------------------------------- full tier ---
+# Uncomment (or `pip install torch diffusers transformers accelerate
+# safetensors`) to encode real prompts and decode embeddings to images. A
+# MODERN diffusers handles BOTH backends from STOCK pipelines -- SD1.5 via
+# StableDiffusionPipeline (+ from_single_file for a local .ckpt/.safetensors)
+# AND SDXL via StableDiffusionXLPipeline. No SAE, no pinned/forked diffusers.
+# Heavy; wants a GPU (or patience on CPU / Apple-Silicon MPS).
+#
+# torch>=2.1            # >=2.4 recommended for stable SDXL on Apple-Silicon MPS
+# diffusers>=0.27       # any modern release: SD1.5 + SDXL stock pipelines
+# transformers>=4.38
+# accelerate>=0.27
+# safetensors>=0.4

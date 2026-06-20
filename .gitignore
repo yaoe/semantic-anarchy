@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------------ venvs ---
+.venv/
+venv/
+env/
+sae-venv/
+
+# ----------------------------------------------------------------- macOS ---
+.DS_Store
+
+# -------------------------------------------------- model weights (huge) ---
+# Never commit model weights — download them per the README (Stability AI
+# licenses; not redistributable here).
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+weights/
+models/
+
+# ------------------------------------------------- mined arrays / outputs ---
+# Distribution caches and raw embeddings are large binaries — regenerate them
+# with the mining scripts; don't commit them. (Curated demo PNGs live in
+# assets/, which is NOT ignored.)
+*.npz
+*.npy
+outputs/
+art_experiment.png
+object_experiment.png
+
+# ------------------------------------------------------- AI session scratch ---
+_ai_sessions/
+
+# ------------------------------------------------ dropped experiments ---
+# Earlier standalone experiments are excluded entirely from this repo. The SDXL
+# backend now lives in the package via STOCK diffusers pipelines
+# (semantic_anarchy/pipeline.py + backend.py). Left on disk (a process may be
+# running there) but never committed.
+sdxl_sae/
+requirements-sdxl.txt
+licenses/
+NOTICE
+EXPLORE.md
