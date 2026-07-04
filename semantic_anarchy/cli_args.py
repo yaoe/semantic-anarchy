@@ -14,15 +14,21 @@ from .backend import BACKEND_DEFAULTS, make_backend
 
 def add_backend_args(p: argparse.ArgumentParser, *, with_steps=True) -> None:
     """Add --backend + model selection + shared sampler/generation knobs."""
-    p.add_argument("--backend", default="sd15", choices=["sd15", "sdxl"],
+    p.add_argument("--backend", default="sd15",
+                   choices=["sd15", "sd2", "sdxl", "flux2", "krea2"],
                    help="Which model runs the identical drift method.")
     p.add_argument("--model", default=None,
                    help="HF id or diffusers dir. sd15 default "
-                        "runwayml/stable-diffusion-v1-5; sdxl default "
+                        "runwayml/stable-diffusion-v1-5; sd2 default "
+                        "stabilityai/stable-diffusion-2-1; sdxl default "
                         "stabilityai/sdxl-turbo. (--ckpt overrides for single-file.)")
     p.add_argument("--ckpt", default=None,
                    help="single-file .ckpt/.safetensors (from_single_file).")
     p.add_argument("--device", default=None, help="cuda | mps | cpu (auto if unset)")
+    p.add_argument("--scheduler", default="default",
+                   choices=["default", "ddim", "euler", "euler_a", "dpm"],
+                   help="diffusion sampler. ddim = smooth classic sampler used for "
+                        "the nicer high-step renders.")
 
     # sampler / drift knobs (forwarded verbatim to EmbeddingDistribution.sample)
     p.add_argument("--sampler", default="diagonal",
@@ -33,7 +39,13 @@ def add_backend_args(p: argparse.ArgumentParser, *, with_steps=True) -> None:
     p.add_argument("--coherence", type=float, default=0.5,
                    help="blend lambda in [0,1]: 1=pure pca, 0=pure diagonal.")
     p.add_argument("--components", type=int, default=None,
-                   help="pca/blend: use only the top N principal axes (default all).")
+                   help="pca/blend: use N principal axes starting at --comp-lo (default all).")
+    p.add_argument("--comp-lo", type=int, default=0,
+                   help="pca/blend: first principal axis (0=dominant/generic; raise to "
+                        "skip the tasteful axes and ride weird mid/minor ones).")
+    p.add_argument("--equalize", action="store_true",
+                   help="pca/blend: express every selected axis at equal (RMS) strength "
+                        "so minor 'weird' axes actually register.")
     p.add_argument("--truncation", type=float, default=None,
                    help="resample coords beyond this many sigma (typical-set trick).")
 
@@ -57,6 +69,7 @@ def resolve_gen_defaults(args) -> None:
     if getattr(args, "guidance", None) is None:
         args.guidance = d["guidance"]
     if getattr(args, "neg_mode", None) is None:
+        # sd15/sd2 use the empty-prompt negative; sdxl pushes from the corpus mean.
         args.neg_mode = "mean" if args.backend == "sdxl" else "empty"
     if getattr(args, "height", None) in (None, 0):
         args.height = d["height"]
@@ -71,8 +84,9 @@ def load_backend(args):
 
 
 def dist_prefix(args, base: str) -> str:
-    """Backend-namespaced distribution prefix so sd15/sdxl never clash.
+    """Backend-namespaced distribution prefix so the backends never clash.
 
-    sd15 keeps the bare ``<base>`` (original layout); sdxl appends ``_sdxl``.
+    sd15 keeps the bare ``<base>`` (original layout); others append their name
+    (``<base>_sd2``, ``<base>_sdxl``).
     """
-    return base if args.backend == "sd15" else f"{base}_sdxl"
+    return base if args.backend == "sd15" else f"{base}_{args.backend}"

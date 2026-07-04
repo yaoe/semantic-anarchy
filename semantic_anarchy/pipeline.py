@@ -22,6 +22,67 @@ from typing import Iterable, Optional
 import numpy as np
 
 
+def set_scheduler(pipe, name: Optional[str]) -> None:
+    """Swap a pipeline's scheduler in place. ``ddim`` is the classic, smooth
+    sampler the deck's nicer renders used; ``None``/``default`` leaves it alone."""
+    if not name or name == "default":
+        return
+    import diffusers
+    # Flow-matching pipelines (FLUX.2, Krea 2) have their own sigma schedule --
+    # swapping in a DDPM-family scheduler would break them. Leave those alone.
+    if "FlowMatch" in type(pipe.scheduler).__name__:
+        return
+    table = {
+        "ddim": "DDIMScheduler",
+        "euler": "EulerDiscreteScheduler",
+        "euler_a": "EulerAncestralDiscreteScheduler",
+        "dpm": "DPMSolverMultistepScheduler",
+    }
+    cls_name = table.get(name)
+    if not cls_name:
+        return
+    cls = getattr(diffusers, cls_name)
+    pipe.scheduler = cls.from_config(pipe.scheduler.config)
+
+
+def tiled_upscale(image, scale, tile, overlap, fn):
+    """Ultimate-SD-Upscale-style detail pass.
+
+    Lanczos-enlarge ``image`` to ``scale x``, then run ``fn`` (an img2img denoise
+    that returns a same-size PIL image) over OVERLAPPING ``tile`` x ``tile`` tiles
+    and feather-blend them back together. Because every tile is denoised at (near)
+    the model's NATIVE resolution -- where it synthesizes the most coherent fine
+    detail -- this adds real texture instead of the soft "zoom" a single
+    off-native-resolution pass produces. ``overlap`` px of feathered blend hides
+    the seams.
+    """
+    import numpy as np
+    from PIL import Image
+
+    w, h = image.size
+    tw, th = max(tile, round(w * scale / 8) * 8), max(tile, round(h * scale / 8) * 8)
+    base = image.convert("RGB").resize((tw, th), Image.LANCZOS)
+
+    # 1-D feathered ramp (0.1..1) rising over `overlap` px from each tile edge.
+    r = np.minimum(np.arange(tile), np.arange(tile)[::-1]).astype(np.float32)
+    r = np.clip((r + 1.0) / max(1, overlap), 0.1, 1.0)
+    mask = np.outer(r, r)[..., None]            # (tile, tile, 1)
+
+    acc = np.zeros((th, tw, 3), np.float32)
+    wsum = np.zeros((th, tw, 1), np.float32)
+    step = max(1, tile - overlap)
+    xs = sorted({min(x, tw - tile) for x in range(0, tw, step)} | {max(0, tw - tile)})
+    ys = sorted({min(y, th - tile) for y in range(0, th, step)} | {max(0, th - tile)})
+    for y in ys:
+        for x in xs:
+            crop = base.crop((x, y, x + tile, y + tile))
+            out = np.asarray(fn(crop).convert("RGB"), np.float32)
+            acc[y:y + tile, x:x + tile] += out * mask
+            wsum[y:y + tile, x:x + tile] += mask
+    res = (acc / np.maximum(wsum, 1e-6)).clip(0, 255).astype("uint8")
+    return Image.fromarray(res)
+
+
 def _pick_device(requested: Optional[str] = None) -> str:
     import torch
 
@@ -137,6 +198,7 @@ class SDModel:
         device: Optional[str] = None,
         dtype: str = "auto",
         ckpt: Optional[str] = None,
+        single_file_config: Optional[str] = None,
     ) -> "SDModel":
         """Load a Stable Diffusion pipeline.
 
@@ -145,6 +207,12 @@ class SDModel:
             given, the pipeline is built via ``from_single_file`` -- so a local
             webui/AUTOMATIC1111 checkpoint works directly with no HF download.
             Otherwise we ``from_pretrained(model_id)`` (a repo id or diffusers folder).
+        ``single_file_config``:
+            Optional diffusers repo id to read the *config* from when loading a
+            single-file ckpt (``from_single_file(config=...)``). Needed for SD 2.x,
+            whose canonical config repo is gated -- point this at a NON-gated
+            diffusers mirror so the v-prediction scheduler / 1024-dim cross-attn
+            config is picked up without hitting the gated repo.
         """
         import torch
         from diffusers import StableDiffusionPipeline
@@ -162,7 +230,10 @@ class SDModel:
             # already safetensors we convert it ourselves (trusted local file)
             # to a cached sibling .safetensors and load that.
             load_path = _ensure_safetensors_ckpt(ckpt)
-            pipe = StableDiffusionPipeline.from_single_file(load_path, torch_dtype=torch_dtype)
+            sf_kwargs = {"torch_dtype": torch_dtype}
+            if single_file_config:
+                sf_kwargs["config"] = single_file_config
+            pipe = StableDiffusionPipeline.from_single_file(load_path, **sf_kwargs)
         else:
             pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
         pipe = pipe.to(device)
@@ -224,11 +295,23 @@ class SDModel:
         height: int = 512,
         width: int = 512,
         seed: Optional[int] = None,
+        init_images: Optional[list] = None,
+        init_strength: float = 0.7,
+        ip_images: Optional[list] = None,
+        ip_scale: float = 0.7,
     ) -> list:
         """Decode conditioning embeddings to PIL images -- no prompt involved.
 
         ``embeddings`` is ``(N, 77, hidden)``. Each is fed as ``prompt_embeds``;
         the text encoder is never called.
+
+        Two ways to inject an init image (mutually exclusive):
+        * ``init_images`` -- IMG2IMG: start the denoiser from the init's latent
+          (its colors/shapes) at ``init_strength``.
+        * ``ip_images`` -- IMAGE-EMBEDDING (IP-Adapter): run the init through a
+          CLIP *image* encoder and inject that embedding via cross-attention at
+          ``ip_scale`` (0=ignore, ~0.6-0.9 strong), while still starting from pure
+          noise. The init steers *content/style*, not just structure.
         """
         import torch
 
@@ -248,6 +331,10 @@ class SDModel:
         neg = np.broadcast_to(neg, embeddings.shape).copy()
         neg = torch.from_numpy(neg).to(self.device, dtype=param_dtype)
 
+        img2img = self._img2img_pipe() if init_images else None
+        if ip_images:
+            self._ensure_ip_adapter(ip_scale)
+
         images = []
         for i in range(n):
             # Seed per image (seed + i) so each image is independently reproducible.
@@ -256,17 +343,106 @@ class SDModel:
                 if seed is not None
                 else None
             )
-            result = self.pipe(
-                prompt_embeds=cond[i : i + 1],
-                negative_prompt_embeds=neg[i : i + 1],
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                height=height,
-                width=width,
-                generator=generator,
-            )
+            if img2img is not None:
+                init = init_images[i % len(init_images)].convert("RGB").resize((width, height))
+                result = img2img(
+                    prompt_embeds=cond[i : i + 1],
+                    negative_prompt_embeds=neg[i : i + 1],
+                    image=init, strength=init_strength,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale, generator=generator,
+                )
+            else:
+                kwargs = dict(
+                    prompt_embeds=cond[i : i + 1],
+                    negative_prompt_embeds=neg[i : i + 1],
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    height=height, width=width, generator=generator,
+                )
+                if ip_images:
+                    kwargs["ip_adapter_image"] = ip_images[i % len(ip_images)].convert("RGB")
+                result = self.pipe(**kwargs)
             images.append(result.images[0])
         return images
+
+    def _img2img_pipe(self):
+        """Lazily build (and cache) an img2img pipeline sharing these weights."""
+        if getattr(self, "_img2img", None) is None:
+            from diffusers import AutoPipelineForImage2Image
+            self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
+            try:
+                self._img2img.enable_vae_tiling()
+            except Exception:
+                pass
+        return self._img2img
+
+    def _ensure_ip_adapter(self, scale: float):
+        """Load the SD1.5 IP-Adapter (image-embedding) once and set its scale.
+
+        Injects a CLIP image embedding of the init via cross-attention. SD2.1
+        (1024-dim cross-attn) has no compatible IP-Adapter -> errors clearly."""
+        hidden = self.pipe.text_encoder.config.hidden_size
+        if hidden != 768:
+            raise RuntimeError(
+                f"IP-Adapter image-embedding not supported for this model "
+                f"(cross-attn dim {hidden}); use SD1.5 or SDXL.")
+        if not getattr(self, "_ip_loaded", False):
+            self.pipe.load_ip_adapter(
+                "h94/IP-Adapter", subfolder="models",
+                weight_name="ip-adapter_sd15.safetensors")
+            self._ip_loaded = True
+        self.pipe.set_ip_adapter_scale(scale)
+
+    # ----------------------------------------------------------- refine ---
+    def refine_image(self, image, scale: float = 2.0, num_inference_steps: int = 50,
+                     strength: float = 0.35, guidance_scale: float = 1.0,
+                     seed: Optional[int] = None, cond=None, scheduler=None):
+        """Upscale + add denoising steps to an existing image (img2img hires-fix).
+
+        The image is Lanczos-upscaled to ``scale x`` then run through an img2img
+        pass for ``num_inference_steps`` (``strength`` fraction actually denoise).
+
+        ``cond``:
+            The ORIGINAL ``(77, hidden)`` conditioning that produced the image
+            (saved as a sidecar at generation time). Reusing it -- with CFG
+            (``guidance_scale > 1``, negative = empty prompt) -- makes the pass
+            *reinforce the same content* at higher resolution instead of drifting
+            toward a generic unconditional refine. Falls back to the empty-prompt
+            embedding when ``cond`` is None (older images without a sidecar).
+        ``scheduler``: optional sampler swap (e.g. ``ddim``).
+        """
+        import torch
+        from diffusers import AutoPipelineForImage2Image
+        from PIL import Image
+
+        if getattr(self, "_img2img", None) is None:
+            self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
+            try:
+                self._img2img.enable_vae_tiling()
+            except Exception:
+                pass
+        set_scheduler(self._img2img, scheduler)
+        w, h = image.size
+        tw, th = max(8, round(w * scale / 8) * 8), max(8, round(h * scale / 8) * 8)
+        init = image.convert("RGB").resize((tw, th), Image.LANCZOS)
+
+        param_dtype = next(self.pipe.unet.parameters()).dtype
+        src = self.uncond_embedding() if cond is None else cond
+        pe = torch.from_numpy(np.asarray(src, dtype=np.float32)).to(
+            self.device, dtype=param_dtype)
+        if pe.ndim == 2:
+            pe = pe[None]
+        kwargs = dict(prompt_embeds=pe, image=init, strength=strength,
+                      num_inference_steps=num_inference_steps,
+                      guidance_scale=guidance_scale)
+        if guidance_scale > 1.0:
+            neg = torch.from_numpy(np.asarray(self.uncond_embedding(), dtype=np.float32)).to(
+                self.device, dtype=param_dtype)
+            kwargs["negative_prompt_embeds"] = neg
+        if seed is not None:
+            kwargs["generator"] = torch.Generator(device=self.device).manual_seed(seed)
+        return self._img2img(**kwargs).images[0]
 
 
 @dataclass
@@ -371,6 +547,10 @@ class SDXLModel:
         height: int = 1024,
         width: int = 1024,
         seed: Optional[int] = None,
+        init_images: Optional[list] = None,
+        init_strength: float = 0.7,
+        ip_images: Optional[list] = None,
+        ip_scale: float = 0.7,
     ) -> list:
         """Decode sampled SDXL conditioning tensors to images (no text encoder).
 
@@ -378,6 +558,12 @@ class SDXLModel:
         When ``guidance_scale > 1`` the CFG path runs and ``negatives`` (same dict
         shape) is supplied as ``negative_prompt_embeds`` / ``negative_pooled``;
         if ``negatives`` is None the empty-prompt encoding is used.
+
+        Init image injection (mutually exclusive):
+        * ``init_images`` -- IMG2IMG from the init's latent at ``init_strength``.
+        * ``ip_images`` -- IMAGE-EMBEDDING (IP-Adapter): CLIP image embedding of
+          the init injected via cross-attention at ``ip_scale``; steers content/
+          style while starting from pure noise.
         """
         import torch
 
@@ -409,6 +595,10 @@ class SDXLModel:
             npe_t = torch.from_numpy(npe).to(self.device, dtype=param_dtype)
             npo_t = torch.from_numpy(npo).to(self.device, dtype=param_dtype)
 
+        img2img = self._img2img_pipe() if init_images else None
+        if ip_images:
+            self._ensure_ip_adapter(ip_scale)
+
         images = []
         for i in range(n):
             generator = (
@@ -420,13 +610,321 @@ class SDXLModel:
                 pooled_prompt_embeds=po_t[i : i + 1],
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
-                height=height,
-                width=width,
                 generator=generator,
             )
             if use_cfg:
                 kwargs["negative_prompt_embeds"] = npe_t[i : i + 1]
                 kwargs["negative_pooled_prompt_embeds"] = npo_t[i : i + 1]
-            result = self.pipe(**kwargs)
+            if img2img is not None:
+                kwargs["image"] = init_images[i % len(init_images)].convert("RGB").resize((width, height))
+                kwargs["strength"] = init_strength
+                result = img2img(**kwargs)
+            else:
+                kwargs["height"], kwargs["width"] = height, width
+                if ip_images:
+                    kwargs["ip_adapter_image"] = ip_images[i % len(ip_images)].convert("RGB")
+                result = self.pipe(**kwargs)
             images.append(result.images[0])
+        return images
+
+    def _img2img_pipe(self):
+        """Lazily build (and cache) an SDXL img2img pipeline sharing these weights."""
+        if getattr(self, "_img2img", None) is None:
+            from diffusers import AutoPipelineForImage2Image
+            self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
+            try:
+                self._img2img.enable_vae_tiling()
+            except Exception:
+                pass
+        return self._img2img
+
+    def _ensure_ip_adapter(self, scale: float):
+        """Load the SDXL IP-Adapter (ViT-H plus) once and set its image scale.
+
+        Uses the cached ip-adapter-plus_sdxl_vit-h weights + the ViT-H image
+        encoder (in the repo's models/image_encoder)."""
+        if not getattr(self, "_ip_loaded", False):
+            # image_encoder_folder WITH a slash is treated as repo-root-relative by
+            # diffusers (the ViT-H encoder lives at models/image_encoder).
+            self.pipe.load_ip_adapter(
+                "h94/IP-Adapter", subfolder="sdxl_models",
+                weight_name="ip-adapter-plus_sdxl_vit-h.safetensors",
+                image_encoder_folder="models/image_encoder")
+            self._ip_loaded = True
+        self.pipe.set_ip_adapter_scale(scale)
+
+    # ----------------------------------------------------------- refine ---
+    def refine_image(self, image, scale: float = 1.5, num_inference_steps: int = 50,
+                     strength: float = 0.35, guidance_scale: float = 1.0,
+                     seed: Optional[int] = None, cond=None, scheduler=None):
+        """SDXL img2img upscale/refine (see SDModel.refine_image).
+
+        ``cond`` is the original ``{"prompt_embeds": (77,2048), "pooled": (1280,)}``
+        saved at generation time; reused (with CFG, negative = empty prompt) so the
+        hires pass reinforces the same content. Falls back to the empty prompt when
+        ``cond`` is None. VAE tiling keeps the high-res decode within memory.
+        """
+        import torch
+        from diffusers import AutoPipelineForImage2Image
+        from PIL import Image
+
+        if getattr(self, "_img2img", None) is None:
+            self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
+            try:
+                self._img2img.enable_vae_tiling()
+            except Exception:
+                pass
+        set_scheduler(self._img2img, scheduler)
+        w, h = image.size
+        tw, th = max(8, round(w * scale / 8) * 8), max(8, round(h * scale / 8) * 8)
+        init = image.convert("RGB").resize((tw, th), Image.LANCZOS)
+
+        param_dtype = next(self.pipe.unet.parameters()).dtype
+        src = self.uncond() if cond is None else cond
+
+        def _t(a, want):
+            # Pad to exactly `want` dims (prompt_embeds -> 3 (B,77,H); pooled -> 2
+            # (B,H)). uncond tensors already carry a batch dim; sidecar ones don't.
+            a = np.asarray(a, dtype=np.float32)
+            while a.ndim < want:
+                a = a[None]
+            return torch.from_numpy(a).to(self.device, dtype=param_dtype)
+
+        kwargs = dict(prompt_embeds=_t(src["prompt_embeds"], 3),
+                      pooled_prompt_embeds=_t(src["pooled"], 2), image=init,
+                      strength=strength, num_inference_steps=num_inference_steps,
+                      guidance_scale=guidance_scale)
+        if guidance_scale > 1.0:
+            u = self.uncond()
+            kwargs["negative_prompt_embeds"] = _t(u["prompt_embeds"], 3)
+            kwargs["negative_pooled_prompt_embeds"] = _t(u["pooled"], 2)
+        if seed is not None:
+            kwargs["generator"] = torch.Generator(device="cpu").manual_seed(seed)
+        return self._img2img(**kwargs).images[0]
+
+
+
+def _flow_pipeline_kwargs(model_id: str) -> dict:
+    """Loading kwargs for big flow models on a 24GB-VRAM / 30GB-RAM box.
+
+    The 4B klein fits in bf16 with cpu-offload. Anything bigger (klein-9B,
+    Krea 2) gets its transformer + LLM text encoder NF4-quantized so the whole
+    pipeline lives on the GPU (~12-15GB) -- bnb weights can't be cpu-offloaded,
+    and unquantized they don't fit either RAM or VRAM. Override with
+    SA_FLOW_QUANT=off|nf4.
+    """
+    import os
+    import torch
+
+    mode = os.environ.get("SA_FLOW_QUANT", "auto")
+    big = any(t in model_id for t in ("9B", "9b", "Krea", "krea"))
+    if mode == "off" or (mode == "auto" and not big):
+        return {"torch_dtype": torch.bfloat16, "_offload": True}
+    from diffusers.quantizers import PipelineQuantizationConfig
+    return {
+        "torch_dtype": torch.bfloat16,
+        "_offload": False,
+        "quantization_config": PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={"load_in_4bit": True,
+                          "bnb_4bit_quant_type": "nf4",
+                          "bnb_4bit_compute_dtype": torch.bfloat16},
+            components_to_quantize=["transformer", "text_encoder"],
+        ),
+    }
+
+
+@dataclass
+class Flux2Model:
+    """FLUX.2 klein (4B/9B) behind the same duck-typed surface as SD/SDXL.
+
+    Klein conditions on ONE tensor: the multi-layer Qwen3 hidden states that
+    ``Flux2KleinPipeline.encode_prompt`` extracts (``text_encoder_out_layers``
+    concatenated), fed back verbatim via ``prompt_embeds``. Distilled model:
+    embedded guidance, no negative branch. VRAM: the 4B fits a 24GB card whole;
+    the 9B (and its Qwen3-8B encoder) rides ``enable_model_cpu_offload``.
+    """
+
+    pipe: object
+    device: str
+    model_id: str
+
+    #: mining pads/truncates prompts to this many tokens so every corpus row has
+    #: one fixed feature shape (full 512 would make the PCA npz enormous).
+    MAX_SEQ = 128
+
+    @classmethod
+    def load(cls, model_id: str = "black-forest-labs/FLUX.2-klein-4B",
+             device: Optional[str] = None, dtype: str = "auto",
+             ckpt: Optional[str] = None) -> "Flux2Model":
+        import torch
+        from diffusers import Flux2KleinPipeline
+
+        device = _pick_device(device)
+        kw = _flow_pipeline_kwargs(model_id)
+        offload = kw.pop("_offload")
+        pipe = Flux2KleinPipeline.from_pretrained(model_id, **kw)
+        if offload:
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception:
+                pipe = pipe.to(device)
+        else:
+            pipe = pipe.to(device)   # NF4 components already live on GPU
+        pipe.set_progress_bar_config(disable=True)
+        return cls(pipe=pipe, device=device, model_id=model_id)
+
+    # ----------------------------------------------------------- encoding ---
+    def encode_prompts(self, prompts, batch_size: int = 8) -> np.ndarray:
+        import torch
+
+        prompts = list(prompts)
+        out = []
+        for i in range(0, len(prompts), batch_size):
+            chunk = prompts[i:i + batch_size]
+            with torch.no_grad():
+                pe = self.pipe.encode_prompt(
+                    prompt=chunk, device=self.device,
+                    num_images_per_prompt=1, prompt_embeds=None,
+                    max_sequence_length=self.MAX_SEQ)
+            if isinstance(pe, (tuple, list)):
+                pe = pe[0]
+            out.append(pe.detach().to(torch.float32).cpu().numpy())
+        return np.concatenate(out, axis=0)
+
+    # ----------------------------------------------------------- decoding ---
+    def generate_from_embeddings(self, embeddings, negative_embedding=None,
+                                 num_inference_steps: int = 28,
+                                 guidance_scale: float = 4.0,
+                                 height: int = 1024, width: int = 1024,
+                                 seed: Optional[int] = None,
+                                 init_images=None, init_strength: float = 0.7,
+                                 ip_images=None, ip_scale: float = 0.7) -> list:
+        import torch
+
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if embeddings.ndim == 2:
+            embeddings = embeddings[None]
+        n = embeddings.shape[0]
+        pe = torch.from_numpy(embeddings).to(dtype=torch.bfloat16)
+
+        images = []
+        for i in range(n):
+            generator = (torch.Generator(device="cpu").manual_seed(seed + i)
+                         if seed is not None else None)
+            kwargs = dict(prompt_embeds=pe[i:i + 1].to(self.device),
+                          num_inference_steps=num_inference_steps,
+                          guidance_scale=guidance_scale,
+                          height=height, width=width, generator=generator)
+            if init_images:
+                # klein's native image conditioning (kontext-style reference)
+                kwargs["image"] = [init_images[i % len(init_images)].convert("RGB")]
+            images.append(self.pipe(**kwargs).images[0])
+        return images
+
+
+@dataclass
+class Krea2Model:
+    """Krea 2 (Raw/Turbo) behind the same duck-typed surface.
+
+    Conditions on ONE tensor of multi-layer Qwen3-VL hidden states plus an
+    attention mask; we mine at a fixed MAX_SEQ so shapes are uniform and feed an
+    all-ones mask at generation (padding positions become live conditioning --
+    anarchy by design). Real CFG: guidance_scale ~4.5 with an empty-prompt
+    negative branch.
+    """
+
+    pipe: object
+    device: str
+    model_id: str
+    _uncond: Optional[tuple] = None
+
+    # Krea's encoder returns 12 stacked layers -> ~2560*12 dims per token; mine
+    # short sequences and accumulate fp16 or a 30GB-RAM box drowns.
+    MAX_SEQ = 64
+
+    @classmethod
+    def load(cls, model_id: str = "krea/Krea-2-Raw",
+             device: Optional[str] = None, dtype: str = "auto",
+             ckpt: Optional[str] = None) -> "Krea2Model":
+        import torch
+        from diffusers import Krea2Pipeline
+
+        device = _pick_device(device)
+        kw = _flow_pipeline_kwargs(model_id)
+        offload = kw.pop("_offload")
+        pipe = Krea2Pipeline.from_pretrained(model_id, **kw)
+        if offload:
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception:
+                pipe = pipe.to(device)
+        else:
+            pipe = pipe.to(device)
+        pipe.set_progress_bar_config(disable=True)
+        return cls(pipe=pipe, device=device, model_id=model_id)
+
+    # ----------------------------------------------------------- encoding ---
+    def encode_prompts(self, prompts, batch_size: int = 8) -> np.ndarray:
+        import torch
+
+        prompts = list(prompts)
+        out = []
+        for i in range(0, len(prompts), batch_size):
+            chunk = prompts[i:i + batch_size]
+            with torch.no_grad():
+                enc = self.pipe.encode_prompt(
+                    prompt=chunk, device=self.device,
+                    num_images_per_prompt=1, prompt_embeds=None,
+                    prompt_embeds_mask=None, max_sequence_length=self.MAX_SEQ)
+            pe = enc[0] if isinstance(enc, (tuple, list)) else enc
+            out.append(pe.detach().to(torch.float16).cpu().numpy())
+        return np.concatenate(out, axis=0)
+
+    def _uncond_embeds(self):
+        import torch
+        if self._uncond is None:
+            with torch.no_grad():
+                enc = self.pipe.encode_prompt(
+                    prompt=[""], device=self.device, num_images_per_prompt=1,
+                    prompt_embeds=None, prompt_embeds_mask=None,
+                    max_sequence_length=self.MAX_SEQ)
+            self._uncond = (enc[0], enc[1] if isinstance(enc, (tuple, list)) and len(enc) > 1 else None)
+        return self._uncond
+
+    # ----------------------------------------------------------- decoding ---
+    def generate_from_embeddings(self, embeddings, negative_embedding=None,
+                                 num_inference_steps: int = 28,
+                                 guidance_scale: float = 4.5,
+                                 height: int = 1024, width: int = 1024,
+                                 seed: Optional[int] = None,
+                                 init_images=None, init_strength: float = 0.7,
+                                 ip_images=None, ip_scale: float = 0.7) -> list:
+        import torch
+
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if embeddings.ndim == 2:
+            embeddings = embeddings[None]
+        n, s = embeddings.shape[0], embeddings.shape[1]
+        pe = torch.from_numpy(embeddings).to(dtype=torch.bfloat16)
+        mask = torch.ones((1, s), dtype=torch.bool)
+
+        use_cfg = guidance_scale > 1.0
+        if use_cfg:
+            npe, nmask = self._uncond_embeds()
+
+        images = []
+        for i in range(n):
+            generator = (torch.Generator(device="cpu").manual_seed(seed + i)
+                         if seed is not None else None)
+            kwargs = dict(prompt_embeds=pe[i:i + 1].to(self.device),
+                          prompt_embeds_mask=mask.to(self.device),
+                          num_inference_steps=num_inference_steps,
+                          guidance_scale=guidance_scale,
+                          height=height, width=width, generator=generator)
+            if use_cfg:
+                kwargs["negative_prompt_embeds"] = npe.to(self.device)
+                if nmask is not None:
+                    kwargs["negative_prompt_embeds_mask"] = nmask.to(self.device)
+            images.append(self.pipe(**kwargs).images[0])
         return images

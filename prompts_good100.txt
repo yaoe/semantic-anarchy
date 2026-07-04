@@ -1,0 +1,103 @@
+# 100 curated high-quality "good prompts" — the quality anchor for Semantic Anarchy.
+# Normal, excellent, diverse prompts (NOT weird). Wildness comes from sampling
+# OUTSIDE the distribution these define, not from the prompts themselves.
+a weathered fisherman's face at dawn, deep wrinkles, golden-hour light, 85mm portrait, shallow depth of field, photorealistic
+an elderly woman with silver braids by a frosted window, soft Rembrandt lighting, muted tones, oil painting
+a ballerina mid-leap in an empty theatre, motion blur, single spotlight, dramatic shadows, monochrome photograph
+a young blacksmith lit by forge embers, sweat and soot, chiaroscuro, cinematic film still
+a Maasai elder in ceremonial beadwork, rich reds and ochres, natural-light portrait, documentary photography
+a contemplative astronaut removing her helmet, stars reflected in the visor, soft rim light, sci-fi concept art
+a street violinist in the rain at night, neon reflections, bokeh, candid documentary photography
+a geisha adjusting her kimono beside paper lanterns, shallow focus, ukiyo-e-influenced digital painting
+a freckled child laughing in summer sun, candid, 50mm, warm natural light
+a Viking warrior gazing over a grey sea, braided beard, overcast light, matte painting
+a flamenco dancer mid-turn, swirling red dress, stage light, long-exposure motion
+an old beekeeper among his hives, dappled forest light, soft documentary photograph
+a terraced rice valley at sunrise, layers of mist, aerial drone shot, golden light
+a lone oak on a windswept moor under storm clouds, dramatic chiaroscuro, oil painting
+a frozen waterfall in a blue-hour canyon, long exposure, crisp detail, fine-art photography
+a field of lavender rolling to the horizon at sunset, soft focus, impressionist
+cherry blossoms over a quiet Kyoto canal, petals on the water, pastel palette, watercolor
+the Milky Way arching over red desert mesas, astrophotography, ultra-wide, crisp stars
+a misty pine forest with shafts of morning light, volumetric god rays, atmospheric
+towering Patagonian peaks mirrored in a still lake at dawn, alpenglow, landscape photography
+an autumn forest path carpeted in golden leaves, soft overcast light, painterly
+a thunderstorm over the ocean at dusk, forked lightning, moody dramatic seascape
+rolling Tuscan hills with cypress trees, warm afternoon haze, classic landscape oil
+a glacial lagoon with floating icebergs, cold blue tones, crisp fine-art photography
+a desert of red dunes with rippling patterns, low sun, long shadows, minimalist
+a tropical waterfall in lush jungle, drifting mist, vibrant greens, cinematic
+a snow leopard on a rocky ridge in swirling snow, telephoto wildlife photography
+a humpback whale breaching at sunset, splash frozen mid-air, dramatic nature photography
+a red fox curled in fresh snow, soft morning light, shallow depth of field
+a majestic stag in misty highlands at dawn, atmospheric fine-art wildlife
+a kingfisher diving, water droplets suspended, ultra high-speed capture, razor sharp
+a herd of elephants crossing a dusty savanna at golden hour, backlit dust, telephoto
+a barn owl in silent flight against a full moon, monochrome, dramatic
+a school of jellyfish glowing in dark water, bioluminescent, macro, ethereal
+a grand baroque library reading room, warm candlelight, intricate detail, wide architectural shot
+a brutalist concrete chapel, shafts of light through narrow slits, moody fine-art architecture
+a winding Moroccan medina street, vivid textiles, warm shadows, travel photography
+a glass skyscraper atrium at twilight, mirrored reflections, symmetrical architectural render
+a cozy Scandinavian cabin interior, fireplace glow, hygge, warm soft light
+an overgrown abandoned train station, sun through a broken roof, melancholic atmosphere
+a Gothic cathedral interior, stained glass casting colored light, volumetric, awe
+a Japanese tea house with tatami and an open garden view, serene, soft natural light
+a colossal derelict spaceship drifting near a ringed planet, epic scale, cinematic sci-fi concept art
+a floating crystal city above the clouds at dawn, fantasy matte painting, epic
+a lone wanderer before a giant ancient forest robot, Studio Ghibli inspired, soft light
+a cyberpunk night market in the rain, neon signage, reflections, Blade Runner mood, cinematic
+a dragon coiled around a snowy mountain peak, dramatic clouds, epic fantasy illustration
+a sunken temple ruin underwater with shafts of light and fish, mysterious concept art
+a desert nomad riding a colossal sandworm over dunes, dramatic sky, epic sci-fi
+a bioluminescent alien jungle at night, glowing flora, otherworldly concept art
+a knight before an enormous glowing portal, volumetric light, fantasy cinematic
+a steampunk airship docking at a brass sky-port, intricate machinery, warm light
+a witch's cottage in a misty enchanted forest, glowing windows, storybook illustration
+a vast crystalline cavern with an underground lake, glowing minerals, awe, concept art
+a still life of split pomegranates and brass on dark wood, Dutch-master oil, chiaroscuro
+a stack of pancakes dripping with syrup and berries, soft morning light, food photography
+a steaming bowl of ramen in rich detail, moody overhead food photography
+a vintage pocket watch with exposed gears, macro, shallow focus, warm tones
+a dewdrop on a spider web at dawn, extreme macro, bokeh, ethereal
+wildflowers in a ceramic vase by a window, soft impressionist oil painting
+a market spice stall, vivid mounds of color, travel photography, rich tones
+a single candle flame in darkness, warm glow, minimal, atmospheric
+flowing ink dispersing in water, swirling colors, high-speed macro, abstract
+an Escher-like impossible staircase, monochrome, geometric, surreal ink drawing
+a fractal of unfolding iridescent shapes, vibrant, digital abstract
+interlocking geometric solids in soft pastel gradients, Bauhaus-inspired, minimal
+paint splatter frozen mid-air, vivid colors on white, abstract photography
+a topographic landscape of layered cut paper, soft shadows, papercraft art
+long-exposure light trails in a city at night, abstract vibrant streaks
+a field of warm color blocks with soft edges, Rothko-inspired, contemplative
+a serene mountain landscape in traditional ink-wash, negative space, sumi-e
+a bustling Parisian cafe scene, loose impressionist brushwork, warm afternoon
+a lion portrait in bold pop-art style, vivid complementary colors
+a quiet coastal town in art-nouveau poster style, elegant lines, muted palette
+a retro 1950s diner at night, neon glow, nostalgic, cinematic
+a spring cottage garden, detailed botanical watercolor illustration
+a samurai duel in dynamic ukiyo-e woodblock style
+a friendly little robot, Pixar-style 3D render, soft studio lighting, charming
+an intricate cyber-organic sculpture, octane render, dramatic light
+a cozy autumn street scene, gouache illustration, warm storybook feel
+a phoenix rendered in glowing stained glass, ornate
+a continuous single-line portrait, elegant minimalist line art
+a foggy harbor at dawn with moored boats, muted tones, calm atmospheric photography
+a rain-streaked window over a blurred city, melancholic, cinematic, bokeh
+a lighthouse beam cutting through a storm at night, dramatic, moody
+a snowy village at dusk with glowing windows, warm and cool light, cozy cinematic
+headlights on an empty desert highway at night, long exposure, lonely, cinematic
+morning fog through a redwood forest, ethereal light beams, serene
+a campfire under a starry mountain sky, warm glow, wide, atmospheric
+an empty cinema lit by a glowing screen, moody, symmetrical, cinematic still
+soft snowfall over a city park at night, peaceful, painterly
+a golden wheat field swaying under a dramatic sky before rain, cinematic, warm
+a lone hiker on a ridge above a sea of clouds, epic scale, golden light
+a fisherman casting a net at dawn on a calm lake, silhouette, serene
+children flying kites on a windy hill, vivid, joyful, soft afternoon light
+a scientist examining a glowing sample in a softly lit lab, cinematic detail
+a couple dancing in an empty ballroom, warm light, romantic, painterly
+a monk lighting candles in a dim temple, incense smoke, warm glow, contemplative
+a painter at an easel in a sunlit studio, dust in the light beams, intimate oil painting
+an astronaut floating above Earth, the blue planet below, awe, photorealistic, cinematic

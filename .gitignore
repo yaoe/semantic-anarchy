@@ -52,3 +52,6 @@ requirements-sdxl.txt
 licenses/
 NOTICE
 EXPLORE.md
+
+# user-provided init images (img2img entropy injection)
+init_images/

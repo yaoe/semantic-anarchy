@@ -69,6 +69,47 @@ SUBJECTS = [
     # space
     "a nebula cradling newborn stars", "a ringed gas giant from its moon",
     "an eclipse over a barren world",
+    # --- surreal / uncanny (the "interesting subject matter" expansion) ---
+    "a cathedral grown from coral and bone", "a staircase descending into the open sky",
+    "a humpback whale drifting through a flooded ballroom", "a clockwork heart wrapped in ivy",
+    "a figure whose face is a window onto a storm", "a city folded like wet origami",
+    "a forest of glass trees ringing in the wind", "a procession of faceless pilgrims in red robes",
+    "a moth the size of a cathedral door", "a desert where the dunes are sleeping giants",
+    "a library where the books are caged birds", "a moon tangled in telephone wires",
+    "a drowned cathedral lit from within", "a chandelier made of frozen tears",
+    "a horse made of running water", "a clock melting over a dead tree",
+    "a room slowly filling with golden honey", "a giant hand emerging from a wheat field",
+    "a lighthouse keeper with a galaxy for a head", "twin moons reflected in a shattered mirror",
+    "a tree whose roots are human veins", "a carousel abandoned on the ocean floor",
+    "a spiral staircase winding into a giant eye", "a market stall selling caged storm clouds",
+    "a snail carrying a tiny cathedral on its shell", "a figure dissolving into a flock of starlings",
+    "a grand piano overgrown with luminous fungus", "a whale skeleton beached in a neon desert",
+    "an angel with too many wings, mid-fall", "a child holding a leash tied to the sun",
+    # --- biomorphic / Beksinski-Ernst-Tanguy register ---
+    "a tower built from fused sleeping figures", "a landscape of breathing flesh and bone",
+    "a creature assembled from driftwood and teeth", "a hand sprouting a forest of fingers",
+    "a bone-coloured cathedral of melted bodies", "a plain of smooth molten stones under a pearl sky",
+    "a petrified forest of bird-headed pilgrims", "an organism of pipes, wax, and eyes",
+    "a cocoon splitting to reveal a city", "a ribcage cathedral on a rust-red plain",
+    # --- mythic / folkloric ---
+    "a wendigo silhouette in a whiteout snowstorm", "Baba Yaga's hut walking on chicken legs",
+    "a nine-tailed fox wreathed in blue fire", "a leviathan rising beneath a fishing boat",
+    "a witch's cottage exhaling green smoke", "a minotaur asleep in a sunlit ruin",
+    "a selkie shedding her sealskin on black rocks", "a golem of river clay and prayer slips",
+    # --- cosmic / eerie ---
+    "an astronaut adrift among jellyfish-like stars", "a black sun hanging over a mirror-flat sea",
+    "a derelict space station overgrown with wildflowers", "an immense eye opening between galaxies",
+    "a cathedral floating in the rings of a planet", "a pilgrim kneeling before a tear in the sky",
+    # --- liminal / uncanny spaces ---
+    "an empty swimming pool at midnight", "an endless office under buzzing fluorescent light",
+    "a hotel hallway that repeats forever", "a flooded subway platform full of koi",
+    "a deserted carnival in thick fog", "a waiting room with no doors",
+    "a supermarket aisle stretching to the horizon", "a child's bedroom on the surface of the moon",
+    # --- impossible objects / dreamlogic ---
+    "a waterfall flowing upward into a keyhole", "a staircase Möbius-looped through a house",
+    "a teapot pouring an entire ocean", "a door standing alone in a field, ajar to nowhere",
+    "a chess game played with living storm clouds", "a violin unravelling into a flock of crows",
+    "a city skyline reflected in a single soap bubble", "a candle whose flame is a tiny galaxy",
 ]
 
 MEDIUMS = [

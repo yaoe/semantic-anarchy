@@ -143,11 +143,17 @@ class EmbeddingDistribution:
             the ``"hybrid"`` SLERP sampler). If the corpus is larger, a random
             subset of this many rows is kept to bound the saved size.
         """
-        embeddings = np.asarray(embeddings, dtype=np.float64)
+        # Huge feature dims (flow-model Qwen conditioning: ~1M coords) cannot
+        # afford float64 copies or a direct SVD on a 30GB-RAM box -- stay in
+        # float32 and use the Gram trick for PCA there.
+        big = int(np.prod(np.asarray(embeddings).shape[1:])) > 200_000
+        embeddings = np.asarray(embeddings, dtype=np.float32 if big else np.float64)
         if embeddings.ndim < 2:
             raise ValueError("embeddings must be (N, *feature_shape)")
         feature_shape = embeddings.shape[1:]
         n = embeddings.shape[0]
+        if big:
+            max_corpus = min(max_corpus, 32)   # bound the saved npz size
 
         if per_token:
             mean = embeddings.mean(axis=0)
@@ -170,13 +176,30 @@ class EmbeddingDistribution:
             x_centered = x_flat - mean.reshape(1, -1)
             # Total variance with the same (N-1) normalisation the SVD uses, so
             # pca_variance_fraction is properly bounded in [0, 1].
-            total_var = float((x_centered ** 2).sum() / (n - 1))
-            # Economy SVD: U (N,r) S (r,) Vt (r,D), r = min(N,D).
-            _, s, vt = np.linalg.svd(x_centered, full_matrices=False)
+            if big:
+                total_var = float(np.einsum('ij,ij->', x_centered, x_centered,
+                                            dtype=np.float64) / (n - 1))
+            else:
+                total_var = float((x_centered ** 2).sum() / (n - 1))
             k = n - 1 if n_components is None else min(int(n_components), n - 1)
             k = max(1, k)
-            pca_components = vt[:k].astype(np.float32)            # (k, D)
-            pca_std = (s[:k] / np.sqrt(n - 1)).astype(np.float32)  # (k,)
+            if big:
+                # Gram trick: eigendecompose the (N,N) Gram matrix instead of
+                # SVD-ing the (N,D) matrix -- same top-k right singular vectors,
+                # a few MB of workspace instead of tens of GB.
+                g = (x_centered @ x_centered.T).astype(np.float64)   # (N, N)
+                evals, evecs = np.linalg.eigh(g)                     # ascending
+                order = np.argsort(evals)[::-1][:k]
+                s = np.sqrt(np.maximum(evals[order], 1e-12))         # singular values
+                u = evecs[:, order].astype(np.float32)               # (N, k)
+                vt_k = (u.T @ x_centered) / s[:, None].astype(np.float32)  # (k, D)
+                pca_components = vt_k.astype(np.float32)
+                pca_std = (s / np.sqrt(n - 1)).astype(np.float32)
+            else:
+                # Economy SVD: U (N,r) S (r,) Vt (r,D), r = min(N,D).
+                _, s, vt = np.linalg.svd(x_centered, full_matrices=False)
+                pca_components = vt[:k].astype(np.float32)            # (k, D)
+                pca_std = (s[:k] / np.sqrt(n - 1)).astype(np.float32)  # (k,)
 
         # ---- retain a bounded subset of raw embeddings for the hybrid sampler --
         if n <= max_corpus:
@@ -208,6 +231,8 @@ class EmbeddingDistribution:
         sampler: str = "diagonal",
         coherence: float = 0.5,
         components: Optional[int] = None,
+        comp_lo: int = 0,
+        equalize: bool = False,
     ) -> np.ndarray:
         """Draw ``n`` fresh conditioning embeddings from the learned distribution.
 
@@ -238,8 +263,17 @@ class EmbeddingDistribution:
         coherence:
             The blend weight ``lambda`` in ``[0, 1]`` for ``sampler="blend"``.
         components:
-            For ``"pca"``/``"blend"``, use only the top ``components`` principal
-            axes (``None`` = all retained at fit time).
+            For ``"pca"``/``"blend"``, use only ``components`` principal axes
+            starting at ``comp_lo`` (``None`` = all from ``comp_lo`` on).
+        comp_lo:
+            First principal axis to sample. ``0`` = the dominant (most generic,
+            "tasteful concept-art") directions. Set it higher to SKIP those and
+            ride the *idiosyncratic* mid/minor axes -> stranger but still on the
+            manifold (the "weird-but-coherent" knob).
+        equalize:
+            Give every selected axis the same (RMS) magnitude instead of its
+            natural variance. Without this, minor axes barely register; with it,
+            their oddities are expressed at full strength.
         """
         rng = rng or np.random.default_rng()
 
@@ -251,7 +285,7 @@ class EmbeddingDistribution:
         if sampler == "diagonal":
             dev = self._diagonal_dev(n, truncation, rng)
         elif sampler == "pca":
-            dev = self._pca_dev(n, truncation, rng, components)
+            dev = self._pca_dev(n, truncation, rng, components, comp_lo, equalize)
         elif sampler == "blend":
             lam = float(np.clip(coherence, 0.0, 1.0))
             # Endpoints are exactly the pure samplers (and consume rng identically),
@@ -259,11 +293,11 @@ class EmbeddingDistribution:
             if lam <= 0.0:
                 dev = self._diagonal_dev(n, truncation, rng)
             elif lam >= 1.0:
-                dev = self._pca_dev(n, truncation, rng, components)
+                dev = self._pca_dev(n, truncation, rng, components, comp_lo, equalize)
             else:
                 # sqrt-weighting blends the covariances (not the samples) linearly:
                 # Cov = lambda*Cov_pca + (1-lambda)*Cov_diag.
-                pca = self._pca_dev(n, truncation, rng, components)
+                pca = self._pca_dev(n, truncation, rng, components, comp_lo, equalize)
                 diag = self._diagonal_dev(n, truncation, rng)
                 dev = np.sqrt(lam) * pca + np.sqrt(1.0 - lam) * diag
         else:
@@ -302,8 +336,15 @@ class EmbeddingDistribution:
         z = _truncate(z, truncation, rng)
         return self.std[None].astype(np.float64) * z
 
-    def _pca_dev(self, n, truncation, rng, components) -> np.ndarray:
-        """Deviation drawn within the low-rank PCA subspace, reshaped to features."""
+    def _pca_dev(self, n, truncation, rng, components, comp_lo=0, equalize=False) -> np.ndarray:
+        """Deviation drawn within the low-rank PCA subspace, reshaped to features.
+
+        ``comp_lo``/``components`` select an axis BAND ``[comp_lo : comp_lo+components]``
+        instead of always the top axes -- letting you ride the idiosyncratic
+        mid/minor directions. ``equalize`` gives each selected axis the RMS
+        magnitude of the full spectrum (so minor axes are actually expressed)
+        rather than its own (tiny) natural variance.
+        """
         if self.pca_components is None or self.pca_std is None:
             raise ValueError(
                 "this distribution was saved without PCA; re-mine to enable the "
@@ -311,12 +352,106 @@ class EmbeddingDistribution:
             )
         comps = self.pca_components.astype(np.float64)  # (k, D)
         pstd = self.pca_std.astype(np.float64)          # (k,)
-        k = comps.shape[0] if components is None else min(int(components), comps.shape[0])
-        comps, pstd = comps[:k], pstd[:k]
-        a = rng.standard_normal((n, k))                 # (n, k) gaussian coeffs
+        total = comps.shape[0]
+        lo = max(0, min(int(comp_lo), total - 1))
+        hi = total if components is None else min(lo + int(components), total)
+        comps_b, pstd_b = comps[lo:hi], pstd[lo:hi]
+        a = rng.standard_normal((n, hi - lo))           # (n, m) gaussian coeffs
         a = _truncate(a, truncation, rng)
-        flat = (a * pstd[None]) @ comps                 # (n, D) on the manifold
+        if equalize:
+            scale = np.full(hi - lo, float(np.sqrt(np.mean(pstd ** 2))))  # RMS of full spectrum
+        else:
+            scale = pstd_b
+        flat = (a * scale[None]) @ comps_b              # (n, D) on the manifold
         return flat.reshape(n, *self.feature_shape)
+
+    def distance(self, embedding: np.ndarray) -> float:
+        """RMS z-score distance of one embedding from the corpus center.
+
+        Whitened by the fitted per-coordinate Gaussian, so the scale is
+        human-readable: a typical corpus sample sits near 1.0, a temperature-T
+        diagonal sample near T. This is the "how far from the promptable
+        center" gauge used to calibrate the periphery.
+        """
+        # Floor the per-coordinate sigma: near-constant coordinates (structural
+        # CLIP dims with ~zero corpus variance) would otherwise explode the
+        # z-score for any anchor not minted from this exact fit.
+        std = np.maximum(self.std, 0.1 * float(np.mean(self.std)))
+        z = (np.asarray(embedding, dtype=np.float64) - self.mean) / std
+        return float(np.sqrt(np.mean(z * z)))
+
+    def neighborhood(
+        self,
+        anchor: np.ndarray,
+        n: int = 6,
+        radius: float = 0.3,
+        rng: Optional[np.random.Generator] = None,
+    ) -> np.ndarray:
+        """Sample ``n`` points in a small ball around ``anchor`` (local search).
+
+        The perturbation is drawn along the corpus's PCA axes (falling back to
+        the diagonal Gaussian if PCA wasn't fitted) and scaled by ``radius``:
+        a fraction of the corpus's own spread, so ``0.3`` means "step 30% of a
+        typical corpus deviation away from the anchor". This is the
+        "explore around this image" primitive -- hill-climbing on taste.
+        """
+        rng = rng or np.random.default_rng()
+        anchor = np.asarray(anchor, dtype=np.float32)
+        if self.pca_components is not None and self.pca_std is not None:
+            dev = self._pca_dev(n, None, rng, None)
+        else:
+            dev = self._diagonal_dev(n, None, rng)
+        return (anchor[None] + radius * dev).astype(np.float32)
+
+    def walk(
+        self,
+        anchor: np.ndarray,
+        steps: int = 6,
+        step: float = 0.15,
+        mode: str = "outward",
+        rng: Optional[np.random.Generator] = None,
+        axis: Optional[int] = None,
+    ) -> np.ndarray:
+        """March from ``anchor`` in ONE persistent direction; return the strip.
+
+        Modes:
+        * ``outward`` -- along the anchor's own ray from the corpus center, i.e.
+          straight toward the periphery. Each step multiplies the deviation by
+          ``(1 + step)``, so the distance gauge grows ~``step`` per frame --
+          watching legibility strain as you leave the promptable region.
+        * ``axis`` -- along principal axis ``axis`` (a *meaningful* direction).
+        * ``random`` -- a persistent random on-manifold direction.
+        """
+        anchor = np.asarray(anchor, dtype=np.float64)
+        if mode == "outward":
+            dev = anchor - self.mean
+            out = [self.mean + dev * (1.0 + step * (i + 1)) for i in range(steps)]
+            return np.stack(out).astype(np.float32)
+        if mode == "axis" and self.pca_components is not None:
+            k = int(axis or 0) % self.pca_components.shape[0]
+            d = (self.pca_std[k] * self.pca_components[k]).reshape(self.feature_shape)
+        else:
+            rng = rng or np.random.default_rng()
+            d = (self._pca_dev(1, None, rng, None)[0]
+                 if self.pca_components is not None else
+                 self._diagonal_dev(1, None, rng)[0])
+        return np.stack([anchor + step * (i + 1) * d
+                         for i in range(steps)]).astype(np.float32)
+
+    def retarget(self, samples: np.ndarray, target: float) -> np.ndarray:
+        """Rescale each sample's deviation so its distance gauge hits ``target``.
+
+        Shell sampling: keep the sampled *direction*, pin the *radius* -- so you
+        draw from the ring where your keepers live instead of blindly scaling
+        temperature.
+        """
+        samples = np.asarray(samples, dtype=np.float64)
+        out = []
+        for x in samples:
+            d = self.distance(x)
+            dev = x - self.mean
+            out.append(self.mean + dev * (target / max(d, 1e-6)))
+        return np.stack(out).astype(np.float32)
 
     def interpolate(self, a: np.ndarray, b: np.ndarray, steps: int = 8) -> np.ndarray:
         """Linear walk between two embeddings (a latent "tween" for animation)."""

@@ -161,6 +161,10 @@ class AestheticScorer(Scorer):
             self._processor = CLIPProcessor.from_pretrained(self.clip_model_id)
             self._model = _build_aesthetic_head(_CLIP_EMBED_DIM)
             state = torch.load(self.weights_path, map_location="cpu")
+            # Some releases wrap the MLP in a `layers` module -> keys are
+            # "layers.0.weight" etc. Strip that prefix to match our bare Sequential.
+            if any(k.startswith("layers.") for k in state):
+                state = {k.replace("layers.", "", 1): v for k, v in state.items()}
             self._model.load_state_dict(state)
             self._model = self._model.to(self._device).eval()
             self.available = True

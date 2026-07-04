@@ -61,6 +61,18 @@ def main(argv=None) -> int:
     for k, v in named.items():
         print(f"[mine]   tensor {k!r}: {np.asarray(v).shape}")
 
+    # Free the pipeline before the numpy fit -- on a 30GB-RAM box the
+    # cpu-offloaded flow models (flux2/krea2) plus the fit workspace won't
+    # coexist. Encoding is done; the model is no longer needed.
+    backend.model = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
     dists = backend.fit(named, per_token=args.per_token, n_components=args.components)
     prefix = dist_prefix(args, str(args.out))
     written = backend.save_dists(dists, prefix)
