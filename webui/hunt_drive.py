@@ -34,7 +34,7 @@ MAX_HOURS = float(os.environ.get("SA_MAX_HOURS", "8"))
 N_PER = int(os.environ.get("SA_N", "4"))
 ANALYZE_EVERY = int(os.environ.get("SA_ANALYZE_EVERY", "3"))
 EXPLORE_PER_ROUND = int(os.environ.get("SA_EXPLORE_PER_ROUND", "2"))
-BACKEND = os.environ.get("SA_BACKEND", "sdxl")
+BACKENDS_ROT = [b.strip() for b in os.environ.get("SA_BACKENDS", "sdxl,sd15").split(",") if b.strip()]
 
 
 def _post(path, body):
@@ -69,16 +69,71 @@ def submit_and_wait(path, body, label):
     return wait_for(jid)
 
 
+def taste_bands():
+    """Per-backend distance samples from the starred images' sidecars."""
+    try:
+        favs = json.loads((OUT / "favorites.json").read_text())
+    except Exception:
+        return {}
+    per = {}
+    for rel in favs:
+        name = Path(rel).name
+        for b in ("sdxl", "sd15", "sd2", "flux2", "krea2"):
+            if f"anarchy_{b}_" in name:
+                j = OUT / Path(rel).with_suffix(".json")
+                if j.exists():
+                    try:
+                        d = json.loads(j.read_text()).get("distance")
+                        if d:
+                            per.setdefault(b, []).append(float(d))
+                    except Exception:
+                        pass
+                break
+    return per
+
+
+def pick_strategy(backend, bands):
+    """The diversity portfolio: the generator's job is VARIANCE (radial, lateral,
+    fusion); selection happens later via novelty x resonance. Never pin all
+    rounds to one shell -- that's how a whole night collapses onto d=2.72.
+    """
+    import random
+    r = random.random()
+    if r < 0.30:   # free-range radial spread
+        return {"sampler": "pca",
+                "temperature": round(random.uniform(1.4, 2.2), 2)}, "free"
+    if r < 0.55:   # taste-band arm: a DISTRIBUTION, per backend, >=10 points, clipped
+        ds = bands.get(backend, [])
+        if len(ds) >= 10:
+            import statistics
+            mu, sd = statistics.mean(ds), max(0.35, statistics.pstdev(ds))
+            t = round(min(2.4, max(1.3, random.gauss(mu, sd))), 2)
+            return {"sampler": "pca", "temperature": 1.7,
+                    "target_distance": t}, f"band(d={t})"
+        return {"sampler": "pca",
+                "temperature": round(random.uniform(1.4, 2.2), 2)}, "free*"
+    if r < 0.80:   # lateral: weird minor axes, non-standard subjects
+        return {"sampler": "pca", "comp_lo": random.choice([40, 80, 120, 160, 200]),
+                "equalize": True,
+                "temperature": round(random.uniform(1.05, 1.4), 2)}, "weird"
+    # concept fusion
+    return {"sampler": "hybrid",
+            "temperature": round(random.uniform(0.9, 1.3), 2)}, "hybrid"
+
+
 def main():
     started = time.time()
     seed = int(os.environ.get("SA_SEED_START", "500000"))
     visited = set(json.loads(VISITED.read_text())) if VISITED.exists() else set()
-    evolved = (OUT / ("dist_evolved.npz" if BACKEND == "sd15"
-                      else f"dist_evolved_{BACKEND}.npz" if BACKEND == "sd2"
-                      else "dist_evolved_sdxl__prompt_embeds.npz")).exists()
-    print(f"[hunt] backend={BACKEND} dist={'evolved★' if evolved else 'base'} "
-          f"n={N_PER}/round, analyze every {ANALYZE_EVERY}, "
-          f"explore {EXPLORE_PER_ROUND} frontier imgs/round", flush=True)
+
+    def has_evolved(b):
+        name = ("dist_evolved.npz" if b == "sd15"
+                else "dist_evolved_sdxl__prompt_embeds.npz" if b == "sdxl"
+                else f"dist_evolved_{b}.npz")
+        return (OUT / name).exists()
+
+    print(f"[hunt] backends={BACKENDS_ROT} n={N_PER}/round, analyze every "
+          f"{ANALYZE_EVERY}, explore {EXPLORE_PER_ROUND} frontier imgs/round", flush=True)
     print(f"[hunt] stop anytime: touch {STOP}", flush=True)
 
     rnd = 0
@@ -89,24 +144,20 @@ def main():
             print("[hunt] time budget -> exiting", flush=True); return
         rnd += 1
 
-        # keeper band -> shell target (recomputed every round as stars accrue)
-        target = None
-        try:
-            band = _get("/api/tasteband")
-            if band.get("count", 0) >= 5:
-                target = band["mean"]
-        except Exception:
-            pass
-
-        body = {"action": "generate", "backend": BACKEND,
-                "model": "sdxl-base-1.0" if BACKEND == "sdxl" else None,
-                "dist": "evolved" if evolved else "base",
-                "sampler": "pca", "temperature": 1.7, "n": N_PER,
-                "seed": seed, "steps": 30, "scheduler": "ddim",
-                "target_distance": target}
+        backend = BACKENDS_ROT[(rnd - 1) % len(BACKENDS_ROT)]
+        knobs, tag = pick_strategy(backend, taste_bands())
+        body = {"action": "generate", "backend": backend,
+                "model": "sdxl-base-1.0" if backend == "sdxl" else None,
+                # base corpus by default: the evolved branch is too narrow for
+                # exploration (it's an exploitation tool). Opt in via SA_USE_EVOLVED=1.
+                "dist": ("evolved" if os.environ.get("SA_USE_EVOLVED") == "1"
+                         and has_evolved(backend) else "base"),
+                "n": N_PER, "seed": seed, "steps": 30, "scheduler": "ddim",
+                "min_distance": 1.0,   # never dip into the bland corpus core
+                **knobs}
         seed += N_PER
         submit_and_wait("/api/run", body,
-                        f"round {rnd}: generate ({'d=' + str(target) if target else 'T=1.7'})")
+                        f"round {rnd}: generate {backend} [{tag}]")
 
         if rnd % ANALYZE_EVERY == 0:
             submit_and_wait("/api/resonance", {}, f"round {rnd}: analyze")

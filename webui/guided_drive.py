@@ -40,14 +40,14 @@ SCORE_EVERY = int(os.environ.get("SA_SCORE_EVERY", "5"))
 EXPLORE = float(os.environ.get("SA_EXPLORE", "0.15"))   # prob of a fully-random combo
 TEMP_LO, TEMP_HI = 0.8, 1.9                              # honour the <2 cap
 
-BACKENDS = ["sd15", "sd2", "sdxl"]
+BACKENDS = ["sd15", "sd2", "sdxl", "flux2"]   # krea2: manual only (too slow for the loop)
 SAMPLERS = ["diagonal", "pca", "blend", "hybrid"]
 # Priors encode the "deck regime" that yields legible-but-surreal subjects:
 #   SDXL base (strong prior renders sampled conditioning into real scenes; sd15
 #   collapses to painterly mush), pca/hybrid (on-manifold -> legible, not washes).
 # These ride on top of the star-derived counts so the loop still adapts as the
 # user curates, but starts where the good stuff lives.
-BACKEND_PRIOR = {"sdxl": 6, "sd2": 1, "sd15": 1}
+BACKEND_PRIOR = {"sdxl": 4, "flux2": 4, "sd2": 1, "sd15": 1}
 SAMPLER_PRIOR = {"diagonal": 1, "blend": 1, "pca": 4, "hybrid": 3}
 TEMP_FLOOR_EXPLOIT = 1.6   # pca needs real deviation to travel outside the hull
 TEMP_CENTER = 1.9          # sit at the coherent travel-outside frontier (~1.7-2.2)
@@ -106,6 +106,8 @@ def sample_combo():
         # from the legacy sd15-heavy stars -> drive it by the prior only.
         backend = weighted(BACKENDS, {}, prior=BACKEND_PRIOR)
         sampler = weighted(SAMPLERS, sa, prior=SAMPLER_PRIOR)
+        if backend == "krea2" and sampler == "pca":
+            sampler = "blend"   # krea's 256-comp pca mine looks washed; blend restores variance
         # Center temperature in the interesting band; let the user's starred temps
         # nudge it, but keep enough deviation for a subject to crystallize.
         mu = TEMP_CENTER

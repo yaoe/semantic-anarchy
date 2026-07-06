@@ -148,6 +148,24 @@ class Backend:
                           rng=rng, axis=axis)
                 for k, d in dists.items()}
 
+    def floor_distance(self, dists, named, floor: float) -> dict:
+        """Push any sample whose distance gauge is below ``floor`` out onto it.
+
+        Keeps the direction; rescales the deviation (all tensors by the same
+        factor so the conditioning stays coherent). The hunter's "never below
+        d=1.0" guard -- inside the corpus core everything is bland.
+        """
+        names = list(named.keys())
+        n = len(np.asarray(named[names[0]]))
+        out = {k: np.asarray(v, dtype=np.float64).copy() for k, v in named.items()}
+        for i in range(n):
+            d = self.distance(dists, {k: out[k][i] for k in names})
+            if d < floor:
+                f = floor / max(d, 1e-6)
+                for k in names:
+                    out[k][i] = dists[k].mean + (out[k][i] - dists[k].mean) * f
+        return {k: v.astype(np.float32) for k, v in out.items()}
+
     def retarget(self, dists, named, target: float) -> dict:
         """Pin every sampled tensor's distance gauge to ``target`` (shell sampling)."""
         return {k: dists[k].retarget(v, target) for k, v in named.items()}

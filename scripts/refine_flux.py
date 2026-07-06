@@ -24,9 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.io_utils import unique_path
 
-DEFAULT_PROMPT = ("Recreate this exact image at higher resolution with maximum "
-                  "fine detail and texture fidelity. Keep the composition, "
-                  "colors, style and every element identical.")
+DEFAULT_PROMPT = (
+    "Faithful upscaling task: output the SAME image at a higher resolution. "
+    "Preserve the exact composition, framing, every subject and object in its "
+    "exact position, the color palette, lighting, brushwork and artistic style "
+    "of the original. Do not add, remove, move, restyle or reinterpret "
+    "anything. Do not make it more photographic or more polished than the "
+    "original. Only render the existing image crisper, with finer detail.")
 
 
 def main(argv=None) -> int:
@@ -81,6 +85,7 @@ def main(argv=None) -> int:
     dest.with_suffix(".json").write_text(json.dumps({
         "kind": "refine", "engine": "flux2-klein", "model": args.model,
         "refined_from": args.src.name, "scale": args.scale,
+        "prompt": args.prompt,
         "steps": args.steps, "guidance": args.guidance,
         "seed": args.seed, "out_size": list(out.size),
     }, indent=2))

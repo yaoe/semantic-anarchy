@@ -37,6 +37,9 @@ def main(argv=None) -> int:
     parser.add_argument("--n", type=int, default=8, help="how many images to generate")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help=">1 = wilder/less typical, <1 = closer to the bland center")
+    parser.add_argument("--min-distance", type=float, default=None,
+                        help="floor: rescale any sample whose distance gauge falls "
+                             "below this up onto it (avoid the bland corpus core).")
     parser.add_argument("--target-distance", type=float, default=None,
                         help="shell sampling: pin every sample's distance gauge to this "
                              "value (draw ON the ring where your keepers live); "
@@ -87,6 +90,9 @@ def main(argv=None) -> int:
     if args.target_distance is not None:
         named = backend.retarget(dists, named, args.target_distance)
         print(f"[gen] shell-retargeted all samples to distance {args.target_distance}")
+    if args.min_distance is not None:
+        named = backend.floor_distance(dists, named, args.min_distance)
+        print(f"[gen] distance floor enforced: d >= {args.min_distance}")
     extra = f", coherence={args.coherence}" if args.sampler == "blend" else ""
     shapes = ", ".join(f"{k}{np.asarray(v).shape[1:]}" for k, v in named.items())
     print(f"[gen] sampled {args.n} ({shapes}), sampler={args.sampler}{extra}, "
@@ -155,6 +161,7 @@ def main(argv=None) -> int:
             "distance": round(backend.distance(
                 dists, {k: np.asarray(v)[i] for k, v in named.items()}), 3),
             "target_distance": args.target_distance,
+            "min_distance": args.min_distance,
             "init_image": (init_names[i] if init_names else None),
             "init_mode": (args.init_mode if init_images is not None else None),
             "init_strength": (args.init_strength if init_images is not None and args.init_mode == "img2img" else None),

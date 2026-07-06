@@ -296,6 +296,7 @@ class RunRequest(BaseModel):
     equalize: bool = False            # pca: express selected axes at equal strength
     dist: str = "base"                # base corpus | evolved ★ branch
     target_distance: Optional[float] = None  # shell sampling: pin the distance gauge
+    min_distance: Optional[float] = None      # floor: never below this distance
     init: bool = False                # start from a random good init image
     init_mode: str = "img2img"        # img2img (latent) | embedding (IP-Adapter)
     init_strength: float = 0.7        # img2img denoise from the init (0.6-0.8)
@@ -403,6 +404,8 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
             argv += ["--temperature", str(req.temperature)]
         if req.target_distance is not None:
             argv += ["--target-distance", str(req.target_distance)]
+        if req.min_distance is not None:
+            argv += ["--min-distance", str(req.min_distance)]
         if req.seed is not None:
             argv += ["--seed", str(req.seed)]
         if req.width:
@@ -484,6 +487,7 @@ class RefineRequest(BaseModel):
     tiled: bool = True                # tiled native-res detail pass (Ultimate-SD-Upscale style)
     overlap: int = 128
     engine: str = "flux"              # flux (klein reference-regen) | sd (tiled img2img)
+    prompt: Optional[str] = None      # flux engine: override the upscale instruction
 
 
 @app.post("/api/refine")
@@ -516,6 +520,8 @@ def api_refine(req: RefineRequest) -> JSONResponse:
                 "--scale", str(req.scale)]
         if req.steps is not None:
             argv += ["--steps", str(int(req.steps))]
+        if req.prompt:
+            argv += ["--prompt", req.prompt]
         label = f"refine · flux-klein · {src.name} · x{req.scale}"
         job = RUNNER.submit("refine", label, argv)
         return JSONResponse({"job_id": job.id, "label": label})
@@ -896,7 +902,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
           overflow:hidden; }
   .card img { width:100%; display:block; background:#000; cursor:zoom-in; }
   .card .meta { padding:6px 9px; font-size:11px; color:var(--dim);
-                display:flex; justify-content:space-between; gap:6px; }
+                display:flex; justify-content:space-between; gap:6px;
+                flex-wrap:wrap; row-gap:4px; }
+  .card .meta .nm { flex:1 1 100%; }
   .card .meta .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .sheet img { cursor:zoom-in; }
   .empty { color:var(--dim); padding:30px; text-align:center; }
@@ -1094,6 +1102,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div><label style="margin-top:0">Scheduler</label>
         <select id="rfSched" style="width:110px"><option value="ddim" selected>DDIM</option>
           <option value="default">default</option><option value="dpm">DPM++ 2M</option></select></div>
+      <div><label style="margin-top:0" title="FLUX engine: instruction given with the reference image">Flux prompt</label>
+        <select id="rfPromptSel" style="width:170px">
+          <option value="faithful" selected>faithful upscale</option>
+          <option value="recreate">creative re-render</option>
+          <option value="custom">custom…</option>
+        </select></div>
+      <div id="rfPromptCustomWrap" style="display:none"><label style="margin-top:0">Custom prompt</label>
+        <input id="rfPrompt" placeholder="your instruction" style="width:220px"></div>
       <div style="border-left:1px solid var(--line);align-self:stretch"></div>
       <div><label style="margin-top:0" title="perturbation size for 🧭 Explore (fraction of corpus spread)">Explore radius</label>
         <input id="exRadius" type="number" step="0.05" placeholder="0.3" style="width:90px"></div>
@@ -1209,7 +1225,7 @@ function refreshCkptHint() {
   } else if (backend === "flux2") {
     el.textContent = "FLUX.2 klein (flow model, Qwen3 encoder) — mine first, then generate";
   } else if (backend === "krea2") {
-    el.textContent = "Krea 2 Raw (flow model, Qwen3-VL encoder) — mine first; slow (CPU-offload)";
+    el.textContent = "Krea 2 Raw — use sampler diagonal (T 1.0–1.3) or blend λ0.6–0.7; pure pca looks washed (256-comp mine). Slow.";
   } else {
     el.textContent = "cached HF repo → --model (1024²)";
   }
@@ -1301,7 +1317,7 @@ function makeCard(im, sheet) {
   const isAnarchy = (im.name || "").startsWith("anarchy_");
   const star = `<button class="fav" title="favorite" style="padding:2px 7px;font-size:12px;${im.fav?'color:#ffcf4d;border-color:#ffcf4d':''}">${im.fav?'★':'☆'}</button>`;
   const up = isAnarchy
-    ? `<button class="up" title="upscale + more steps" style="padding:2px 8px;font-size:11px">⤴</button>` : "";
+    ? `<button class="up" title="upscale + more steps" style="padding:2px 8px;font-size:11px;white-space:nowrap">⤴ Upscale</button>` : "";
   const nav = isAnarchy
     ? `<button class="ex" title="explore around this (neighborhood)" style="padding:2px 8px;font-size:11px">🧭</button>` +
       `<button class="wk" title="walk outward toward the periphery from this point" style="padding:2px 8px;font-size:11px">🚶</button>` +
@@ -1430,6 +1446,15 @@ async function toggleFav(rel, on) {
     await refreshImages();
   } catch (e) {}
 }
+// The creative preset = the original "Recreate" instruction (re-renders with
+// license to reinterpret); faithful = the script's built-in default (null).
+const RECREATE_PROMPT = "Recreate this exact image at higher resolution with maximum fine detail and texture fidelity. Keep the composition, colors, style and every element identical.";
+function refinePrompt() {
+  const sel = $("#rfPromptSel") ? $("#rfPromptSel").value : "faithful";
+  if (sel === "recreate") return RECREATE_PROMPT;
+  if (sel === "custom") return (($("#rfPrompt") || {}).value || "").trim() || null;
+  return null;   // faithful -> script default
+}
 async function refineImage(name, btn) {
   const body = {
     src: name,
@@ -1439,6 +1464,7 @@ async function refineImage(name, btn) {
     scheduler: $("#rfSched").value || null,
     tiled: $("#rfMode").value === "tiled",
     engine: $("#rfEngine").value,
+    prompt: refinePrompt(),
   };
   if (btn) { btn.disabled = true; btn.textContent = "queued…"; }
   try {
@@ -1501,6 +1527,9 @@ function buildCli(m){
 $("#lightbox").onclick = (e) => { if (e.target.id !== "lightmeta") $("#lightbox").style.display = "none"; };
 $("#lightmeta").onclick = (e) => e.stopPropagation();
 
+$("#rfPromptSel").onchange = () => {
+  $("#rfPromptCustomWrap").style.display = $("#rfPromptSel").value === "custom" ? "" : "none";
+};
 $("#sortBy").onchange = () => { shown = PAGE; renderGallery(); };
 $("#evolveBtn").onclick = async () => {
   if (!confirm("Refit a distribution branch around your ★ favorites and sample 8 images from it?")) return;
