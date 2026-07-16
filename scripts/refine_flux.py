@@ -27,10 +27,13 @@ from semantic_anarchy.io_utils import unique_path
 DEFAULT_PROMPT = (
     "Faithful upscaling task: output the SAME image at a higher resolution. "
     "Preserve the exact composition, framing, every subject and object in its "
-    "exact position, the color palette, lighting, brushwork and artistic style "
-    "of the original. Do not add, remove, move, restyle or reinterpret "
-    "anything. Do not make it more photographic or more polished than the "
-    "original. Only render the existing image crisper, with finer detail.")
+    "exact position, the color palette, lighting, and the original's own "
+    "medium, materials and surface texture. Do not add, remove, move, restyle "
+    "or reinterpret anything. Do NOT add painterly brushstrokes, oil-paint, "
+    "watercolor, canvas grain, or any hand-painted look that is not already "
+    "there; if the original is a photograph, render or digital image, keep it "
+    "exactly that. Only render the existing image crisper, with finer, native "
+    "detail true to its original medium.")
 
 
 def main(argv=None) -> int:
@@ -72,8 +75,9 @@ def main(argv=None) -> int:
         pipe = pipe.to("cuda")
     pipe.set_progress_bar_config(disable=True)
 
-    gen = (torch.Generator(device="cpu").manual_seed(args.seed)
-           if args.seed is not None else None)
+    if args.seed is None:
+        args.seed = int.from_bytes(os.urandom(4), "little")  # record it: reproducible upscales
+    gen = torch.Generator(device="cpu").manual_seed(args.seed)
     out = pipe(prompt=args.prompt, image=[img], height=th, width=tw,
                num_inference_steps=args.steps, guidance_scale=args.guidance,
                generator=gen).images[0]
