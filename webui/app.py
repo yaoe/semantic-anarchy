@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import queue
 import shlex
 import subprocess
@@ -571,15 +572,38 @@ def _resolve_output_png(rel: str) -> Path:
     return p
 
 
+def _explorable_source(p: Path) -> Path:
+    """Resolve to an image that has conditioning (.npz). Upscaled/refined
+    outputs have none -- follow their ``refined_from`` sidecar link back to the
+    original (through chains of refinements) so 🧭/🚶/🧬 on an upscale act on
+    the image it came from."""
+    for _ in range(5):
+        if p.with_suffix(".npz").is_file():
+            return p
+        j = p.with_suffix(".json")
+        parent = None
+        if j.is_file():
+            try:
+                parent = json.loads(j.read_text()).get("refined_from")
+            except Exception:
+                parent = None
+        if not parent:
+            break
+        cand = p.parent / parent
+        if not cand.is_file():
+            break
+        p = cand
+    raise HTTPException(
+        400, f"{p.name} has no conditioning sidecar (and no traceable original)")
+
+
 @app.post("/api/explore")
 def api_explore(req: ExploreRequest) -> JSONResponse:
     if req.mode not in ("neighborhood", "breed", "walk"):
         raise HTTPException(400, f"bad mode {req.mode!r}")
     if req.direction not in ("outward", "random", "axis"):
         raise HTTPException(400, f"bad direction {req.direction!r}")
-    src = _resolve_output_png(req.src)
-    if not src.with_suffix(".npz").is_file():
-        raise HTTPException(400, f"{src.name} has no conditioning sidecar (too old to explore)")
+    src = _explorable_source(_resolve_output_png(req.src))
     backend = "sd15"
     for b in ("flux2", "krea2", "sdxl", "sd2"):
         if f"anarchy_{b}_" in src.name:
@@ -590,9 +614,7 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
             "--mode", req.mode, "--src", str(src),
             "--n", str(int(req.n)), "--scheduler", "ddim"]
     if req.mode == "breed":
-        b = _resolve_output_png(req.b or "")
-        if not b.with_suffix(".npz").is_file():
-            raise HTTPException(400, f"{b.name} has no conditioning sidecar")
+        b = _explorable_source(_resolve_output_png(req.b or ""))
         if backend not in b.name:
             raise HTTPException(400, "breed parents must be from the same backend")
         argv += ["--b", str(b), "--mutate", str(req.mutate)]
@@ -660,6 +682,87 @@ def api_resonance() -> JSONResponse:
     """Queue the resonance engine: embed new images, novelty + taste model."""
     argv = [PYTHON, "-u", "scripts/resonance.py"]
     job = RUNNER.submit("resonance", "analyze · novelty + resonance", argv)
+    return JSONResponse({"job_id": job.id})
+
+
+class InvertRequest(BaseModel):
+    src: str
+    tokens: int = 12
+    space: str = "clip"      # clip = image match (any backend); native = match
+                             # the stored conditioning in the model's own encoder
+
+
+@app.post("/api/invert")
+def api_invert(req: InvertRequest) -> JSONResponse:
+    """Queue PEZ hard-prompt inversion (arXiv:2302.03668): find the nearest
+    TYPEABLE prompt to an image born without one. Ruler, not leash."""
+    src = _resolve_output_png(req.src)
+    if req.space == "native":
+        src = _explorable_source(src)   # native needs the .npz; upscales redirect
+    argv = [PYTHON, "-u", "scripts/invert_prompt.py", "--src", str(src),
+            "--space", req.space,
+            "--tokens", str(req.tokens), "--steps", "500", "--restarts", "3"]
+    job = RUNNER.submit("invert", f"invert[{req.space}] · {src.name} · {req.tokens} tok", argv)
+    return JSONResponse({"job_id": job.id})
+
+
+class GenPromptRequest(BaseModel):
+    src: str                 # image whose sidecar holds the discovered prompt
+    which: str = "inverted"  # inverted (CLIP PEZ) | native
+
+
+@app.post("/api/genprompt")
+def api_genprompt(req: GenPromptRequest) -> JSONResponse:
+    """Render what the discovered hard prompt actually produces, through the
+    same backend and seed, so discovery and best-words-can-do can be compared."""
+    src = _resolve_output_png(req.src)
+    j = src.with_suffix(".json")
+    meta = {}
+    if j.is_file():
+        try:
+            meta = json.loads(j.read_text())
+        except Exception:
+            pass
+    prompt = meta.get(f"{req.which}_prompt")
+    # Upscales/refines record the REFINE engine as their model; walk back to
+    # the generation ancestor for backend/model/params (prompt stays as clicked).
+    gsrc, gmeta = src, meta
+    for _ in range(5):
+        if gmeta.get("kind") != "refine" or not gmeta.get("refined_from"):
+            break
+        cand = gsrc.parent / gmeta["refined_from"]
+        cj = cand.with_suffix(".json")
+        if not cand.is_file() or not cj.is_file():
+            break
+        gsrc = cand
+        try:
+            gmeta = json.loads(cj.read_text())
+        except Exception:
+            gmeta = {}
+    meta = gmeta
+    if not prompt:                       # e.g. native prompt saved on the ancestor
+        prompt = meta.get(f"{req.which}_prompt") or meta.get("inverted_prompt")
+    if not prompt:
+        raise HTTPException(400, f"{src.name}: no discovered prompt yet -- run 🔤 first")
+    m = re.match(r"anarchy_([a-z0-9]+)_", gsrc.name)
+    backend = meta.get("backend") or (m.group(1) if m else "sd15")
+    argv = [python_for(backend), "-u", "scripts/generate_prompted.py",
+            "--backend", backend, "--prompt", prompt,
+            "--parent", src.name, "--prompt-kind",
+            ("pez" if req.which == "inverted" else "native")]
+    model = meta.get("model")
+    if model and model != "(default)":
+        # single-file checkpoints need --ckpt (from_single_file), repos --model
+        argv += (["--ckpt", model] if model.endswith((".safetensors", ".ckpt"))
+                 else ["--model", model])
+    for k, flag in (("steps", "--steps"), ("guidance", "--guidance"),
+                    ("image_seed", "--seed"), ("height", "--height"),
+                    ("width", "--width")):
+        if meta.get(k) is not None:
+            argv += [flag, str(meta[k])]
+    if meta.get("scheduler") and meta["scheduler"] != "default":
+        argv += ["--scheduler", meta["scheduler"]]
+    job = RUNNER.submit("genprompt", f"from-prompt · {src.name}", argv)
     return JSONResponse({"job_id": job.id})
 
 
@@ -757,15 +860,23 @@ def api_images() -> JSONResponse:
     cand = [it for it in buckets["generated"]
             if it["nov"] is not None and (it["res"] or it["score"]) is not None]
     cand.sort(key=lambda d: d["nov"], reverse=True)
-    front, best = [], -1e9
-    for it in cand:
-        r = it["res"] if it["res"] is not None else it["score"]
-        if r > best:
-            front.append(it)
-            best = r
-    front.sort(key=lambda d: (d["res"] if d["res"] is not None else d["score"]),
-               reverse=True)
-    buckets["frontier"] = front[:150]
+    # Peel successive Pareto layers: the strict front is razor-thin (often <10
+    # of 10k), so keep taking "the front of what remains" until ~120 images.
+    def _r(it):
+        return it["res"] if it["res"] is not None else it["score"]
+    front, pool = [], cand
+    while pool and len(front) < 120:
+        best, layer, rest = -1e9, [], []
+        for it in pool:                       # pool stays novelty-sorted
+            if _r(it) > best:
+                layer.append(it)
+                best = _r(it)
+            else:
+                rest.append(it)
+        layer.sort(key=_r, reverse=True)
+        front.extend(layer)
+        pool = rest
+    buckets["frontier"] = front[:120]
     for key in buckets:
         if key not in ("top", "frontier"):
             buckets[key].sort(key=lambda d: d["mtime"], reverse=True)
@@ -802,18 +913,42 @@ def api_favorite(req: FavRequest) -> JSONResponse:
 
 @app.get("/api/meta")
 def api_meta(path: str) -> JSONResponse:
-    """Return the param sidecar (``<stem>.json``) for an image, or {}."""
+    """Return the param sidecar (``<stem>.json``) for an image, or {}.
+
+    Native inversions run against the ORIGINAL's conditioning, so refines
+    inherit their ancestor's native_prompt for display (marked native_from).
+    """
     base = OUTPUTS.resolve()
     target = (base / path).resolve()
     if base not in target.parents:
         raise HTTPException(404, "not found")
     j = target.with_suffix(".json")
+    meta = {}
     if j.is_file():
         try:
-            return JSONResponse(json.loads(j.read_text()))
+            meta = json.loads(j.read_text())
         except Exception:
-            pass
-    return JSONResponse({})
+            meta = {}
+    if "native_prompt" not in meta:
+        p, m = target, dict(meta)
+        for _ in range(5):
+            if not m.get("refined_from"):
+                break
+            p = p.parent / m["refined_from"]
+            pj = p.with_suffix(".json")
+            if not pj.is_file():
+                break
+            try:
+                m = json.loads(pj.read_text())
+            except Exception:
+                break
+            if "native_prompt" in m:
+                for k in ("native_prompt", "native_sim", "native_tokens", "native_vocab"):
+                    if k in m:
+                        meta[k] = m[k]
+                meta["native_from"] = p.name
+                break
+    return JSONResponse(meta)
 
 
 @app.get("/img")
@@ -822,9 +957,134 @@ def api_img(path: str) -> FileResponse:
     # against path traversal by confirming the resolved file stays inside it.
     base = OUTPUTS.resolve()
     target = (base / path).resolve()
-    if base not in target.parents or target.suffix.lower() != ".png" or not target.is_file():
+    if (base not in target.parents
+            or target.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".mp4")
+            or not target.is_file()):
         raise HTTPException(404, "not found")
     return FileResponse(target)
+
+
+def _wipe_candidates():
+    """Non-starred images with aesthetic score < 5. Favorites and their whole
+    ancestry (refined_from / parent chains) are protected -- deleting a
+    favorite's original would break native inversion and exploration."""
+    favs = set()
+    try:
+        favs = set(json.loads((OUTPUTS / "favorites.json").read_text()))
+    except Exception:
+        pass
+    try:
+        scores = json.loads((OUTPUTS / "scores.json").read_text())
+    except Exception:
+        scores = {}
+    protected = set(favs)
+    for rel in list(favs):                      # protect ancestry chains
+        p = OUTPUTS / rel
+        for _ in range(6):
+            jj = p.with_suffix(".json")
+            if not jj.is_file():
+                break
+            try:
+                m = json.loads(jj.read_text())
+            except Exception:
+                break
+            up = m.get("refined_from") or m.get("parent")
+            if not up:
+                break
+            p = p.parent / up
+            protected.add(str(p.relative_to(OUTPUTS)))
+    out = []
+    for png in sorted((OUTPUTS / "generated").glob("anarchy_*.png")):
+        rel = str(png.relative_to(OUTPUTS))
+        sc = scores.get(rel)
+        if rel not in protected and sc is not None and sc < 5.0:
+            out.append(rel)
+    return out
+
+
+@app.get("/api/wipe/preview")
+def api_wipe_preview() -> JSONResponse:
+    return JSONResponse({"count": len(_wipe_candidates())})
+
+
+@app.post("/api/wipe")
+def api_wipe() -> JSONResponse:
+    doomed = _wipe_candidates()
+    gone = set(doomed)
+    n_files = 0
+    for rel in doomed:
+        base = OUTPUTS / rel
+        for ext in (".png", ".json", ".npz"):
+            p = base.with_suffix(ext)
+            if p.is_file():
+                p.unlink()
+                n_files += 1
+    for cache in ("novelty.json", "resonance.json", "scores.json"):
+        cp = OUTPUTS / cache
+        if cp.is_file():
+            try:
+                d = json.loads(cp.read_text())
+                cp.write_text(json.dumps(
+                    {k: v for k, v in d.items() if k not in gone}))
+            except Exception:
+                pass
+    emb = OUTPUTS / "clip_embeds.npz"
+    if emb.is_file():
+        try:
+            import numpy as np
+            z = np.load(emb)
+            names, vecs = list(z["names"]), z["vecs"]
+            keep = [i for i, nm in enumerate(names) if str(nm) not in gone]
+            np.savez_compressed(emb, names=np.array([str(names[i]) for i in keep]),
+                                vecs=vecs[keep])
+        except Exception:
+            pass
+    return JSONResponse({"deleted": len(doomed), "files": n_files})
+
+
+class FilmDeleteRequest(BaseModel):
+    dir: str
+
+
+@app.post("/api/films/delete")
+def api_films_delete(req: FilmDeleteRequest) -> JSONResponse:
+    if "/" in req.dir or ".." in req.dir or not req.dir:
+        raise HTTPException(400, "bad film dir")
+    d = (OUTPUTS / "films" / req.dir).resolve()
+    if (OUTPUTS / "films").resolve() not in d.parents or not d.is_dir():
+        raise HTTPException(404, "not found")
+    import shutil
+    shutil.rmtree(d)
+    return JSONResponse({"deleted": req.dir})
+
+
+@app.get("/api/films")
+def api_films() -> JSONResponse:
+    """List rendered morph films (outputs/films/<name>/<name>.mp4 + manifest)."""
+    films = []
+    root = OUTPUTS / "films"
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            for mp4 in sorted(d.glob("*.mp4")):
+                info = {}
+                mj = d / "film.json"
+                if mj.is_file():
+                    try:
+                        info = json.loads(mj.read_text())
+                    except Exception:
+                        pass
+                films.append({
+                    "name": mp4.stem, "dir": d.name,
+                    "rel": str(mp4.relative_to(OUTPUTS)),
+                    "mtime": mp4.stat().st_mtime,
+                    "frames": info.get("frames"), "fps": info.get("fps"),
+                    "keyframes": info.get("keyframes", []),
+                    "refine": info.get("refine"),
+                })
+    films.sort(key=lambda f: f["mtime"], reverse=True)
+    return JSONResponse(films)
 
 
 @app.get("/api/config")
@@ -1075,6 +1335,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button data-tab="temperature">Temp sweeps</button>
       <button data-tab="sampler">Sampler sweeps</button>
       <button data-tab="marginals">Marginals</button>
+      <button data-tab="films">🎞 Films</button>
       <select id="sortBy" title="gallery order" style="margin-left:auto;width:150px">
         <option value="new">newest first</option>
         <option value="score">score ↓</option>
@@ -1086,6 +1347,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button id="evolveBtn" title="refit a distribution branch around your ★ favorites and sample it">🧪 Evolve ★</button>
       <button id="analyzeBtn" title="embed new images, recompute novelty + retrain the taste model from your ★">🎯 Analyze</button>
       <button id="scoreBtn" title="aesthetic-score all images">Score all ▶</button>
+      <button id="wipeBtn" title="delete all non-starred images scored below 5 (unscored images are kept)" style="color:#d98a8a">🧹 Wipe &lt;5</button>
     </div>
     <div id="refineBar" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;
          margin:0 0 12px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px">
@@ -1128,6 +1390,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="lightbox">
+  <button id="lbPrev" title="previous (←)" style="position:fixed;left:14px;top:50%;transform:translateY(-50%);
+    z-index:60;font-size:26px;padding:14px 16px;background:rgba(22,24,31,.75);border:1px solid var(--line);
+    border-radius:10px;color:#e7e9ee;cursor:pointer">‹</button>
+  <button id="lbNext" title="next (→)" style="position:fixed;right:14px;top:50%;transform:translateY(-50%);
+    z-index:60;font-size:26px;padding:14px 16px;background:rgba(22,24,31,.75);border:1px solid var(--line);
+    border-radius:10px;color:#e7e9ee;cursor:pointer">›</button>
   <img id="lightimg">
   <div id="lightmeta" style="position:fixed;left:0;right:0;bottom:0;background:rgba(7,8,11,.92);
        border-top:1px solid var(--line);padding:10px 16px;font:12px/1.6 ui-monospace,Menlo,monospace;
@@ -1138,6 +1406,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const $ = s => document.querySelector(s);
 let action = "generate", backend = "sd15", tab = "generated";
 const PAGE = 200; let shown = PAGE;   // gallery pagination: render this many, +PAGE on scroll
+let currentView = [], lightIdx = -1;  // lightbox ←/→ navigation over the current sort order
 let selectedJob = null, images = {}, lastBusy = null;
 
 document.getElementById("host").textContent = location.host;
@@ -1347,8 +1616,41 @@ function makeCard(im, sheet) {
   if (sheet) c.style.marginBottom = "16px";
   return c;
 }
+async function renderFilms(g) {
+  let films = [];
+  try { films = await (await fetch("/api/films")).json(); } catch(e){}
+  if (!films.length) {
+    g.innerHTML = `<div class="empty">no films yet — render one with scripts/morph_film.py</div>`;
+    return;
+  }
+  g.innerHTML = films.map(f => `
+    <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;max-width:820px;margin-bottom:14px">
+      <div style="margin-bottom:8px"><span style="color:#e0a13d">🎞 ${f.name}</span>
+        <span style="color:#9aa0ad;font-size:11px;margin-left:10px">${f.frames ?? "?"} frames · ${f.fps ?? "?"} fps · ${f.refine === "flux" ? "flux-refined" : "base"}</span>
+        <button onclick="deleteFilm(this,'${f.dir}')" title="delete this film's whole folder (all its variants + frames)" style="float:right;color:#d98a8a;padding:2px 8px;font-size:11px">🗑 delete</button></div>
+      <video controls loop style="width:100%;border-radius:8px;background:#000"
+             src="/img?path=${encodeURIComponent(f.rel)}"></video>
+      ${f.keyframes.length ? `<div style="color:#9aa0ad;font-size:11px;margin-top:6px">keyframes: ${f.keyframes.map(k => `<a href="#" style="color:#6fb3e0" onclick="openParent('${k.split("/").pop()}');return false;">${k.split("/").pop()}</a>`).join(" → ")}</div>` : ""}
+    </div>`).join("");
+}
+
+async function deleteFilm(btn, dir){
+  if (!confirm(`Delete film folder "${dir}" (all variants + frames)? This cannot be undone.`)) return;
+  btn.disabled = true;
+  await fetch("/api/films/delete", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({dir: dir})});
+  renderGallery();
+}
+
 function renderGallery() {
   const g = $("#gallery"); const list = images[tab] || [];
+  if (tab === "films") {
+    $("#refineBar").style.display = "none";
+    g.className = "";
+    $("#galleryFoot").textContent = "";
+    renderFilms(g);
+    return;
+  }
   const upscalable = (tab === "generated" || tab === "favorites" || tab === "top" || tab === "frontier");
   $("#refineBar").style.display = upscalable ? "flex" : "none";
   if (!list.length) {
@@ -1373,6 +1675,7 @@ function renderGallery() {
   else if (sb === "dist_asc") view = [...list].sort((a,b) => (a.dist ?? 1e9) - (b.dist ?? 1e9));
   else if (sb === "nov") view = [...list].sort((a,b) => (b.nov ?? -1) - (a.nov ?? -1));
   else if (sb === "res") view = [...list].sort((a,b) => (b.res ?? -1) - (a.res ?? -1));
+  currentView = view;
   g.innerHTML = "";
   const count = Math.min(shown, view.length);
   for (let i = 0; i < count; i++) g.appendChild(makeCard(view[i], sheet));
@@ -1483,7 +1786,10 @@ const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distan
   "backend","model","sampler","temperature","coherence",
   "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
   "batch_seed","image_seed","index","refined_from","scale","strength","cond_reused","out_size","seed"];
+let currentRel = null, currentScore = null;
 async function openLight(src, rel, score){
+  currentRel = rel; currentScore = score;
+  lightIdx = currentView.findIndex(x => x.rel === rel);
   $("#lightimg").src = src;
   $("#lightbox").style.display = "flex";
   const box = $("#lightmeta"); box.innerHTML = "loading params…";
@@ -1491,8 +1797,18 @@ async function openLight(src, rel, score){
   if (!rel) { box.textContent = ""; return; }
   try {
     const m = await (await fetch("/api/meta?path=" + encodeURIComponent(rel))).json();
+    const genBtn = w => ` <button onclick="genFromPrompt(this,'${rel}','${w}')" style="padding:2px 8px;font-size:11px">🎨 generate from it</button>`;
+    const nativeable = /anarchy_(sd15|sdxl)_/.test(rel);
+    let inv = "";
+    inv += m.inverted_prompt !== undefined
+      ? `<div style="margin-top:6px;color:#d4b96a">🔤 \u201C${m.inverted_prompt}\u201D <span style="color:#9aa0ad">CLIP's eyes (PEZ, ${m.inverted_tokens} tok, sim ${m.inverted_sim})</span>${genBtn("inverted")}</div>`
+      : `<div style="margin-top:6px;display:inline-block"><button id="invBtn" onclick="invertImage(this,'${rel}','clip')" style="padding:3px 10px;font-size:11px">🔤 reveal nearest prompt</button></div>`;
+    if (m.native_prompt !== undefined)
+      inv += `<div style="margin-top:4px;color:#8fd48a">🔡 \u201C${m.native_prompt}\u201D <span style="color:#9aa0ad">model's own encoder (native, cond-cos ${m.native_sim})</span>${genBtn("native")}</div>`;
+    else if (nativeable)
+      inv += `<span style="margin-left:8px"><button id="invBtnN" onclick="invertImage(this,'${rel}','native')" style="padding:3px 10px;font-size:11px">🔡 native prompt</button></span>`;
     const keys = Object.keys(m);
-    if (!keys.length) { box.innerHTML = `<span style="color:#9aa0ad">${rel} — no params recorded (pre-dates param logging)</span>${scoreLine}`; return; }
+    if (!keys.length) { box.innerHTML = `<span style="color:#9aa0ad">${rel} — no params recorded (pre-dates param logging)</span>${scoreLine}` + inv; return; }
     const ordered = PARAM_ORDER.filter(k => k in m && m[k] !== null);
     const cli = buildCli(m);
     const LINKED = new Set(["parent", "parent_b", "refined_from"]);
@@ -1504,9 +1820,44 @@ async function openLight(src, rel, score){
     };
     box.innerHTML = `<div style="color:#e0a13d;margin-bottom:4px">${rel}${scoreLine}</div>` +
       ordered.map(render).join("") +
-      (cli ? `<div style="margin-top:6px;color:#7fae7f">${cli}</div>` : "");
+      (cli ? `<div style="margin-top:6px;color:#7fae7f">${cli}</div>` : "") + inv;
   } catch(e){ box.textContent = ""; }
 }
+
+function pollJob(jid, onDone){
+  const t = setInterval(async () => {
+    try {
+      const st = await (await fetch("/api/state")).json();
+      const j = (st.jobs || []).find(x => x.id === jid);
+      if (j && ["done", "error", "cancelled"].includes(j.status)) {
+        clearInterval(t); onDone(j.status);
+      }
+    } catch(e){}
+  }, 4000);
+}
+
+async function invertImage(btn, rel, space){
+  if (btn) { btn.disabled = true; btn.textContent = (space === "native" ? "🔡" : "🔤") + " inverting… (queued)"; }
+  const r = await (await fetch("/api/invert", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({src: rel, space: space || "clip"})})).json();
+  pollJob(r.job_id, () => {
+    if (currentRel === rel)              // still looking at it -> refresh panel
+      openLight($("#lightimg").src, rel, currentScore);
+  });
+}
+
+async function genFromPrompt(btn, rel, which){
+  if (btn) { btn.disabled = true; btn.textContent = "🎨 rendering… (queued)"; }
+  const r = await (await fetch("/api/genprompt", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({src: rel, which: which})})).json();
+  pollJob(r.job_id, (status) => {
+    if (btn) btn.textContent = status === "done" ? "🎨 done — in gallery ✓" : "🎨 " + status;
+    if (status === "done") refreshImages();   // the comparison appears beside its parent
+  });
+}
+
 function openParent(name){
   const rel = "generated/" + name;
   openLight("/img?path=" + encodeURIComponent(rel), rel, null);
@@ -1527,13 +1878,39 @@ function buildCli(m){
   }
   return "";
 }
-$("#lightbox").onclick = (e) => { if (e.target.id !== "lightmeta") $("#lightbox").style.display = "none"; };
+function lightNav(d){
+  if (!currentView.length) return;
+  let i = lightIdx < 0 ? (d > 0 ? 0 : currentView.length - 1) : lightIdx + d;
+  if (i < 0 || i >= currentView.length) return;
+  const im = currentView[i];
+  openLight(im.url + "&t=" + Math.floor(im.mtime), im.rel, im.score);
+}
+$("#lbPrev").onclick = (e) => { e.stopPropagation(); lightNav(-1); };
+$("#lbNext").onclick = (e) => { e.stopPropagation(); lightNav(1); };
+document.addEventListener("keydown", (e) => {
+  if ($("#lightbox").style.display !== "flex") return;
+  if (e.key === "ArrowLeft") { e.preventDefault(); lightNav(-1); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); lightNav(1); }
+  else if (e.key === "Escape") $("#lightbox").style.display = "none";
+});
+$("#lightbox").onclick = (e) => { if (e.target.id !== "lightmeta" && e.target.tagName !== "BUTTON") $("#lightbox").style.display = "none"; };
 $("#lightmeta").onclick = (e) => e.stopPropagation();
 
 $("#rfPromptSel").onchange = () => {
   $("#rfPromptCustomWrap").style.display = $("#rfPromptSel").value === "custom" ? "" : "none";
 };
 $("#sortBy").onchange = () => { shown = PAGE; renderGallery(); };
+$("#wipeBtn").onclick = async () => {
+  const p = await (await fetch("/api/wipe/preview")).json();
+  if (!p.count) { alert("nothing to wipe: no non-starred images scored below 5."); return; }
+  if (!confirm(`Delete ${p.count} images (not starred, score < 5)?\nFavorites and their originals are protected. This cannot be undone.`)) return;
+  $("#wipeBtn").disabled = true; $("#wipeBtn").textContent = "🧹 wiping…";
+  const r = await (await fetch("/api/wipe", {method: "POST"})).json();
+  $("#wipeBtn").disabled = false; $("#wipeBtn").textContent = "🧹 Wipe <5";
+  alert(`deleted ${r.deleted} images (${r.files} files).`);
+  refreshImages();
+};
+
 $("#evolveBtn").onclick = async () => {
   if (!confirm("Refit a distribution branch around your ★ favorites and sample 8 images from it?")) return;
   $("#evolveBtn").disabled = true;
