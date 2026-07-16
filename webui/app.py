@@ -308,9 +308,12 @@ def _model_flags(req: RunRequest) -> list[str]:
     """--ckpt for single-file backends (sd15/sd2), --model for sdxl (cached HF id)."""
     if req.backend in SINGLE_FILE_CKPT:
         ckpt = SINGLE_FILE_CKPT[req.backend]
-        if not Path(ckpt).exists():
+        p = Path(ckpt)
+        if not p.exists():
             raise HTTPException(400, f"{req.backend} checkpoint not found: {ckpt}")
-        return ["--ckpt", ckpt]
+        # A diffusers *folder* loads via from_pretrained (--model); a single-file
+        # .ckpt/.safetensors loads via from_single_file (--ckpt).
+        return ["--model", ckpt] if p.is_dir() else ["--ckpt", ckpt]
     if req.backend == "flux2":
         return ["--model", os.environ.get("SA_FLUX2_MODEL",
                                           "black-forest-labs/FLUX.2-klein-4B")]
