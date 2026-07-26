@@ -1,0 +1,75 @@
+# Task: rebuild the Semantic Anarchy dashboard frontend as a React app
+
+Repo: `/home/rednax/SSD2TB/Github_repos/LatentAnarchy/semantic-anarchy` (read `CLAUDE.md` first).
+
+Today the entire UI is an inline `INDEX_HTML` string in `webui/app.py` (~1400 lines of HTML/CSS + 567 lines
+of vanilla JS, starting around line 1109). Replace it with a proper frontend app. **Do not touch the Python
+job-running logic** — `app.py` keeps its 22 `/api/*` endpoints, its single worker thread, and its
+"orchestrate, never compute" design. This is a frontend-only rewrite plus two small backend additions
+(below).
+
+## Stack
+
+Vite + React + TypeScript, in `webui/frontend/`. Use:
+- **TanStack Query** for all server state — replaces every manual `setInterval` poll of
+  `/api/state`, `/api/images`, `/api/meta`, `/api/films`. Mutations invalidate queries.
+- **Tailwind v4 + Radix primitives** (shadcn/ui is fine). Port the existing dark palette
+  (the `:root` CSS variables in `app.py`) into the Tailwind theme — keep the look, sharpen it.
+- **Zustand** for client-only state: selected job, lightbox index, breed-selection pair, active tab.
+- **`@tanstack/react-virtual`** for the gallery, replacing the current 200-item pagination entirely.
+
+## The core requirement: a declarative param schema
+
+The current sidebar has ~45 inputs whose visibility is toggled via CSS classes (`.genonly`, `.genimg`,
+`.coh`, `.ngen`, `#sdxlModelWrap`). Replace that with a data-driven schema — one entry per knob, e.g.:
+
+```ts
+{ id: "coherence", label: "Coherence λ", type: "number", step: 0.1, placeholder: "0.5",
+  group: "sampler", when: { action: ["generate"], sampler: ["blend"] },
+  hint: "0 ≡ diagonal, 1 ≡ pca" }
+```
+
+Rendering, form state, and the `/api/run` payload all derive from this one array. Adding a knob must mean
+adding one object and nothing else. Preserve every existing control, default, placeholder, and tooltip —
+cross-check against `build_argv` and `cli_args.py` so no knob is silently dropped.
+
+## Structure
+
+```
+webui/frontend/src/
+  api/       client.ts, types.ts, queries.ts    # all fetch calls, fully typed
+  params/    schema.ts, Field.tsx, ParamPanel.tsx
+  features/
+    jobs/    JobList, JobLog, StatusDot
+    gallery/ Gallery, Card, Lightbox, Filters
+    taste/   EvolveBar, AnalyzeBar, ScoreBar, WipeDialog
+    refine/  RefineBar, ExploreBar
+  store.ts
+  App.tsx
+```
+
+## Backend changes (only these two)
+
+1. Add an SSE endpoint streaming appended job-log lines, replacing polling of `/api/log/{job_id}`.
+   Keep the existing endpoint working.
+2. Serve the built frontend: mount `webui/frontend/dist` via `StaticFiles` at `/`, and move the old
+   `INDEX_HTML` route to `/legacy` so the current dashboard stays reachable until parity is confirmed.
+
+## Environment & verification
+
+- Python deps via **uv** (`uv pip install ...` into the repo's `.venv`) — never plain `pip`, never a new venv.
+- Frontend: use `npm` in `webui/frontend/`. Check `node --version` first; if node is missing, stop and tell me.
+- Configure the Vite dev server to proxy `/api` and `/img` to `http://127.0.0.1:8800`.
+- Add `webui/frontend/node_modules` and `webui/frontend/dist` to `.gitignore`.
+
+Before reporting done, you must actually verify:
+1. `pytest -q` still passes (36 tests) — you changed nothing Python-critical, prove it.
+2. `npm run build` succeeds with zero TypeScript errors.
+3. Start the server (`SA_HOST=127.0.0.1 ./webui/run.sh`, backgrounded) and curl the endpoints:
+   `/api/config`, `/api/state`, `/api/images` — confirm the new UI is served at `/` and the old one at `/legacy`.
+4. Load the page in a headless browser (playwright), screenshot it, and confirm no console errors.
+   Exercise at least: switching action + backend (params show/hide correctly), the gallery rendering,
+   opening the lightbox. Do **not** trigger a real GPU generate job.
+
+Report honestly: if something is unverified or broken, say so explicitly rather than claiming completion.
+Keep the old `INDEX_HTML` in place — I'll delete it once I've used the new UI.

@@ -31,6 +31,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from semantic_anarchy.clip_compat import image_features
+
 EMB_FILE = Path("outputs/clip_embeds.npz")
 NOVELTY_FILE = Path("outputs/novelty.json")
 RESONANCE_FILE = Path("outputs/resonance.json")
@@ -69,7 +71,7 @@ def embed_new(names, vecs, batch=16):
             chunk = todo[i:i + batch]
             imgs = [Image.open(p).convert("RGB") for _, p in chunk]
             inputs = proc(images=imgs, return_tensors="pt").to(device)
-            f = clip.get_image_features(**inputs)
+            f = image_features(clip, inputs)
             f = f / f.norm(dim=-1, keepdim=True)
             new_vecs.append(f.float().cpu().numpy())
             print(f"[resonance]   embed {min(i + batch, len(todo))}/{len(todo)}", flush=True)

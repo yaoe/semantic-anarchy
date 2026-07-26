@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Semantic Anarchy — Algorithm Report &amp; Idea Backlog</title>
+<style>
+  :root {
+    --bg: #fbfbfd; --fg: #1a1d21; --muted: #5b6470; --accent: #7c3aed; --accent2: #db2777;
+    --card: #f4f5f8; --border: #e2e5ea; --code-bg: #edeff4; --warn: #b45309;
+    --good: #047857; --link: #2563eb;
+    --shadow: 0 1px 2px rgba(16,18,24,.05), 0 6px 20px rgba(16,18,24,.06);
+    --zebra: rgba(16,18,24,.025);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216; --fg: #e6e8eb; --muted: #9aa3af; --accent: #a78bfa; --accent2: #f472b6;
+      --card: #191c22; --border: #2a2f38; --code-bg: #20242c; --warn: #fbbf24;
+      --good: #34d399; --link: #60a5fa;
+      --shadow: 0 1px 2px rgba(0,0,0,.45), 0 6px 20px rgba(0,0,0,.35);
+      --zebra: rgba(255,255,255,.025);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.68 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Inter", sans-serif;
+    max-width: 1000px; margin: 0 auto; padding: 2.5rem 1.5rem 7rem;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+  a { color: var(--link); }
+  .hero { margin-bottom: 2.2rem; }
+  .hero h1 {
+    font-size: clamp(1.7rem, 4vw, 2.3rem); line-height: 1.2; margin: .2rem 0 .5rem;
+    letter-spacing: -.02em;
+    background: linear-gradient(100deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero .sub { color: var(--muted); margin: .2rem 0 .9rem; max-width: 62ch; }
+  .metabar { display: flex; flex-wrap: wrap; gap: .45rem; }
+  .metabar .pill { font-size: .78rem; }
+  h2 {
+    font-size: 1.45rem; letter-spacing: -.01em; margin-top: 3.2rem; padding-top: 1.2rem;
+    border-top: 1px solid var(--border); color: var(--accent);
+  }
+  h2::before { content: ""; display: block; width: 3.2rem; height: 3px; margin-bottom: 1rem;
+               border-radius: 2px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+  h3 { font-size: 1.13rem; margin-top: 2.1rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .88em; }
+  code { background: var(--code-bg); padding: .12em .35em; border-radius: 5px; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.2rem; overflow-x: auto; line-height: 1.5; box-shadow: var(--shadow);
+  }
+  pre code { background: none; padding: 0; }
+  .math {
+    background: var(--card); border-left: 3px solid var(--accent); border-radius: 0 10px 10px 0;
+    padding: .8rem 1.2rem; margin: 1.1rem 0; overflow-x: auto; box-shadow: var(--shadow);
+    font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-size: 1.05rem;
+  }
+  .math .lbl { float: right; color: var(--muted); font-family: inherit; font-size: .85rem; padding-left: 1rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1.1rem 0; font-size: .92rem; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--border); padding: .5rem .75rem; text-align: left; vertical-align: top; }
+  th { background: var(--card); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--zebra); }
+  .file { color: var(--muted); font-size: .85em; }
+  .note {
+    background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--warn);
+    border-radius: 0 10px 10px 0; padding: .7rem 1.1rem; margin: 1.1rem 0; box-shadow: var(--shadow);
+  }
+  .note.good { border-left-color: var(--good); }
+  .toc {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1.1rem 1.6rem 1.2rem; margin: 1.6rem 0; box-shadow: var(--shadow);
+  }
+  .toc ol { margin: .5rem 0 0 1.1rem; padding: 0; columns: 2; column-gap: 2.5rem; }
+  .toc li { break-inside: avoid; padding: .1rem 0; }
+  @media (max-width: 700px) { .toc ol { columns: 1; } }
+  .toc a { color: var(--link); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .pill { display: inline-block; background: var(--code-bg); border: 1px solid var(--border);
+          border-radius: 999px; padding: .05em .65em; font-size: .8em; color: var(--muted); }
+  .diagram { font-size: .82rem; }
+  sup, sub { line-height: 0; }
+
+  /* ——— idea cards (§13) ——— */
+  .lever { color: var(--accent2); font-weight: 650; }
+  .idea {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1.05rem 1.3rem 1.1rem; margin: 1.1rem 0; box-shadow: var(--shadow);
+    transition: border-color .15s ease;
+  }
+  .idea:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .idea h4 { margin: 0; font-size: 1.04rem; letter-spacing: -.01em; }
+  .idea h4 .num { color: var(--accent); font-weight: 700; margin-right: .45rem; font-variant-numeric: tabular-nums; }
+  .idea p { margin: .55rem 0 0; }
+  .tags { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .55rem; }
+  .tag { font-size: .72rem; font-weight: 600; letter-spacing: .02em; border-radius: 999px;
+         padding: .13em .65em; border: 1px solid currentColor; background: transparent; }
+  .tag.flag    { color: var(--good); }      /* existing flags / ~10 lines */
+  .tag.script  { color: var(--link); }      /* standalone script, no core changes */
+  .tag.sampler { color: var(--accent); }    /* new sampler / fit change */
+  .tag.pipe    { color: var(--warn); }      /* touches the decode pipeline */
+  .tag.lev     { color: var(--accent2); border-style: dashed; }
+  .combo { color: var(--muted); font-size: .85rem; margin-top: .6rem; }
+  .combo a { text-decoration: none; }
+  .queue td:first-child { white-space: nowrap; font-weight: 600; }
+  .totop {
+    position: fixed; right: 1.1rem; bottom: 1.1rem; z-index: 10;
+    width: 2.6rem; height: 2.6rem; display: flex; align-items: center; justify-content: center;
+    background: var(--card); border: 1px solid var(--border); border-radius: 50%;
+    color: var(--muted); text-decoration: none; font-size: 1.1rem; box-shadow: var(--shadow);
+  }
+  .totop:hover { color: var(--accent); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>Semantic Anarchy — algorithm report &amp; idea backlog</h1>
+  <p class="sub">A code-level reconstruction of the algorithm in <code>semantic-anarchy</code>, restricted to the <strong>SD1.5 backend</strong>, with all statistical details made explicit — plus a backlog of new experiments to run (<a href="#ideas">§13</a>).</p>
+  <div class="metabar">
+    <span class="pill">SD1.5 backend</span>
+    <span class="pill">commit <code>4916175</code></span>
+    <span class="pill">written 2026-07-17</span>
+    <span class="pill">§13 · 21 new experiments</span>
+  </div>
+</header>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#tldr">Executive summary — is it your algorithm?</a></li>
+    <li><a href="#pipeline">Pipeline overview</a></li>
+    <li><a href="#mining">Stage 1 — Mining: harvesting CLIP conditioning</a></li>
+    <li><a href="#fitting">Stage 2 — Fitting: the statistical model</a></li>
+    <li><a href="#sampling">Stage 3 — Sampling: four samplers + post-ops</a></li>
+    <li><a href="#decoding">Stage 4 — Decoding through the UNet</a></li>
+    <li><a href="#local">Local navigation: neighborhood / walk / breed</a></li>
+    <li><a href="#evolution">Selection &amp; evolution: three feedback loops</a></li>
+    <li><a href="#diffs">Where this differs from your original implementation</a></li>
+    <li><a href="#gotchas">Statistical fine print &amp; potential gotchas</a></li>
+    <li><a href="#state">What's actually mined in this repo right now</a></li>
+    <li><a href="#oldcode">Addendum: the actual old implementation, compared</a></li>
+    <li><a href="#ideas">New ideas — the next round of experiments</a></li>
+  </ol>
+</div>
+
+<h2 id="tldr">1 · Executive summary — is it your algorithm?</h2>
+
+<p><strong>Yes — the core is exactly your idea, and it is the default path.</strong> The repo encodes a corpus of ~1000 prompts through the SD1.5 CLIP text encoder once, fits an <em>independent Gaussian per coordinate</em> of the <code>(77, 768)</code> conditioning tensor (μ, σ per latent — 59,136 univariate Gaussians), samples fresh conditioning as <code>c = μ + T·σ⊙z</code>, and feeds it straight to the UNet via diffusers' <code>prompt_embeds</code>, bypassing the text encoder entirely. Good latents are saved as per-image <code>.npz</code> sidecars and can be refit into new distributions ("evolved branches"). Temperature scaling and sigma-clipping (a GAN-style truncation trick) are both there.</p>
+
+<p><strong>But your friend built substantially more around that core.</strong> The four biggest additions, in decreasing order of statistical significance:</p>
+<ol>
+  <li><strong>A correlated (low-rank PCA) sampler.</strong> The fit also stores the top <em>N−1</em> principal components of the corpus cloud, and a <code>pca</code> sampler draws deviations <em>inside that subspace</em> — deliberately breaking your "uncorrelated" assumption to get more coherent samples, with a <code>blend</code> sampler interpolating the two covariances exactly.</li>
+  <li><strong>A calibrated distance gauge + shell sampling.</strong> Every sample gets an RMS z-score distance from the corpus center; samples can be floored ("never below d=1.0") or pinned to a target shell — a more surgical version of temperature.</li>
+  <li><strong>Formalized iteration.</strong> Your "save good latents → recompute statistics" loop exists in three flavors: a cross-entropy-method (CEM) evolution loop with an aesthetic scorer, a favorites-refit script, and an autonomous "frontier hunter" that optimizes a Pareto front of novelty × learned personal taste.</li>
+  <li><strong>A SLERP "hybrid" sampler</strong> that fuses two real corpus embeddings instead of sampling the Gaussian at all.</li>
+</ol>
+
+<p>One notable <em>restriction</em> relative to your description: there is <strong>no per-coordinate sigma modulation</strong>. Temperature is a single global scalar on the whole deviation; you cannot skew or reshape individual σ's (the closest substitutes are PCA band selection and the <code>equalize</code> flag, which operate per principal axis, not per coordinate). Also note it is a <em>single</em> diagonal Gaussian, not a multi-modal mixture — no k&gt;1 mixture fitting exists anywhere in the code. Details in <a href="#diffs">§9</a>.</p>
+
+<h2 id="pipeline">2 · Pipeline overview</h2>
+
+<pre class="diagram">
+ prompts_1000.txt ──▶ CLIP text encoder (used ONCE) ──▶ E ∈ ℝ^(1000×77×768)
+                                                          │
+                          ┌───────────────────────────────┴───────────────────┐
+                          │  FIT  (distribution.py)                           │
+                          │  μ, σ ∈ ℝ^(77×768)   per-coordinate Gaussian      │
+                          │  V ∈ ℝ^(999×59136), s ∈ ℝ^999   PCA of the cloud  │
+                          │  C ∈ ℝ^(256×77×768)  retained raw corpus subset   │
+                          └───────────────────────────────┬───────────────────┘
+                                                          │  saved: outputs/dist.npz
+              SAMPLE  c = μ + T·dev     dev from one of:  ▼
+              diagonal σ⊙z │ pca (a·s)V │ blend √λ·pca+√(1−λ)·diag │ hybrid SLERP
+                          + optional truncation, distance floor, shell retarget
+                                                          │
+                UNet(prompt_embeds = c)  + CFG vs empty-prompt embedding
+                          30 steps · guidance 7.5 · 512×512                │
+                                                          ▼
+                 image.png + image.npz (the latent!) + image.json (params, distance)
+                                                          │
+        ┌─────────────────────────────────────────────────┴──────────────┐
+        │ CURATE: star favorites / aesthetic score / novelty / taste model│
+        │ ITERATE: refit_from_elites (CEM · favorites) → evolved branch   │
+        │ NAVIGATE: neighborhood · walk · breed around saved latents      │
+        └──────────────────────────────────────────────────────────────────┘
+</pre>
+
+<h2 id="mining">3 · Stage 1 — Mining: harvesting CLIP conditioning</h2>
+<p class="file">scripts/mine_distribution.py · semantic_anarchy/pipeline.py (<code>SDModel.encode_prompts</code>, lines 255–276)</p>
+
+<ul>
+  <li><strong>Corpus:</strong> <code>prompts_1000.txt</code> — 1000 deterministic "good prompts" (regenerable via <code>gen_prompts.py</code>). Blank lines and <code>#</code> comments stripped.</li>
+  <li><strong>Encoder call:</strong> the stock diffusers <code>pipe.encode_prompt(..., do_classifier_free_guidance=False)</code> in batches of 16. This is the standard SD1.5 conditioning: tokenize to exactly 77 tokens (BOS + text + EOS + padding), CLIP ViT-L/14 text encoder, <em>final</em> hidden states after the final layer norm. No pooling, no layer skipping.</li>
+  <li><strong>Precision:</strong> embeddings are cast to <code>float32</code> on the way out; the fit later promotes to <code>float64</code>.</li>
+  <li><strong>Result:</strong> <code>E</code> of shape <code>(N=1000, 77, 768)</code>. This is the <em>only</em> time the text encoder runs; generation never touches it.</li>
+</ul>
+
+<div class="note good"><strong>Matches your design:</strong> these are precisely "the activations that normally feed into the unet" — the cross-attention conditioning tensor, recorded once per prompt.</div>
+
+<h2 id="fitting">4 · Stage 2 — Fitting: the statistical model</h2>
+<p class="file">semantic_anarchy/distribution.py (<code>EmbeddingDistribution.fit</code>, lines 114–222)</p>
+
+<h3>4.1 The diagonal Gaussian (your model)</h3>
+<p>Default (<code>per_token=True</code>): one independent Gaussian per <em>(token, feature)</em> coordinate:</p>
+<div class="math">
+  μ<sub>t,f</sub> = (1/N) Σ<sub>i</sub> E<sub>i,t,f</sub> &nbsp;&nbsp;&nbsp;
+  σ<sub>t,f</sub> = √( (1/N) Σ<sub>i</sub> (E<sub>i,t,f</sub> − μ<sub>t,f</sub>)² ) &nbsp;&nbsp;&nbsp;
+  σ ← max(σ, 10⁻⁴)
+  <span class="lbl">77 × 768 = 59,136 Gaussians</span>
+</div>
+<ul>
+  <li>σ uses NumPy's default <strong>ddof = 0</strong> (biased, 1/N) estimator; the PCA spectrum below uses 1/(N−1). A ~0.05% inconsistency at N=1000 — cosmetic, but worth knowing.</li>
+  <li>The <code>std_floor = 1e-4</code> guards collapsed coordinates. Important side effect of the per-token fit: structurally constant positions (the BOS token embedding is identical for every prompt; late padding positions are nearly so) get σ ≈ 0, so <em>samples automatically reproduce CLIP's structural tokens almost exactly</em>. This is a quiet but significant reason per-token diagonal sampling works at all.</li>
+  <li>An alternative <code>--pooled</code> mode collapses the token axis into a single shared <code>(768,)</code> Gaussian (mean/std over all N·77 rows) — a stronger prior yielding "calmer" samples. Not the default.</li>
+</ul>
+
+<h3>4.2 The low-rank PCA structure (beyond your model)</h3>
+<p>The fit additionally flattens each embedding to <code>D = 59,136</code> dims, centers by μ, and takes an economy SVD:</p>
+<div class="math">
+  X<sub>c</sub> = X − 1μᵀ = U S Vᵀ, &nbsp;&nbsp; keep V<sub>k</sub> ∈ ℝ<sup>k×D</sup> (rows = top right-singular vectors), &nbsp;
+  s<sub>j</sub> = S<sub>j</sub> / √(N−1)
+  <span class="lbl">k = N−1 = 999 by default</span>
+</div>
+<ul>
+  <li><code>pca_std[j] = s_j</code> is the per-component standard deviation of the corpus along axis <em>j</em>. With the default <code>n_components=None</code>, all 999 non-trivial components are kept, so the PCA basis captures <em>100%</em> of corpus variance (<code>total_var</code> is stored with the same 1/(N−1) normalization for the bookkeeping fraction).</li>
+  <li>This adds what your uncorrelated model deliberately threw away: the <em>correlation structure</em> between coordinates — i.e. the actual manifold directions the corpus varies along.</li>
+</ul>
+
+<h3>4.3 The retained raw corpus</h3>
+<p>Up to <code>max_corpus = 256</code> raw embeddings are kept inside the saved distribution (random subset, fixed seed 0) to power the <code>hybrid</code> SLERP sampler. Everything is persisted to a compressed <code>.npz</code> plus a small <code>.meta.json</code>.</p>
+
+<h2 id="sampling">5 · Stage 3 — Sampling: four samplers + post-ops</h2>
+<p class="file">semantic_anarchy/distribution.py (<code>sample</code>, lines 225–366)</p>
+
+<p>All samplers share one master formula (except <code>hybrid</code>, which returns full samples):</p>
+<div class="math">
+  c = μ + T · dev
+  <span class="lbl">T = <code>--temperature</code>, global scalar</span>
+</div>
+
+<h3>5.1 <code>diagonal</code> — your original sampler (the default)</h3>
+<div class="math">
+  z ~ 𝒩(0, I) ∈ ℝ<sup>77×768</sup>, &nbsp; z ← truncate(z), &nbsp; dev = σ ⊙ z
+</div>
+<p>Independent per-coordinate draws. At T = 1 this reproduces each marginal exactly but ignores all correlations — "maximal anarchy," off-manifold by construction.</p>
+
+<h3>5.2 <code>pca</code> — draw within the corpus subspace</h3>
+<div class="math">
+  a ~ 𝒩(0, I<sub>m</sub>), &nbsp; a ← truncate(a), &nbsp;
+  dev = (a ⊙ scale) V<sub>band</sub>, &nbsp;
+  V<sub>band</sub> = V[lo : lo+m]
+</div>
+<ul>
+  <li><strong>Axis band selection:</strong> <code>--comp-lo</code> / <code>--components</code> pick a window of principal axes. <code>comp_lo = 0</code> rides the dominant (generic, "tasteful") directions; setting it higher (the drives use 40–200) skips those and rides idiosyncratic minor axes — the "weird-but-coherent" knob.</li>
+  <li><strong>Natural scale</strong> (default): <code>scale = s_band</code>, each axis at its own corpus variance. <strong><code>--equalize</code>:</strong> every selected axis instead gets the same magnitude, the RMS of the <em>full</em> spectrum: <code>scale_j = √(mean(s²))</code> — so minor axes, normally inaudible, are expressed at full strength.</li>
+  <li>Since samples stay in span(V), T &gt; 1 <em>extrapolates along real corpus directions</em> — outside the convex hull but on the manifold's axes. This is the repo's flagship "coherent chaos" mode.</li>
+</ul>
+
+<h3>5.3 <code>blend</code> — exact covariance interpolation</h3>
+<div class="math">
+  dev = √λ · dev<sub>pca</sub> + √(1−λ) · dev<sub>diag</sub>
+  &nbsp;&nbsp;⇒&nbsp;&nbsp; Cov = λ·V<sup>T</sup>S²V + (1−λ)·diag(σ²)
+  <span class="lbl">λ = <code>--coherence</code> ∈ [0,1]</span>
+</div>
+<p>Because the two deviations are drawn independently, the √-weighting makes the resulting covariance an exact <em>linear</em> interpolation of the two covariance matrices. λ=0 and λ=1 reproduce the pure samplers bit-for-bit (same RNG consumption).</p>
+
+<h3>5.4 <code>hybrid</code> — SLERP concept fusion (no Gaussian at all)</h3>
+<div class="math">
+  pick a, b from the 256 retained corpus rows, &nbsp; t ~ U(0.3, 0.7)<br>
+  c = slerp(a, b, t) + 0.15 · T · σ ⊙ z
+</div>
+<p>The SLERP interpolates <em>direction</em> on the unit hypersphere of the flattened 59,136-dim vectors and lerps the magnitudes, so fusions keep corpus-typical norm instead of collapsing toward the center like a plain lerp. The additive jitter (15% of a temperature-T diagonal deviation) keeps children off exact corpus chords. This sampler stays <em>inside</em> the hull.</p>
+
+<h3>5.5 Truncation (the σ-clipping you described)</h3>
+<p class="file">distribution.py <code>_truncate</code>, lines 26–41</p>
+<p><code>--truncation τ</code> applies to the standard-normal coefficients <em>before</em> scaling: any |z| &gt; τ is <strong>resampled up to 8 times, then hard-clipped</strong> to ±τ — the GAN truncation trick. It applies identically to per-coordinate z's (diagonal) and per-component a's (pca), so the knob means the same thing everywhere. Off by default.</p>
+<p>Separately, <code>project()</code> (lines 462–471) implements "creation through projection": whiten any arbitrary tensor by (μ, σ), clip to ±3σ, unwhiten — pulling out-of-domain tensors onto the typical set.</p>
+
+<h3>5.6 The distance gauge and shell operations</h3>
+<p class="file">distribution.py <code>distance/retarget</code> lines 368–454 · backend.py <code>floor_distance/retarget</code> lines 151–171</p>
+<div class="math">
+  d(x) = √( mean<sub>t,f</sub> [ ((x−μ)/σ̃)² ] ), &nbsp;&nbsp; σ̃ = max(σ, 0.1·mean(σ))
+</div>
+<p>An RMS z-score whitened by the fitted Gaussian — a typical corpus sample sits near d ≈ 1, a temperature-T diagonal sample near d ≈ T. The σ floor at 10% of the mean σ prevents near-constant coordinates (BOS, padding) from exploding the gauge for anchors not minted from this exact fit. Two post-ops use it, both preserving <em>direction</em> and rescaling only the radius:</p>
+<ul>
+  <li><code>--min-distance f</code>: any sample with d &lt; f is pushed out onto the floor: <code>x ← μ + (x−μ)·f/d</code>. (The hunter runs with f = 1.0 — "never dip into the bland corpus core.")</li>
+  <li><code>--target-distance t</code>: <em>shell sampling</em> — every sample is rescaled to d = t exactly, so you draw on the ring where your keepers live while the sampler still supplies the direction.</li>
+</ul>
+<p>Every generated image's JSON sidecar records its d, which is what makes taste-band targeting possible later.</p>
+
+<h2 id="decoding">6 · Stage 4 — Decoding through the UNet</h2>
+<p class="file">semantic_anarchy/pipeline.py (<code>SDModel.generate_from_embeddings</code>, lines 289–367) · scripts/generate.py</p>
+
+<ul>
+  <li>Each sampled <code>c (77×768)</code> is passed as <code>prompt_embeds</code> to the stock <code>StableDiffusionPipeline</code> — no forked diffusers, no hooks. Images are generated <strong>one at a time</strong>, seed <code>= batch_seed + i</code> per image for independent reproducibility. Batch seed is random (and printed) unless <code>--seed</code> is given.</li>
+  <li><strong>CFG:</strong> defaults <code>steps=30, guidance=7.5</code>, 512×512. The negative branch is <strong>always the cached empty-prompt encoding</strong> for SD1.5. Statistically this matters: with guidance g, the effective denoising direction is <code>ε(∅) + g·(ε(c) − ε(∅))</code>, so what gets amplified 7.5× is the sampled conditioning <em>relative to the empty prompt</em> — CFG acts as a second, image-space "temperature" on top of T.</li>
+  <li>Scheduler is the pipeline default (PNDM for SD1.5) unless <code>--scheduler ddim|euler|euler_a|dpm</code>; the drives run DDIM. Safety checker is disabled.</li>
+  <li><strong>Sidecars:</strong> every image gets <code>{stem}.npz</code> holding its exact conditioning tensor (this is your "save the good latents" — saved for <em>all</em> images, curation happens later) and <code>{stem}.json</code> with every knob plus the distance d.</li>
+  <li>Optional entropy injection: <code>--init-dir</code> starts each image img2img from a random "good init" at strength 0.7, or <code>--init-mode embedding</code> injects the init through IP-Adapter (CLIP <em>image</em> embedding via cross-attention) while still denoising from pure noise. Plus an img2img hires-refine (<code>refine_image</code>) that reuses the sidecar conditioning so upscales reinforce the same content.</li>
+</ul>
+
+<div class="note"><strong>Quirk:</strong> <code>SD15Backend.generate</code> accepts a <code>neg_mode</code> argument (<code>mean|empty|zeros</code>) but <em>ignores it</em> — the corpus-mean negative trick is only wired up for SDXL (backend.py line 243–252 vs 311–324). On SD1.5 the negative is always the empty prompt, whatever you pass.</div>
+
+<h2 id="local">7 · Local navigation: neighborhood / walk / breed</h2>
+<p class="file">distribution.py lines 383–439 · backend.py <code>perturb/breed/walk</code> · scripts/explore.py</p>
+
+<p>Because every image's latent is saved, any image is a navigable anchor <code>x</code>:</p>
+<table>
+  <tr><th>Mode</th><th>Math</th><th>Semantics</th></tr>
+  <tr><td><code>neighborhood</code></td><td><code>x + r·dev</code>, dev drawn from the <em>full PCA spectrum</em> at natural scales (fallback: diagonal), r = <code>--radius</code> (default 0.3)</td><td>"Step 30% of a typical corpus deviation away" — hill-climbing on taste, the frontier hunter uses r = 0.25</td></tr>
+  <tr><td><code>walk outward</code></td><td>frame i: <code>μ + (x−μ)·(1+step·(i+1))</code></td><td>March along the anchor's own ray from the corpus center — distance gauge grows ~step per frame; watch legibility strain</td></tr>
+  <tr><td><code>walk axis / random</code></td><td><code>x + step·(i+1)·d</code>, d = <code>s_k·V_k</code> or one random PCA deviation</td><td>Persistent movement along one meaningful direction</td></tr>
+  <tr><td><code>breed</code></td><td><code>slerp(a, b, t)</code> for t ∈ linspace(0.15, 0.85, n), + <code>mutate·pca_dev</code> per child (default 0.15)</td><td>Picbreeder-style children of two parents</td></tr>
+</table>
+
+<h2 id="evolution">8 · Selection &amp; evolution: three feedback loops</h2>
+
+<h3>8.1 The refit primitive (your "recompute statistics on keepers")</h3>
+<p class="file">distribution.py <code>refit_from_elites</code>, lines 474–498</p>
+<div class="math">
+  μ′ = mean(elites) &nbsp;&nbsp;&nbsp;
+  σ′ = β·σ<sub>base</sub> + (1−β)·std(elites), &nbsp; β = 0.25 &nbsp;&nbsp;&nbsp;
+  σ′ ← max(σ′, 0.1·σ<sub>base</sub>)
+</div>
+<p>Crucially this is <em>not</em> a raw refit: the elite spread is blended with 25% of the base corpus spread and floored at 10% of it, so branches specialize without collapsing to a point. The refit result carries no PCA; <code>evolve_favorites.py</code> explicitly grafts the base corpus PCA axes and retained corpus back onto the branch so all samplers keep working on it.</p>
+
+<h3>8.2 Loop A — CEM evolution with a scorer <span class="pill">scripts/evolve.py</span></h3>
+<p class="file">semantic_anarchy/evolve.py · aesthetic.py</p>
+<pre>for each generation (default 10):
+    population = dist.sample(64, T, truncation)     # diagonal sampler
+    scores     = scorer(population)                 # decode → score images
+    elites     = top 25% by score
+    dist       = dist.refit_from_elites(elites)     # β = 0.25</pre>
+<p>Scorers: <code>aesthetic</code> = the LAION improved-aesthetic-predictor (CLIP ViT-L/14 image features, L2-normalized, through the 1024→128→64→16→1 linear head — the same head Eden used), <code>human</code> = interactive 1–10 rating, <code>random</code> = plumbing test.</p>
+
+<h3>8.3 Loop B — favorites branch <span class="pill">scripts/evolve_favorites.py</span></h3>
+<p>Collects the <code>.npz</code> latents of every ★-starred image (≥3 required), runs one <code>refit_from_elites</code> on them, grafts the corpus PCA back, saves as <code>outputs/dist_evolved</code>, and samples it (default: diagonal sampler, i.e. tightest to the elite spread). This is the closest analog to your manual iterate-on-keepers workflow.</p>
+
+<h3>8.4 Loop C — the autonomous frontier hunter <span class="pill">webui/hunt_drive.py + scripts/resonance.py</span></h3>
+<p>An unattended generative-recommender loop on top of the web dashboard:</p>
+<ul>
+  <li><strong>Novelty:</strong> every gallery image gets a CLIP ViT-L embedding; novelty = 1 − cosine similarity to its <em>nearest neighbor</em> in the gallery (catches motif repetition, which the corpus-distance gauge cannot).</li>
+  <li><strong>Resonance:</strong> a balanced L2-regularized logistic regression (400 full-batch steps, lr 0.5, λ=10⁻³) on CLIP features, positives = your stars (≥8 required), negatives = 5× randomly sampled non-starred. Output: P(you'd star it) for every image.</li>
+  <li><strong>Frontier:</strong> successive Pareto layers of novelty × resonance ("nothing else is both newer AND more you"), up to 120 images.</li>
+  <li><strong>Strategy portfolio</strong> per round (deliberate variance, never one shell): 30% free-range <code>pca</code> at T ∈ [1.4, 2.2]; 25% taste-band shell targeting (fit a Gaussian to your starred images' recorded distances, draw a target d from it, clip to [1.3, 2.4] — needs ≥10 stars); 25% weird minor axes (<code>comp_lo ∈ {40…200}</code>, <code>equalize</code>, T ∈ [1.05, 1.4]); 20% <code>hybrid</code> fusion. All with <code>min_distance = 1.0</code>. Frontier images that haven't been visited get <code>neighborhood</code> children (r = 0.25).</li>
+</ul>
+<p>A sibling <code>guided_drive.py</code> does exploitation-weighted knob sampling from the star sidecars (add-one smoothing, 15% exploration floor) — though its priors currently steer hard toward SDXL.</p>
+
+<h2 id="diffs">9 · Where this differs from your original implementation</h2>
+
+<table>
+  <tr><th>Your description (4 years ago)</th><th>What the repo does</th><th>Assessment</th></tr>
+  <tr>
+    <td>Mixture of <strong>uncorrelated Gaussians</strong> (μ, σ per latent)</td>
+    <td>Identical as the default: per-(token,feature) diagonal Gaussian, 59,136 (μ, σ) pairs. Note it's a single Gaussian, not a multi-component mixture — if your "mixture" meant k&gt;1 modes, that was <em>not</em> implemented.</td>
+    <td class="good">✅ Faithful core</td>
+  </tr>
+  <tr>
+    <td><strong>Skew the distribution by modulating the sigmas</strong></td>
+    <td>Only a single global temperature scalar: <code>c = μ + T·dev</code>. There is no interface for per-coordinate or per-dimension σ reshaping, asymmetric skewing, or selective amplification of coordinate subsets. Nearest equivalents operate in PCA space: axis band selection (<code>comp_lo/components</code>) and <code>equalize</code>.</td>
+    <td>⚠️ Coarser than yours</td>
+  </tr>
+  <tr>
+    <td><strong>Clipping</strong> and other statistical manipulations</td>
+    <td>Truncation exists, but on the standard-normal coefficients z <em>pre-scaling</em> (resample-8×-then-clip), not on the final values; plus <code>project()</code> (whiten → clip ±3σ → unwhiten) for arbitrary tensors. If your clipping acted on raw activation values, the semantics differ slightly.</td>
+    <td>≈ Equivalent, different parameterization</td>
+  </tr>
+  <tr>
+    <td><em>(not in your version)</em></td>
+    <td><strong>PCA / correlated sampling</strong>: full 999-component low-rank covariance, on-manifold draws, coherent extrapolation at T&gt;1, exact covariance blending. This is the single biggest algorithmic departure — it abandons the uncorrelated assumption when you want it to.</td>
+    <td class="good">➕ Major extension</td>
+  </tr>
+  <tr>
+    <td>Save good latents, <strong>recompute statistics</strong>, iterate</td>
+    <td>Implemented, but the refit is <em>regularized</em>: σ′ = 0.25·σ_base + 0.75·σ_elites, floored at 0.1·σ_base, and the branch inherits the base corpus PCA rather than its own. A raw recompute (your version) would concentrate faster and drift the covariance with your keepers; this version deliberately anchors to the base corpus to avoid collapse.</td>
+    <td>≈ Same intent, more conservative dynamics</td>
+  </tr>
+  <tr>
+    <td><em>(unknown in your version)</em></td>
+    <td><strong>CFG vs the empty prompt at 7.5</strong> is baked into the default decode. If your old implementation ran unguided (or guided differently), the images live in a meaningfully different regime: guidance amplifies the sampled deviation in ε-space by ~7.5× relative to unconditional.</td>
+    <td>⚠️ Check against your old setup</td>
+  </tr>
+  <tr>
+    <td><em>(manual curation)</em></td>
+    <td>Automated taste: LAION aesthetic head, per-user logistic taste model, novelty NN-distance, Pareto frontier, autonomous hunter with a randomized strategy portfolio.</td>
+    <td class="good">➕ New layer entirely</td>
+  </tr>
+  <tr>
+    <td><em>(pure sampling)</em></td>
+    <td>Latent-space <em>navigation</em> instruments: neighborhood perturbation, outward/axis walks, SLERP breeding, shell retargeting, hybrid fusion, init-image entropy injection, IP-Adapter, conditioning-reusing hires refine.</td>
+    <td class="good">➕ New instruments</td>
+  </tr>
+</table>
+
+<h2 id="gotchas">10 · Statistical fine print &amp; potential gotchas</h2>
+<ol>
+  <li><strong>Estimator noise:</strong> 59,136 per-coordinate σ's from N=1000 samples means each σ carries ~4.5% relative sampling error (√(1/2N)); harmless for generation, but per-token statistics are far noisier than pooled ones would be. The PCA spectrum's tail (components ~500–999) is essentially noise-level and mostly matters when <code>equalize</code> amplifies it.</li>
+  <li><strong>ddof mismatch:</strong> diagonal σ uses 1/N, PCA σ and <code>total_var</code> use 1/(N−1). Negligible at N=1000; would bite for tiny elite refits — except <code>refit_from_elites</code> doesn't compute PCA at all.</li>
+  <li><strong>Distance gauge σ-floor:</strong> d(x) uses σ̃ = max(σ, 0.1·mean(σ)). Consequently structural coordinates (BOS/padding, true σ≈10⁻⁴) contribute almost nothing to d — the gauge effectively measures distance in the "live" subspace. Good for robustness; means d is <em>not</em> exactly the Mahalanobis distance of the fitted model.</li>
+  <li><strong>Diagonal + truncation interaction:</strong> truncation acts on z before temperature, so <code>--temperature 2 --truncation 2</code> still reaches 4σ in raw units. The knobs compose multiplicatively, not min().</li>
+  <li><strong>Blend covariance claim is exact</strong> only because the pca and diagonal deviations are drawn independently — the code does this correctly (two separate RNG draws, √λ weights).</li>
+  <li><strong>Hybrid jitter scale:</strong> the 0.15·T·σ noise in the hybrid sampler means temperature has a much weaker (7×-attenuated) effect there than in the other samplers; hybrid images cluster near d ≈ 1 regardless of T.</li>
+  <li><strong><code>neg_mode</code> is a no-op on SD1.5</strong> (always empty-prompt negative), despite the CLI accepting it. Only SDXL implements corpus-mean negatives.</li>
+  <li><strong>Elite refits keep the base PCA verbatim:</strong> an evolved branch samples PCA deviations around <em>your</em> mean but along the <em>base corpus's</em> axes and scales — the covariance never adapts to your taste, only the center and diagonal spread do.</li>
+  <li><strong>Per-token vs pooled is a real fork:</strong> the shipped distribution is per-token. If your old implementation pooled over token positions (768 Gaussians instead of 59,136), the sample texture will differ noticeably — per-token preserves positional structure (BOS/EOS/padding), pooled scrambles it.</li>
+  <li><strong>Corpus retention cap:</strong> only 256 of 1000 raw embeddings survive into the saved distribution; the hybrid sampler fuses from that subset only.</li>
+</ol>
+
+<h2 id="state">11 · What's actually mined in this repo right now</h2>
+<table>
+  <tr><th>Artifact</th><th>Contents</th></tr>
+  <tr><td><code>outputs/dist.npz</code> / <code>.meta.json</code></td><td>SD1.5 base distribution: shape (77, 768), <strong>per_token = true, N = 1000</strong>, total_var = 43,513 (⇒ mean per-coordinate variance ≈ 0.736, RMS σ ≈ 0.86), full PCA present, 256 corpus rows retained.</td></tr>
+  <tr><td><code>outputs/dist_evolved.npz</code></td><td>An evolved SD1.5 branch refit from <strong>14 starred images</strong> (with base PCA grafted on; total_var = 0 because refits don't recompute it).</td></tr>
+  <tr><td><code>outputs/generated/*.png|.npz|.json</code></td><td>Generated gallery with full latent + parameter sidecars, including recorded distances — the raw material for taste-band targeting.</td></tr>
+  <tr><td><code>outputs/favorites.json</code>, <code>novelty.json</code>, <code>resonance.json</code>, <code>taste_model.npz</code></td><td>Curation state for the recommender loops.</td></tr>
+</table>
+
+<h2 id="oldcode">12 · Addendum: the actual old implementation, found and compared</h2>
+<p class="sub">Located at <code>/home/rednax/SSD2TB/Github_repos/cog/eden-sd-pipelines/eden/latent_magic.py</code> (invoked from <code>eden/generation.py:130–158</code>), data under <code>eden/xander/latent_hacking/</code> (<code>prompts_raw.npy</code> = stacked <code>{c, uc, pc, puc}</code>; keepers in <code>good_randomc_conditions/</code> as .jpg + .npy pairs). An older numpy generation exists at git commit <code>60e0ffd</code>; the current file is actually wired to the SDXL pipeline (pooled embeds, 1024×1024) — the (77, 768) SD1.5 shape corresponds to the "mini" variant / earlier runs.</p>
+
+<h3>12.1 What the old code did</h3>
+<div class="math">
+  stats: μ, σ = mean/std over prompts, per (token, channel); &nbsp;
+  q<sub>05</sub>, q<sub>95</sub> = 5th/95th percentiles per coordinate<br>
+  sample = clamp( 𝒩(μ, T·σ), &nbsp; k·q<sub>05</sub>, &nbsp; k·q<sub>95</sub> )
+  <span class="lbl">T = <code>conditioning_sigma</code>, k = <code>clamp_factor</code></span>
+</div>
+<ul>
+  <li>Same per-coordinate diagonal Gaussian core; stats recomputed at import from the raw stack, so appending keepers and re-running <em>was</em> the iteration loop.</li>
+  <li><strong>Percentile-envelope clamping</strong>: samples clipped to <code>clamp_factor × [q05, q95]</code> per coordinate (the fields are named <code>_min/_max</code> but are quantiles). Two independent knobs: temperature on σ, and the clamp envelope scale.</li>
+  <li><strong>Token pinning</strong> (commented but revealing): restore the real BOS embedding <code>c[0,0,:]</code> and the tail <code>c[0,50:,:]</code> (EOS/padding region) from a real conditioning — randomize only the ~50 "content" tokens.</li>
+  <li><strong><code>mix_latents</code> per-token crossover</strong>: pick n ∈ {4…128} recorded embeddings, and for each of the 77 token rows independently copy that <em>entire row</em> from a random parent (then temperature + clamp). Keeps each token's channel vector intact — a genetic-crossover alternative to per-channel independence.</li>
+  <li>The <code>60e0ffd</code> version fabricated <em>all four</em> tensors (<code>c, uc, pc, puc</code>) — including the CFG <strong>negative</strong> — and computed (but never modeled) the coordinate correlation matrix.</li>
+  <li>Side branches: sampled IP-Adapter image-conditioning rows from keeper stats (<code>good_ip_conditions/</code>), and a small GAN trained on real c-vectors as a learned prior (<code>xander/conditioning_optimization/</code>).</li>
+  <li>Decoding: euler, 35 steps, guidance 8–10, 1024×1024; embeddings dropped into stock diffusers via <code>prompt_embeds</code>/<code>negative_prompt_embeds</code>.</li>
+</ul>
+
+<h3>12.2 Old vs new, point by point</h3>
+<table>
+  <tr><th>Trick (old code)</th><th>New repo equivalent</th><th>Verdict</th></tr>
+  <tr><td>Per-(token,channel) diagonal Gaussian, temperature on σ</td><td>Identical (<code>diagonal</code> sampler; <code>c = μ + T·σ⊙z</code>)</td><td class="good">✅ Same</td></tr>
+  <tr><td><strong>Percentile clamp</strong>: clip sample values to <code>k·[q05, q95]</code> per coordinate</td><td>Different mechanism: truncation resample-clips the <em>z-scores</em> at ±τ (symmetric, in σ-units), off by default. No percentile envelope, no asymmetric clipping — the old clamp respected the empirical (possibly skewed) marginals; the new one assumes symmetry around μ.</td><td>⚠️ Not reproduced</td></tr>
+  <tr><td><strong>BOS + tail-token pinning</strong> from a real conditioning</td><td>Not implemented explicitly — but the per-token fit does it <em>statistically</em>: structural tokens have σ≈0, so samples reproduce them near-exactly. The old hard-pinning of tokens 50–76 (real EOS/pad from one prompt) is stronger than the new soft version.</td><td>≈ Implicit only</td></tr>
+  <tr><td><strong><code>mix_latents</code> per-token row crossover</strong> among n parents</td><td>Closest analog is <code>hybrid</code> (whole-tensor SLERP of 2 corpus rows) and <code>breed</code> (SLERP of 2 chosen parents + mutation). Nothing does per-token row-level recombination from many parents — a genuinely distinct operator that was lost.</td><td>⚠️ Not reproduced</td></tr>
+  <tr><td>Fabricated the <strong>CFG negative</strong> (<code>uc</code>) too (old numpy version)</td><td>SD1.5 path always uses the empty-prompt negative (<code>neg_mode</code> is a no-op); only SDXL gets corpus-mean negatives.</td><td>⚠️ Partial</td></tr>
+  <tr><td>Sampled IP-Adapter image-conditioning rows from keeper stats</td><td>IP-Adapter exists but only encodes <em>real</em> init images; the image-embedding rows are never sampled from a distribution.</td><td>⚠️ Not reproduced</td></tr>
+  <tr><td>GAN learned prior over c-vectors</td><td>No analog. (The PCA sampler is the new repo's answer to "learn the manifold".)</td><td>— Different lineage</td></tr>
+  <tr><td>Correlations inspected (<code>np.corrcoef</code>) but never modeled</td><td>The PCA/blend samplers model exactly this — the new repo took the improvement your old code left on the table.</td><td class="good">➕ New wins</td></tr>
+  <tr><td>Keeper iteration = raw restack + recompute stats</td><td>Regularized refit (σ′ = 0.25·σ_base + 0.75·σ_elite, floored) + base PCA grafted on. More conservative than your raw recompute.</td><td>≈ Same intent</td></tr>
+  <tr><td>No norm matching of samples (norms plotted, never enforced)</td><td>Also absent. Still an untried trick in both codebases.</td><td>— Open idea</td></tr>
+</table>
+
+<h2 id="ideas">13 · New ideas — the next round of experiments</h2>
+
+<p>Everything below follows from one observation: the machine has <strong>three levers</strong>, and almost all the work so far has pushed only the first one.</p>
+<ol>
+  <li><span class="lever">Lever 1 — where the deviation comes from:</span> which distribution, which basis, which marginals. This is where diagonal / pca / blend / hybrid / refit all live. Heavily explored.</li>
+  <li><span class="lever">Lever 2 — how the deviation is structured across the tensor:</span> the token axis, sparsity, asymmetry, on- vs off-manifold energy. Almost untouched — and the old <code>latent_magic.py</code> tricks that were lost (percentile clamp, token pinning, <code>mix_latents</code>) all lived here.</li>
+  <li><span class="lever">Lever 3 — how the UNet is driven:</span> the negative branch, the guidance scale, the <em>time axis</em> of denoising, feedback through the image. Nearly untouched — and everything here gets multiplied by <strong>g = 7.5 in ε-space</strong> before it reaches pixels, so it's the highest-gain lever in the system.</li>
+</ol>
+
+<p>One meta-principle before the list: <strong>gradient descent needs a gradient.</strong> Every idea below is sized to be testable in 1–2 batches of 16–32 images against a fixed seed panel, and the measurement ideas (<a href="#i19">#19</a>–<a href="#i21">#21</a>) exist to make those batches legible data points instead of vibes. Tags on each card: <span class="tag flag">flag</span> = reuses existing flags or ≤10 lines · <span class="tag script">script</span> = standalone script, core untouched · <span class="tag sampler">sampler</span> = new sampler or fit change · <span class="tag pipe">pipeline</span> = touches the decode loop · <span class="tag lev">★–★★★</span> = expected leverage.</p>
+
+<h3 id="ideas-a">A · Drive the UNet differently <span class="pill">lever 3 — the 7.5× multiplier</span></h3>
+
+<div class="idea" id="i1">
+  <h4><span class="num">#1</span> Fabricated negatives: point the CFG vector where you want it</h4>
+  <div class="tags"><span class="tag flag">flag</span><span class="tag lev">★★★</span></div>
+  <p>The negative branch is a <em>free second embedding slot</em> that currently always holds the empty prompt (<code>neg_mode</code> is a literal no-op on SD1.5 — fixing that is the first commit). Since the guided direction is ε(c) − ε(neg), choosing neg <em>chooses what gets amplified 7.5×</em>. Three settings, in increasing weirdness: <strong>(a)</strong> neg = μ, the corpus mean — guidance now amplifies "how this sample differs from the <em>average</em> prompt", actively suppressing generic content (already implemented for SDXL; port it); <strong>(b)</strong> <em>aligned</em> negative, neg = μ − γ·(c − μ) — the guidance difference becomes ≈ (1+γ)× the sampled deviation itself, so you amplify your deviation in ε-space without raising T in embedding space, where high T degrades structure; <strong>(c)</strong> neg = an independent hot sample — every image becomes a tug-of-war between two anarchic points, the old numpy code's fabricated-<code>uc</code> trick reborn.</p>
+  <p class="combo">Combines with: every sampler; <a href="#i2">#2</a> (sweep g per neg-mode); <a href="#i12">#12</a> (neg = −taste direction).</p>
+</div>
+
+<div class="idea" id="i2">
+  <h4><span class="num">#2</span> Guidance scale as a first-class anarchy knob</h4>
+  <div class="tags"><span class="tag flag">flag</span><span class="tag lev">★★</span></div>
+  <p>Zero new code — <code>--guidance</code> already exists and nobody has swept it. §6 already establishes that CFG is a second, image-space temperature; treat it as one. Grid (T, g) with T ∈ {0.8, 1.2, 1.8} × g ∈ {1, 3, 7.5, 15, 30}, 16 fixed seeds per cell, one contour plot of keeper-rate. Include the exotic corners: g ∈ (0, 1) (under-guidance: the sampled conditioning as a whisper) and g &lt; 0 (anti-guidance: denoise <em>away</em> from the sample — genuinely unexplored territory that costs one afternoon).</p>
+  <p class="combo">Combines with: everything, forever — this calibrates the baseline all other ideas are judged against.</p>
+</div>
+
+<div class="idea" id="i3">
+  <h4><span class="num">#3</span> Conditioning schedules: vary c over the denoising trajectory</h4>
+  <div class="tags"><span class="tag pipe">pipeline</span><span class="tag lev">★★★</span></div>
+  <p>All 30 steps currently see the same c — but diffusion decides <em>composition</em> in the first ~30% of steps and <em>texture</em> in the rest. Swapping embeddings mid-run (diffusers' <code>callback_on_step_end</code> can mutate <code>prompt_embeds</code>; no fork needed) splits anarchy into two independently controllable phases: <strong>hot→mild</strong> = alien layout rendered competently (likely the grail for "weird but stunning"); <strong>mild→hot</strong> = a normal scene with alien surfaces; <strong>continuous slerp c(t)</strong> = an entire latent walk <em>inside one image</em>. This one mechanism turns every pair of existing samplers into a 2-D grid of (early, late) choices — the single biggest combinatorial expansion available.</p>
+  <p class="combo">Combines with: any two samplers as endpoints; <a href="#i1">#1</a> (schedule the negative too); <a href="#i11">#11</a> (mantra early, gaussian late).</p>
+</div>
+
+<div class="idea" id="i4">
+  <h4><span class="num">#4</span> The dream loop: iterated img2img with re-sampled conditioning</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>Decode a batch; feed each output back as its own init image (<code>--init-dir</code> machinery, strength ≈ 0.55) with a <em>fresh</em> sampled c each round; run 5–8 rounds and keep the whole trajectory. The image accumulates structure that no single conditioning asked for — attractor-seeking drift through image space × conditioning space, deep-dream style. Cheap variant: keep c fixed and only re-noise (does the UNet reinforce or erode the anarchy?); expensive variant: re-sample c from the <em>neighborhood</em> of the previous round's c so image and conditioning drift together.</p>
+  <p class="combo">Combines with: <a href="#i12">#12</a> (steer each round up the taste gradient); <a href="#i19">#19</a> (score trajectories, not frames).</p>
+</div>
+
+<h3 id="ideas-b">B · Fix the marginals, shape the deviation <span class="pill">levers 1+2</span></h3>
+
+<div class="idea" id="i5">
+  <h4><span class="num">#5</span> Bootstrap marginals: sample the empirical distribution directly</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★★</span></div>
+  <p>CLIP activations are skewed and heavy-tailed; a Gaussian is the wrong marginal for every one of the 59,136 coordinates. Replace σ⊙z with direct resampling: for each coordinate independently, draw one of its 1000 recorded corpus values. Independence (the anarchy) is preserved; the marginals become <em>exact</em> — skew, kurtosis, bimodality, and the old <code>latent_magic.py</code> percentile envelope are all inherited for free, in ~30 lines with no re-mining (the full E matrix is already on disk). Temperature generalizes cleanly as <em>rank stretch</em>: map each draw's corpus rank r through r′ = ½ + T·(r − ½), clipping or linearly extrapolating the tails — T &gt; 1 now means "prefer the tails of the <em>real</em> distribution" rather than "assume Gaussian tails exist".</p>
+  <p class="combo">Combines with: <a href="#i7">#7</a> (bootstrap the off-manifold part only); <a href="#i9">#9</a> (crossover then bootstrap-jitter).</p>
+</div>
+
+<div class="idea" id="i6">
+  <h4><span class="num">#6</span> Two-piece skew fit: the per-coordinate σ modulation, finally</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★</span></div>
+  <p>The original design called for "skewing the distribution by modulating the sigmas" and §9 shows it was never built. Minimal faithful version: fit σ⁺ and σ⁻ per coordinate (std of positive and negative residuals separately), then sample a sign and a half-normal. One extra array in the fit, a <code>--skew</code> flag, and asymmetry is restored — plus a free new knob: <em>exaggerate</em> the skew (σ⁺/σ⁻ ratio raised to a power λ) to push every coordinate harder toward its naturally heavy side.</p>
+  <p class="combo">Combines with: any diagonal-based sampler; largely subsumed by <a href="#i5">#5</a> — run both once, keep the winner.</p>
+</div>
+
+<div class="idea" id="i7">
+  <h4><span class="num">#7</span> Two-temperature on/off-manifold split — the diagnostic experiment</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★★★</span></div>
+  <p>Decompose the diagonal deviation into its projection onto the PCA subspace and the orthogonal remainder: dev = P<sub>V</sub>dev + (I − P<sub>V</sub>)dev, and give each part its own temperature (T<sub>on</sub>, T<sub>off</sub>). This generalizes diagonal/pca/blend into one 2-knob family — and the corner (0, T) is a sampler that exists nowhere yet: <strong>pure off-manifold</strong> deviations, orthogonal to every direction the corpus actually varies along. One batch at each of the four corners answers the deepest open question in the project: <em>does the good weirdness live on the manifold, off it, or on the diagonal between?</em> Every future sampling decision inherits the answer. Cost: one matvec per sample against the already-stored V.</p>
+  <p class="combo">Combines with: <a href="#i5">#5</a>, <a href="#i8">#8</a>; the (T<sub>on</sub>, T<sub>off</sub>) map belongs in <a href="#i21">#21</a>'s response surface.</p>
+</div>
+
+<div class="idea" id="i8">
+  <h4><span class="num">#8</span> Sparse axis cocktails: few strong concepts beat diffuse noise</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★★</span></div>
+  <p>A Gaussian draw over 999 components spreads energy everywhere — which may be exactly why high-T images read as "textured soup". Real prompts are <em>sparse</em> in concept space: a few strong words. Mirror that: pick K ∈ {2…8} components at random (optionally within a <code>comp_lo</code> band), give each a large amplitude ±(3–6)·s<sub>j</sub>, zero everywhere else. Predicted signature: images with a few strong alien <em>concepts</em> instead of uniform strangeness. Then the killer follow-up, nearly free because sidecars record everything: log which axes appear in starred images → a per-axis leaderboard → bias the cocktail toward proven axes. That's a bandit over basis vectors — taste-directed exploration with no model fitting at all.</p>
+  <p class="combo">Combines with: <a href="#i7">#7</a> (sparse on-manifold + dense off-manifold); <a href="#i3">#3</a> (different cocktail early vs late).</p>
+</div>
+
+<h3 id="ideas-c">C · Token-axis operators <span class="pill">lever 2 — the lost dimension</span></h3>
+
+<div class="idea" id="i9">
+  <h4><span class="num">#9</span> Resurrect <code>mix_latents</code>: per-token row crossover</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★★</span></div>
+  <p>The one demonstrably lost operator (§12.2): pick n ∈ {4…128} parents from the 256 retained corpus rows; for each of the 77 token positions independently, copy that <em>entire 768-dim row</em> from a random parent; finish with mild temperature + truncation. Row-level copying keeps each token internally coherent (unlike per-coordinate independence) while scrambling the "sentence" — a genetic crossover in prompt space that no current sampler approximates. It worked four years ago; it's 15 lines to bring back; n itself is a coherence knob (n=2 ≈ hybrid, n=128 ≈ token-level anarchy).</p>
+  <p class="combo">Combines with: <a href="#i5">#5</a> (bootstrap jitter on top); <a href="#i13">#13</a> (parents = starred latents only — taste crossover).</p>
+</div>
+
+<div class="idea" id="i10">
+  <h4><span class="num">#10</span> Token-position temperature profiles</h4>
+  <div class="tags"><span class="tag flag">flag</span><span class="tag lev">★★</span></div>
+  <p>Promote the global scalar T to a 77-vector T<sub>t</sub> (one broadcast multiply). Three profiles worth a batch each: <strong>(a)</strong> structural pinning — T=0 at BOS/EOS/padding, hot in the content span (the old code's token-pinning trick, now soft and tunable); <strong>(b)</strong> random smooth profiles — sample 8 spline knots, upsample to 77, so each image gets its own "where in the sentence the madness lives"; <strong>(c)</strong> one-hot-token — everything at T=0.3 except 3–5 random content positions at T=4: a plausible sentence with a few words replaced by static. This is the most legible form of the per-coordinate σ modulation the original design wanted — and profiles are nameable, starrable, evolvable objects.</p>
+  <p class="combo">Combines with: every sampler; <a href="#i6">#6</a>/<a href="#i5">#5</a> (profile × marginal); the hunter's strategy portfolio.</p>
+</div>
+
+<div class="idea" id="i11">
+  <h4><span class="num">#11</span> Mantra conditioning: one concept, chanted</h4>
+  <div class="tags"><span class="tag flag">flag</span><span class="tag lev">★</span></div>
+  <p>Sample a <em>single</em> plausible content row (768-dim — from the pooled fit, or steal one token from a real embedding), tile it across all ~50 content positions, keep BOS/EOS/padding at μ. Cross-attention sees one concept repeated 50× — a conditioning state no text can produce, since real sentences never repeat a token embedding exactly (position is baked into CLIP's output values). Variants: alternate 2–3 rows (a chord instead of a note); tile with slowly increasing noise per position (a concept dissolving as the sentence proceeds). Ten lines, deterministic weirdness, completely orthogonal to every existing sampler.</p>
+  <p class="combo">Combines with: <a href="#i3">#3</a> (mantra early → gaussian late: alien composition, familiar texture).</p>
+</div>
+
+<h3 id="ideas-d">D · Taste geometry <span class="pill">use the stars as directions, not just centers</span></h3>
+
+<div class="idea" id="i12">
+  <h4><span class="num">#12</span> The contrastive steering vector</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★★</span></div>
+  <p><code>refit_from_elites</code> moves the <em>center</em> toward your stars; this extracts the <em>direction</em>. Fit LDA / logistic regression in conditioning space — starred latents vs random non-starred, done in the top-50 PCA coordinates so 14 stars are enough — and take the unit vector w. Then every sampler, present and future, gets one added term: c ← c + α·w. Unlike a refit branch it needs no bookkeeping, composes with everything, and is <em>sign-flippable</em>: −α·w is anti-taste, which is exactly what the novelty objective wants when the gallery starts repeating itself. Recompute w in seconds whenever the star set grows. This is the cheapest possible way to make taste a continuous knob instead of a discrete branch.</p>
+  <p class="combo">Combines with: everything via one addition; <a href="#i1">#1</a>c (neg = μ − α·w: guidance itself pushes up the taste gradient).</p>
+</div>
+
+<div class="idea" id="i13">
+  <h4><span class="num">#13</span> Star-manifold sampling: learn the covariance of your taste</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>§10.8's gotcha — evolved branches keep the <em>base</em> corpus PCA, so the covariance never adapts — fixed properly: project the starred latents into the top-m PCA coordinates (m ≈ 30, small enough that ~14 stars still constrain it), fit a small full-covariance Gaussian there with shrinkage toward its diagonal, sample coefficients from <em>that</em>, map back through V. Where the refit learns "where your taste is centered", this learns "which directions your taste <em>varies along</em>" — correlations of preference, not just location. Falls back to the current behavior as shrinkage → 1, so it strictly generalizes the existing branch mechanics.</p>
+  <p class="combo">Combines with: <a href="#i8">#8</a> (sparse cocktails from the taste covariance's own eigenvectors); <a href="#i14">#14</a> (as its initialization).</p>
+</div>
+
+<div class="idea" id="i14">
+  <h4><span class="num">#14</span> CMA-ES in coefficient space: an optimizer that can actually optimize</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>The existing CEM loop mutates all 59,136 coordinates blindly — evolution strategies don't work in that dimension. But in <em>PCA coefficient space</em> the problem is 40-dimensional, which is exactly where CMA-ES shines: optimize a ∈ ℝ⁴⁰ (leading components, or a chosen weird band), score = w₁·taste-model + w₂·novelty (both scorers already exist), population 24, ~15 generations ≈ 360 decodes — one overnight run on the existing hardware. Unlike the hunter (which <em>samples</em> strategies), this actually climbs. Seed the initial covariance from <a href="#i13">#13</a> and it starts from your taste instead of from zero.</p>
+  <p class="combo">Combines with: <a href="#i19">#19</a> (its fitness function is the report card); any sampler as the initialization.</p>
+</div>
+
+<h3 id="ideas-e">E · New distributions to mine <span class="pill">change what "typical" means</span></h3>
+
+<div class="idea" id="i15">
+  <h4><span class="num">#15</span> Mixture fit: make the "mixture of Gaussians" literal at last</h4>
+  <div class="tags"><span class="tag sampler">sampler</span><span class="tag lev">★★</span></div>
+  <p>§1 notes the original description said <em>mixture</em> but only a single Gaussian was ever fit. Do it: k-means (k ≈ 8–20) on the PCA coefficients of the 1000 corpus embeddings → per-cluster μ<sub>k</sub>, σ<sub>k</sub> (and optionally local PCA). Three new moves fall out: sample <em>within</em> a far-from-center cluster (themed anarchy — all draws share a flavor); sample the <em>chord between two cluster centers</em> ± noise (hybridizing prompt <em>regions</em> instead of prompt pairs); and per-cluster temperature (which neighborhoods of prompt space tolerate heat before collapsing?). Fit-side script only; the samplers reuse the existing blend machinery.</p>
+  <p class="combo">Combines with: <a href="#i9">#9</a> (crossover parents from two different clusters); <a href="#i18">#18</a> (different cluster per encoder stream).</p>
+</div>
+
+<div class="idea" id="i16">
+  <h4><span class="num">#16</span> Adversarial corpora &amp; distribution arithmetic</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>Mining takes minutes, so mine <em>contrast</em> corpora: <code>dist_boring</code> (500 dull literal captions) and <code>dist_weird</code> (surrealist poetry, glossolalia, non-Latin scripts, unicode soup, dense technical jargon). Then operate on <em>fits</em>, not samples: <strong>repulsion</strong> — project the top boring-vs-base LDA directions out of every deviation, or add −β·(μ<sub>boring</sub> − μ) so guidance-space never drifts toward stock imagery; <strong>fit interpolation</strong> — μ ← μ + β(μ<sub>weird</sub> − μ) with geometric σ interpolation, an "anarchy prior" slider. Distribution-space arithmetic is a whole new plane of knobs, and each new corpus is one <code>mine_distribution.py</code> run.</p>
+  <p class="combo">Combines with: <a href="#i12">#12</a> (boring-repulsion is a corpus-level steering vector); <a href="#i1">#1</a>a (neg = μ<sub>boring</sub> — guidance flees boredom directly).</p>
+</div>
+
+<h3 id="ideas-f">F · Cross-model <span class="pill">SDXL · Flux</span></h3>
+
+<div class="idea" id="i17">
+  <h4><span class="num">#17</span> Paired-corpus translation: teleport gems between models</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>Encode the <em>same</em> 1000 prompts through SD1.5, SDXL, and Flux's T5; the corpora are then row-aligned, so a ridge regression (or a map between the two PCA coefficient spaces — just 999×999) translates any conditioning tensor from one model's space to another's. Two payoffs: every discovered SD1.5 gem gets a free high-res SDXL/Flux render attempt from <em>its own latent</em>, not a re-roll; and the transfer success rate is itself the finding — if anarchic directions survive translation, weirdness is a property of <em>language geometry</em>; if not, it's a property of each model's decoder. Either answer shapes everything downstream.</p>
+  <p class="combo">Combines with: <a href="#i12">#12</a> (translate the taste vector once, reuse everywhere); the existing favorites workflow (translate all stars in bulk).</p>
+</div>
+
+<div class="idea" id="i18">
+  <h4><span class="num">#18</span> Dual-stream dissonance: conditioning states no text can reach</h4>
+  <div class="tags"><span class="tag pipe">pipeline</span><span class="tag lev">★★★</span></div>
+  <p>SDXL conditions on <em>two</em> text encoders (CLIP-L + OpenCLIP bigG) plus a pooled vector; Flux on a T5 sequence plus a CLIP pooled vector. Every text prompt ever written produces <em>consistent</em> streams — so the inconsistent region of conditioning space is virgin territory by construction, unreachable even in principle by prompting. Sample the streams independently (different draws, different clusters from <a href="#i15">#15</a>, or one stream real + one sampled); mismatch the pooled vector against the sequence; on Flux, fabricate only the T5 stream while keeping CLIP-pooled real (and vice versa) to isolate which stream carries the anarchy. The multi-tensor backend abstraction already exists — this is mostly plumbing flags through it. Arguably the purest expression of the project's premise.</p>
+  <p class="combo">Combines with: <a href="#i3">#3</a> (swap only one stream mid-denoise); <a href="#i15">#15</a>; <a href="#i17">#17</a>.</p>
+</div>
+
+<h3 id="ideas-g">G · Make the gradient real <span class="pill">measurement — the meta-idea</span></h3>
+
+<div class="idea" id="i19">
+  <h4><span class="num">#19</span> Fixed seed panel + batch report card</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★★</span></div>
+  <p>Freeze a panel of 16 seeds and render <em>every</em> experiment against it, so comparisons are paired and visual — same noise, different idea. Then a report card per batch, computed from data that already exists (sidecars + the hunter's CLIP features): taste-model mean, novelty mean, distance histogram, colorfulness, edge entropy, % near-duplicates within the batch. Emit one HTML strip per batch, ranked. This is the meta-idea that makes "gradient descent in idea space" literal: without it every batch is a vibe, with it every 20-minute batch is a data point, and the 21 ideas on this page become a measurable tournament instead of a pile of hunches. <strong>Build this first.</strong></p>
+  <p class="combo">Combines with: all of the above — it's the referee.</p>
+</div>
+
+<div class="idea" id="i20">
+  <h4><span class="num">#20</span> Legibility-cliff mapping: find the edge, per direction</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>The interesting images live just before coherence collapses — but §5.6's shell targeting assumes one radius fits all directions, and it almost certainly doesn't. Protocol, using only existing flags: fix a direction u (a PCA axis, a sparse cocktail, the steering vector, or one sampled deviation), render at <code>--target-distance</code> d ∈ {1.0, 1.4, …, 3.0}, and auto-score legibility (max CLIP similarity to the corpus images, or the taste model's confidence). The steepest drop is that direction's <em>cliff</em> — a single number per direction. Findings compound: keepers should cluster just before their cliff, so per-direction cliff estimates turn shell targeting from a global knob into an adaptive one, and "cliff distance" itself becomes a novelty-adjacent axis to explore along.</p>
+  <p class="combo">Combines with: <a href="#i8">#8</a> (cliff per cocktail axis → leaderboard column); the hunter's taste-band strategy (band per direction, not global).</p>
+</div>
+
+<div class="idea" id="i21">
+  <h4><span class="num">#21</span> Knob-response surface: fit the experiment history itself</h4>
+  <div class="tags"><span class="tag script">script</span><span class="tag lev">★★</span></div>
+  <p>Every image already carries its complete knob vector (sampler, T, comp_lo, λ, g, d, truncation…) plus a starred bit — thousands of labeled points of "what settings produce keepers", sitting unused in the sidecar JSONs. Periodically fit a simple model over that ledger (logistic regression on knobs to start; a GP if it earns it), then print two things: the current argmax cell and the steepest uphill direction from the best-explored region. <code>hunt_drive</code> <em>samples</em> from a fixed strategy portfolio but never <em>fits</em> the history — this closes that loop, and the uphill direction is, literally, the gradient in knob space. An evening of pandas + sklearn.</p>
+  <p class="combo">Combines with: <a href="#i19">#19</a> (report card fields become features); feeds updated weights back into the hunter's portfolio.</p>
+</div>
+
+<h3 id="ideas-queue">The first week — a concrete queue</h3>
+<p>Ordered so each day's result informs the next; every line is 1–3 batches. The multiplication table matters more than any single row: <em>schedule(any, any) × negatives × steering × guidance</em> is thousands of cells, which is exactly why the referee comes first.</p>
+<table class="queue">
+  <tr><th>Day</th><th>Run</th><th>Question it answers</th></tr>
+  <tr><td>Day 1</td><td><a href="#i19">#19</a> report card + <a href="#i2">#2</a> (T, g) grid</td><td>Where does the current system actually peak? (Baseline for everything.)</td></tr>
+  <tr><td>Day 2</td><td><a href="#i1">#1</a> negatives a/b/c at Day-1's best g</td><td>Is the CFG vector the cheap 10× it looks like?</td></tr>
+  <tr><td>Day 3</td><td><a href="#i7">#7</a> four corners of (T<sub>on</sub>, T<sub>off</sub>) + <a href="#i5">#5</a> as marginal control</td><td>Does the weirdness live on or off the manifold? Do real marginals matter?</td></tr>
+  <tr><td>Day 4</td><td><a href="#i3">#3</a> hot→mild and mild→hot with the Day-2/3 winners as endpoints</td><td>Is composition/texture splitting the grail it should be?</td></tr>
+  <tr><td>Day 5</td><td><a href="#i8">#8</a> sparse cocktails + start the axis leaderboard; <a href="#i12">#12</a> once stars ≥ 15</td><td>Few strong concepts vs diffuse noise; is taste a usable direction?</td></tr>
+  <tr><td>Weekend</td><td><a href="#i14">#14</a> CMA-ES overnight; <a href="#i17">#17</a>/<a href="#i18">#18</a> if SDXL/Flux are warm</td><td>Can an optimizer beat the hunter? Does anarchy transfer across models?</td></tr>
+</table>
+
+<div class="note good"><strong>Highest-leverage single picks</strong> if only three things get built: <a href="#i3">#3</a> conditioning schedules (multiplies the whole sampler zoo), <a href="#i1">#1</a> fabricated negatives (7.5× amplifier, ~10 lines), and <a href="#i19">#19</a> the report card (turns everything else into measurable gradient steps).</div>
+
+<p style="margin-top:2.5rem; color: var(--muted); font-size:.9rem;">Key sources: <code>semantic_anarchy/distribution.py</code> (all fit/sample math), <code>semantic_anarchy/pipeline.py</code> (SD1.5 encode/decode), <code>semantic_anarchy/backend.py</code> (multi-tensor abstraction, distance ops), <code>semantic_anarchy/evolve.py</code> + <code>aesthetic.py</code> (CEM + scorers), <code>scripts/mine_distribution.py</code>, <code>scripts/generate.py</code>, <code>scripts/explore.py</code>, <code>scripts/evolve_favorites.py</code>, <code>scripts/resonance.py</code>, <code>webui/hunt_drive.py</code>, <code>webui/guided_drive.py</code>, <code>webui/app.py</code> (frontier).</p>
+
+<a class="totop" href="#" title="Back to top">↑</a>
+</body>
+</html>

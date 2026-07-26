@@ -30,7 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from semantic_anarchy.clip_compat import (causal_mask, encoder_hidden_states,
+                                          image_features)
 
 CLIP_ID = "openai/clip-vit-large-patch14"
 SDXL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -159,9 +165,6 @@ def main(argv=None) -> int:
     M = args.tokens
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
-    def mk_causal(L):
-        return torch.full((L, L), float("-inf"), device=device).triu(1)[None, None]
-
     def cosrows(a, b):                                    # mean per-row cosine
         a = a / a.norm(dim=-1, keepdim=True)
         b = b / b.norm(dim=-1, keepdim=True)
@@ -172,16 +175,16 @@ def main(argv=None) -> int:
         with torch.no_grad():
             inputs = proc(images=[Image.open(args.src).convert("RGB")],
                           return_tensors="pt").to(device)
-            img_feat = clip.get_image_features(**inputs)
+            img_feat = image_features(clip, inputs)
             img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
         L = M + 2
         pos = tm.embeddings.position_embedding(torch.arange(L, device=device))
-        causal = mk_causal(L)
+        causal = causal_mask(L, device)
 
         def objective(rows):
             seq = build_seq(table, pad_id, tok.bos_token_id, tok.eos_token_id,
                             rows[0], L, device) + pos[None]
-            h = tm.encoder(inputs_embeds=seq, causal_attention_mask=causal)[0]
+            h = encoder_hidden_states(tm, seq, causal)[-1]
             pooled = tm.final_layer_norm(h)[:, M + 1]     # EOS position
             f = clip.text_projection(pooled)
             f = f / f.norm(dim=-1, keepdim=True)
@@ -206,7 +209,7 @@ def main(argv=None) -> int:
         data = np.load(npz)
         L = 77
         pos = tm.embeddings.position_embedding(torch.arange(L, device=device))
-        causal = mk_causal(L)
+        causal = causal_mask(L, device)
 
         if backend == "sd15":
             target = torch.tensor(np.asarray(data["embeds"], dtype=np.float32),
@@ -215,8 +218,7 @@ def main(argv=None) -> int:
             def objective(rows):
                 seq = build_seq(table, pad_id, tok.bos_token_id,
                                 tok.eos_token_id, rows[0], L, device) + pos[None]
-                h = tm.encoder(inputs_embeds=seq,
-                               causal_attention_mask=causal)[0]
+                h = encoder_hidden_states(tm, seq, causal)[-1]
                 out = tm.final_layer_norm(h)[0]           # sd15: final LN states
                 return cosrows(out, target)
 
@@ -251,15 +253,13 @@ def main(argv=None) -> int:
                 # ViT-L branch (penultimate layer, diffusers convention)
                 seq1 = build_seq(table, pad_id, tok.bos_token_id,
                                  tok.eos_token_id, rows[0], L, device) + pos[None]
-                h1 = tm.encoder(inputs_embeds=seq1, causal_attention_mask=causal,
-                                output_hidden_states=True).hidden_states[-2][0]
+                h1 = encoder_hidden_states(tm, seq1, causal)[-2][0]
                 # bigG branch (penultimate + projected pooled at EOS)
                 seq2 = build_seq(table2, pad2, tok2.bos_token_id,
                                  tok2.eos_token_id, rows[1], L, device) + pos2[None]
-                o2 = tm2.encoder(inputs_embeds=seq2, causal_attention_mask=causal,
-                                 output_hidden_states=True)
-                h2 = o2.hidden_states[-2][0]
-                pooled = tm2.final_layer_norm(o2.hidden_states[-1])[:, M + 1]
+                hs2 = encoder_hidden_states(tm2, seq2, causal)
+                h2 = hs2[-2][0]
+                pooled = tm2.final_layer_norm(hs2[-1])[:, M + 1]
                 pooled = enc2.text_projection(pooled).reshape(-1)
                 pc = torch.nn.functional.cosine_similarity(
                     pooled, target_pooled, dim=0)
