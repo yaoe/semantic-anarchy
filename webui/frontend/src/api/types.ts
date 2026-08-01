@@ -230,14 +230,18 @@ export interface RunRequest {
 
 export interface RefineRequest {
   src: string
+  /** Upscale factor. hires snaps the resulting size to a multiple of 16 px. */
   scale: number
+  /** hires: unset = replay the source's own step count. */
   steps?: number | null
+  /** hires: fraction of the ORIGINAL schedule to re-run on the enlarged image. */
   strength: number
   scheduler?: string | null
   tiled: boolean
   overlap?: number
-  engine: 'flux' | 'sd'
+  engine: 'hires' | 'flux' | 'sd'
   prompt?: string | null
+  interp?: 'lanczos' | 'bicubic' | 'bilinear' | 'nearest'
 }
 
 export interface ExploreRequest {
@@ -296,6 +300,13 @@ export interface ImageMeta {
   parent?: string
   parent_b?: string
   refined_from?: string
+  /** refine sidecars: which upscaler made it (hires | flux2-klein | absent = sd img2img). */
+  engine?: string
+  /** hires: the ancestor whose .npz supplied the conditioning. */
+  cond_from?: string
+  factor?: number
+  denoise?: number
+  interp?: string
   backend?: string
   model?: string
   sampler?: string

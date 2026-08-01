@@ -2,7 +2,7 @@ import { useExplore, useFavorite, useRefine } from '../../api/queries'
 import type { ImageItem } from '../../api/types'
 import { cn, fmtSize, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
-import { refinePromptFor } from '../refine/RefineBar'
+import { HIRES_DENOISE, HIRES_FACTOR, refinePromptFor } from '../refine/RefineBar'
 
 const numOr = (v: string | undefined, dflt: number) =>
   (v ?? '').trim() === '' ? dflt : Number(v)
@@ -37,7 +37,18 @@ export function Card({
   const isAnarchy = im.name.startsWith('anarchy_')
   const n = numOr(tools.exN, 6)
 
-  const doRefine = () =>
+  const doRefine = () => {
+    // hires owns its own two knobs and derives everything else (steps, guidance,
+    // scheduler, seed) from the source image's sidecar — nothing else to send.
+    if (tools.rfEngine === 'hires') {
+      return refine.mutate({
+        src: im.rel,
+        engine: 'hires',
+        scale: numOr(tools.rfFactor, HIRES_FACTOR),
+        strength: numOr(tools.rfDenoise, HIRES_DENOISE),
+        tiled: false,
+      })
+    }
     refine.mutate({
       src: im.rel,
       scale: numOr(tools.rfScale, 1.5),
@@ -48,6 +59,7 @@ export function Card({
       engine: tools.rfEngine === 'sd' ? 'sd' : 'flux',
       prompt: refinePromptFor(tools),
     })
+  }
 
   const doExplore = () =>
     explore.mutate({

@@ -89,6 +89,35 @@
   .sa-btn-sm {
     @apply px-2 py-[2px] text-[11px] rounded-md;
   }
+  /* Range inputs — the browser default is light-grey chrome that fights the
+     palette, so both engines' track and thumb are restyled by hand. */
+  /* Height matches .sa-input so a slider and a select sitting side by side in an
+     `items-end` toolbar line their tracks up with the select's midline. */
+  .sa-range {
+    @apply h-[34px] w-full cursor-pointer appearance-none bg-transparent
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .sa-range::-webkit-slider-runnable-track {
+    @apply h-[4px] rounded-full bg-line;
+  }
+  .sa-range::-webkit-slider-thumb {
+    @apply -mt-[5px] h-[14px] w-[14px] appearance-none rounded-full
+           border border-line2 bg-ink transition-colors;
+  }
+  .sa-range::-moz-range-track {
+    @apply h-[4px] rounded-full bg-line;
+  }
+  .sa-range::-moz-range-thumb {
+    @apply h-[14px] w-[14px] rounded-full border border-line2 bg-ink;
+  }
+  .sa-range:hover::-webkit-slider-thumb,
+  .sa-range:focus-visible::-webkit-slider-thumb {
+    @apply border-accent;
+  }
+  .sa-range:hover::-moz-range-thumb,
+  .sa-range:focus-visible::-moz-range-thumb {
+    @apply border-accent;
+  }
   .sa-label {
     @apply block text-[12px] text-dim mt-[10px] mb-[3px];
   }

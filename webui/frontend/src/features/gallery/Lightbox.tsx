@@ -15,10 +15,11 @@ const PARAM_ORDER = [
   'components', 'comp_lo', 'equalize', 'truncation', 'steps', 'guidance',
   'scheduler', 'neg_mode', 'height', 'width', 'init_image', 'init_mode',
   'init_strength', 'ip_scale', 'batch_seed', 'image_seed', 'index', 'refined_from',
-  'scale', 'strength', 'cond_reused', 'out_size', 'seed',
+  'cond_from', 'engine', 'factor', 'denoise', 'denoise_steps', 'interp',
+  'scale', 'strength', 'cond_reused', 'src_size', 'out_size', 'seed',
 ]
 
-const LINKED = new Set(['parent', 'parent_b', 'refined_from'])
+const LINKED = new Set(['parent', 'parent_b', 'refined_from', 'cond_from'])
 
 /** The "how would I reproduce this from the CLI" line. */
 function buildCli(m: ImageMeta): string {
@@ -31,6 +32,13 @@ function buildCli(m: ImageMeta): string {
     if (m.coherence != null) s += ` --coherence ${m.coherence}`
     return s
   }
+  if (m.kind === 'refine' && m.engine === 'hires')
+    return (
+      `upscale.py --src ${m.refined_from ?? '<orig>'} --factor ${m.factor} ` +
+      `--denoise ${m.denoise} --interp ${m.interp}`
+    )
+  if (m.kind === 'refine' && m.engine === 'flux2-klein')
+    return `refine_flux.py --src ${m.refined_from ?? '<orig>'} --scale ${m.scale} --steps ${m.steps}`
   if (m.kind === 'refine')
     return (
       `refine.py --src <orig> --scale ${m.scale} --strength ${m.strength} ` +

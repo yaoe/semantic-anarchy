@@ -19,7 +19,11 @@ export type SortKey = 'new' | 'score' | 'dist' | 'dist_asc' | 'nov' | 'res'
 export const DEFAULT_TOOLS: Record<string, string> = {
   rfScale: '1.5',
   rfSteps: '',
-  rfEngine: 'flux',
+  rfEngine: 'hires',
+  // hires keeps its own factor/denoise so switching engines doesn't clobber
+  // the flux/sd numbers (and vice versa).
+  rfFactor: '2.0',
+  rfDenoise: '0.3',
   rfMode: 'tiled',
   rfStrength: '',
   rfSched: 'ddim',
@@ -94,6 +98,22 @@ interface UIState {
   setBreedParent: (rel: string | null) => void
 }
 
+/**
+ * The slice worth surviving a reload. Job selection, the lightbox cursor and a
+ * half-finished breed pairing are per-session; a half-built timeline is not —
+ * that's curation work.
+ */
+const partialize = (s: UIState) => ({
+  params: s.params,
+  tools: s.tools,
+  tab: s.tab,
+  sortBy: s.sortBy,
+  logCollapsed: s.logCollapsed,
+  timeline: s.timeline,
+  film: s.film,
+})
+type Persisted = ReturnType<typeof partialize>
+
 export const useUI = create<UIState>()(
   persist(
     (set) => ({
@@ -156,19 +176,22 @@ export const useUI = create<UIState>()(
     }),
     {
       name: 'semantic-anarchy-ui',
-      version: 1,
-      // Only the settings worth surviving a reload. Job selection, the lightbox
-      // cursor and a half-finished breed pairing are per-session.
-      partialize: (s) => ({
-        params: s.params,
-        tools: s.tools,
-        tab: s.tab,
-        sortBy: s.sortBy,
-        logCollapsed: s.logCollapsed,
-        // A half-built timeline is worth a page reload — it's curation work.
-        timeline: s.timeline,
-        film: s.film,
-      }),
+      version: 2,
+      // v1 -> v2: the same-latent hires pass became the upscale default. Anyone
+      // still carrying the old 'flux' default gets moved onto it; an explicit
+      // 'sd' pick is left alone. (A plain version bump would drop the whole
+      // blob — including a half-built timeline — so migrate rather than reset.)
+      // The cast is safe: whatever migrate returns goes straight through `merge`
+      // below, which re-applies the defaults for every missing key.
+      migrate: (persisted, from) => {
+        const p = (persisted ?? {}) as Partial<Persisted>
+        const out =
+          from < 2 && p.tools?.rfEngine === 'flux'
+            ? { ...p, tools: { ...p.tools, rfEngine: 'hires' } }
+            : p
+        return out as Persisted
+      },
+      partialize,
       // New knobs added to the schema must appear even for users with an old
       // blob in localStorage, so defaults always win on missing keys.
       merge: (persisted, current) => {

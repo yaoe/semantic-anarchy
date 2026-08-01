@@ -1,9 +1,20 @@
+import { Slider } from '../../components/ui/Slider'
 import { Tool } from '../../components/ui/Tool'
 import { useUI } from '../../store'
+
+/** hires: how far the enlarge goes, and how much of the original schedule re-runs. */
+export const HIRES_FACTOR = 2.0
+export const HIRES_DENOISE = 0.3
 
 /**
  * Settings for the ⤴ Upscale action on gallery cards (POST /api/refine).
  * Nothing here submits — the card does, reading these values from the store.
+ *
+ * Three engines, and each one hides the knobs the others own:
+ *  · hires — the same model re-rendering its own latents (two sliders, nothing else;
+ *            steps/guidance/scheduler/seed all come from the source's sidecar)
+ *  · flux  — a different model regenerating from the image as a reference
+ *  · sd    — the general img2img refine, tiled or single-pass
  */
 export function RefineBar() {
   const engine = useUI((s) => s.tools.rfEngine)
@@ -12,25 +23,62 @@ export function RefineBar() {
   return (
     <>
       <Tool
-        id="rfScale"
-        label="Upscale ×"
-        width="w-[90px]"
-        options={[
-          { value: '1.25', label: '1.25' },
-          { value: '1.5', label: '1.5' },
-          { value: '2.0', label: '2.0' },
-        ]}
-      />
-      <Tool id="rfSteps" label="Steps" type="number" placeholder="40" width="w-[80px]" />
-      <Tool
         id="rfEngine"
         label="Engine"
-        width="w-[150px]"
+        tooltip="Same-latent hires re-renders the picture the model already drew, at more pixels."
+        width="w-[170px]"
         options={[
-          { value: 'flux', label: 'FLUX klein (best)' },
+          { value: 'hires', label: 'Same-latent hires' },
+          { value: 'flux', label: 'FLUX klein' },
           { value: 'sd', label: 'SD img2img' },
         ]}
       />
+
+      {engine === 'hires' ? (
+        <>
+          <Slider
+            id="rfFactor"
+            label="Upscale"
+            tooltip="Target = source × this, snapped to a multiple of 16 px."
+            min={1}
+            max={3}
+            step={0.05}
+            fallback={HIRES_FACTOR}
+            format={(v) => `×${v.toFixed(2)}`}
+          />
+          <Slider
+            id="rfDenoise"
+            label="Denoise"
+            tooltip={
+              'How much of the ORIGINAL schedule to re-run on the enlarged image. ' +
+              '0.3 = its last 30% of steps, same conditioning, same seed — detail without drift.'
+            }
+            min={0.05}
+            max={1}
+            step={0.05}
+            fallback={HIRES_DENOISE}
+            width="w-[165px]"
+            format={(v) => `${v.toFixed(2)} · last ${Math.round(v * 100)}%`}
+          />
+        </>
+      ) : null}
+
+      {engine !== 'hires' ? (
+        <>
+          <Tool
+            id="rfScale"
+            label="Upscale ×"
+            width="w-[90px]"
+            options={[
+              { value: '1.25', label: '1.25' },
+              { value: '1.5', label: '1.5' },
+              { value: '2.0', label: '2.0' },
+            ]}
+          />
+          <Tool id="rfSteps" label="Steps" type="number" placeholder="40" width="w-[80px]" />
+        </>
+      ) : null}
+
       {engine === 'sd' ? (
         <>
           <Tool
@@ -61,7 +109,9 @@ export function RefineBar() {
             ]}
           />
         </>
-      ) : (
+      ) : null}
+
+      {engine === 'flux' ? (
         <>
           <Tool
             id="rfPromptSel"
@@ -83,7 +133,7 @@ export function RefineBar() {
             />
           ) : null}
         </>
-      )}
+      ) : null}
     </>
   )
 }

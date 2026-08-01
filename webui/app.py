@@ -366,6 +366,7 @@ BACKENDS = {"sd15", "sd2", "sdxl", "flux2", "krea2"}
 SAMPLERS = {"diagonal", "pca", "blend", "hybrid"}
 NEG_MODES = {"mean", "empty", "zeros"}
 SCHEDULERS = {"default", "ddim", "euler", "euler_a", "dpm"}
+INTERPS = {"lanczos", "bicubic", "bilinear", "nearest"}    # hires upscale resampler
 
 # Gallery buckets keyed by filename prefix.
 GALLERY_BUCKETS = [
@@ -732,16 +733,28 @@ def api_run(req: RunRequest) -> JSONResponse:
     return JSONResponse({"job_id": job.id, "label": label})
 
 
+#: Upscale engines, in the order the UI offers them.
+#: hires -- scripts/upscale.py: same model, same latents, last `strength` of the
+#:          ORIGINAL schedule. The faithful default.
+#: flux  -- scripts/refine_flux.py: klein reference-regeneration (different model).
+#: sd    -- scripts/refine.py: general img2img, optionally tiled.
+REFINE_ENGINES = {"hires", "flux", "sd"}
+
+#: The hires pass replays conditioning, so only SD-family sidecars qualify.
+HIRES_BACKENDS = {"sd15", "sd2", "sdxl"}
+
+
 class RefineRequest(BaseModel):
     src: str                          # filename (or outputs-relative path) of a PNG
-    scale: float = 1.5
-    steps: Optional[int] = None
-    strength: float = 0.35
+    scale: float = 2.0                # upscale factor (hires: snapped to 16px)
+    steps: Optional[int] = None       # hires: unset = the original's own step count
+    strength: float = 0.3             # hires: fraction of the original schedule re-run
     scheduler: Optional[str] = None   # default ddim in refine.py when unset
     tiled: bool = True                # tiled native-res detail pass (Ultimate-SD-Upscale style)
     overlap: int = 128
-    engine: str = "flux"              # flux (klein reference-regen) | sd (tiled img2img)
+    engine: str = "hires"             # hires (same-latent) | flux (klein) | sd (img2img)
     prompt: Optional[str] = None      # flux engine: override the upscale instruction
+    interp: str = "lanczos"           # hires: resampling filter for the enlarge
 
 
 @app.post("/api/refine")
@@ -757,6 +770,8 @@ def api_refine(req: RefineRequest) -> JSONResponse:
             src = alt
     if base not in src.parents or src.suffix.lower() != ".png" or not src.is_file():
         raise HTTPException(404, f"source not found under outputs/: {req.src}")
+    if req.engine not in REFINE_ENGINES:
+        raise HTTPException(400, f"bad engine {req.engine!r}")
     if not (0.0 < req.scale <= 3.0):
         raise HTTPException(400, "scale must be in (0, 3]")
     if not (0.0 < req.strength <= 1.0):
@@ -769,6 +784,24 @@ def api_refine(req: RefineRequest) -> JSONResponse:
     else:
         backend = "sd15"
     model = _model_flags(RunRequest(action="refine", backend=backend))
+    if req.engine == "hires":
+        # The conditioning may live one or more `refined_from` hops back (this is
+        # also the pre-flight: an untraceable source 400s instead of burning a job).
+        origin = _explorable_source(src)
+        obackend = next((b for b in ("sdxl", "sd2") if f"anarchy_{b}_" in origin.name), "sd15")
+        if obackend not in HIRES_BACKENDS:
+            raise HTTPException(400, f"{obackend} latents can't be replayed; use the FLUX engine")
+        if req.interp not in INTERPS:
+            raise HTTPException(400, f"bad interp {req.interp!r}")
+        model = _model_flags(RunRequest(action="refine", backend=obackend))
+        argv = [PYTHON, "-u", "scripts/upscale.py", "--backend", obackend, *model,
+                "--src", str(src), "--factor", str(req.scale),
+                "--denoise", str(req.strength), "--interp", req.interp]
+        if req.steps is not None:
+            argv += ["--steps", str(int(req.steps))]
+        label = f"upscale · {obackend} · {src.name} · x{req.scale} · d{req.strength}"
+        job = RUNNER.submit("refine", label, argv)
+        return JSONResponse({"job_id": job.id, "label": label})
     if req.engine == "flux":
         argv = [FLUX_PYTHON, "-u", "scripts/refine_flux.py", "--src", str(src),
                 "--scale", str(req.scale)]
@@ -1961,14 +1994,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="refineBar" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;
          margin:0 0 12px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px">
-      <div><label style="margin-top:0">Upscale ×</label>
-        <select id="rfScale" style="width:90px"><option>1.25</option><option selected>1.5</option><option>2.0</option></select></div>
-      <div><label style="margin-top:0">Steps</label>
-        <input id="rfSteps" type="number" placeholder="40" style="width:80px"></div>
       <div><label style="margin-top:0">Engine</label>
-        <select id="rfEngine" style="width:150px">
-          <option value="flux" selected>FLUX klein (best)</option>
+        <select id="rfEngine" style="width:170px">
+          <option value="hires" selected>Same-latent hires</option>
+          <option value="flux">FLUX klein</option>
           <option value="sd">SD img2img</option></select></div>
+      <div class="rfHires"><label style="margin-top:0"
+           title="target = source × this, snapped to a multiple of 16 px">Upscale <b id="rfFactorOut">×2.00</b></label>
+        <input id="rfFactor" type="range" min="1" max="3" step="0.05" value="2.0" style="width:150px"></div>
+      <div class="rfHires"><label style="margin-top:0"
+           title="fraction of the ORIGINAL schedule re-run on the enlarged image, with the same latents and seed">Denoise <b id="rfDenoiseOut">0.30 · last 30%</b></label>
+        <input id="rfDenoise" type="range" min="0.05" max="1" step="0.05" value="0.3" style="width:165px"></div>
+      <div class="rfOther"><label style="margin-top:0">Upscale ×</label>
+        <select id="rfScale" style="width:90px"><option>1.25</option><option selected>1.5</option><option>2.0</option></select></div>
+      <div class="rfOther"><label style="margin-top:0">Steps</label>
+        <input id="rfSteps" type="number" placeholder="40" style="width:80px"></div>
       <div><label style="margin-top:0">SD mode</label>
         <select id="rfMode" style="width:140px"><option value="tiled" selected>Detail (tiled)</option>
           <option value="single">Standard (1 pass)</option></select></div>
@@ -2372,7 +2412,13 @@ function refinePrompt() {
   return null;   // faithful -> script default
 }
 async function refineImage(name, btn) {
-  const body = {
+  // hires owns its own two knobs and reads steps/guidance/scheduler/seed off the
+  // source image's sidecar; the other engines take the rest of the bar.
+  const body = $("#rfEngine").value === "hires" ? {
+    src: name, engine: "hires", tiled: false,
+    scale: parseFloat($("#rfFactor").value),
+    strength: parseFloat($("#rfDenoise").value),
+  } : {
     src: name,
     scale: parseFloat($("#rfScale").value),
     steps: $("#rfSteps").value.trim() === "" ? null : Number($("#rfSteps").value),
@@ -2395,7 +2441,8 @@ const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distan
   "direction","step","walk_frame","target_distance","elites","base_blend","dist",
   "backend","model","sampler","temperature","coherence",
   "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
-  "batch_seed","image_seed","index","refined_from","scale","strength","cond_reused","out_size","seed"];
+  "batch_seed","image_seed","index","refined_from","cond_from","engine","factor","denoise",
+  "denoise_steps","interp","scale","strength","cond_reused","src_size","out_size","seed"];
 let currentRel = null, currentScore = null;
 async function openLight(src, rel, score){
   currentRel = rel; currentScore = score;
@@ -2421,7 +2468,7 @@ async function openLight(src, rel, score){
     if (!keys.length) { box.innerHTML = `<span style="color:#9aa0ad">${rel} — no params recorded (pre-dates param logging)</span>${scoreLine}` + inv; return; }
     const ordered = PARAM_ORDER.filter(k => k in m && m[k] !== null);
     const cli = buildCli(m);
-    const LINKED = new Set(["parent", "parent_b", "refined_from"]);
+    const LINKED = new Set(["parent", "parent_b", "refined_from", "cond_from"]);
     const render = k => {
       let v = m[k];
       if (LINKED.has(k) && typeof v === "string")
@@ -2479,6 +2526,8 @@ function buildCli(m){
     if (m.coherence!=null) s += ` --coherence ${m.coherence}`;
     return s;
   }
+  if (m.kind === "refine" && m.engine === "hires") return `upscale.py --src ${m.refined_from || "<orig>"} --factor ${m.factor} --denoise ${m.denoise} --interp ${m.interp}`;
+  if (m.kind === "refine" && m.engine === "flux2-klein") return `refine_flux.py --src ${m.refined_from || "<orig>"} --scale ${m.scale} --steps ${m.steps}`;
   if (m.kind === "refine") return `refine.py --src <orig> --scale ${m.scale} --strength ${m.strength} --steps ${m.steps} --guidance ${m.guidance} --scheduler ${m.scheduler}`;
   if (m.kind === "explore") {
     let s = `explore.py --mode ${m.mode} --src ${m.parent} --seed ${m.batch_seed}`;
@@ -2509,6 +2558,21 @@ $("#lightmeta").onclick = (e) => e.stopPropagation();
 $("#rfPromptSel").onchange = () => {
   $("#rfPromptCustomWrap").style.display = $("#rfPromptSel").value === "custom" ? "" : "none";
 };
+// Engine switch: each engine shows only the knobs it actually reads.
+function rfSyncEngine() {
+  const hires = $("#rfEngine").value === "hires";
+  document.querySelectorAll(".rfHires").forEach(e => e.style.display = hires ? "" : "none");
+  document.querySelectorAll(".rfOther").forEach(e => e.style.display = hires ? "none" : "");
+}
+$("#rfEngine").onchange = rfSyncEngine;
+$("#rfFactor").oninput = () => {
+  $("#rfFactorOut").textContent = "×" + Number($("#rfFactor").value).toFixed(2);
+};
+$("#rfDenoise").oninput = () => {
+  const v = Number($("#rfDenoise").value);
+  $("#rfDenoiseOut").textContent = v.toFixed(2) + " · last " + Math.round(v * 100) + "%";
+};
+rfSyncEngine();
 $("#sortBy").onchange = () => { shown = PAGE; renderGallery(); };
 $("#wipeBtn").onclick = async () => {
   const p = await (await fetch("/api/wipe/preview")).json();

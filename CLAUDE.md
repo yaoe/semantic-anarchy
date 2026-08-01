@@ -22,6 +22,10 @@ python scripts/mine_distribution.py --backend sd15 --ckpt MODEL.safetensors \
 python scripts/generate.py --backend sd15 --dist outputs/dist --n 8
 python scripts/temperature_sweep.py --backend sdxl --dist outputs/dist --sampler pca --temps 1,2,3,4
 
+# same-latent hires fix (the default upscaler): enlarge, then re-run the tail of
+# the ORIGINAL schedule with that image's own conditioning
+python scripts/upscale.py --src outputs/generated/anarchy_sd15_7_000.png --factor 2.0 --denoise 0.3
+
 # latent travel film through keyframes -> outputs/films/<name>/<name>.mp4
 python scripts/morph_film.py --name drift --refine none --frames-per 24 --fps 16 \
     --images generated/a.png generated/b.png generated/c.png
@@ -67,6 +71,16 @@ Adding a backend means: a `Backend` subclass (`tensor_names` + `encode`/`generat
 **Distribution files are backend-namespaced.** `dist_prefix()` in `cli_args.py`: `sd15` keeps the bare `outputs/dist` (original layout), everything else gets `outputs/dist_<backend>`. Multi-tensor backends then append `__<tensor>` per file (`outputs/dist_sdxl__pooled.npz`). Each `.npz` has a `.meta.json` sibling. Evolved taste branches use the `outputs/dist_evolved*` prefix with the same rules.
 
 **`travel.py` — keyframe films, torch-free.** `interpolate` (`slerp`/`lerp`), `ease` (`smooth`/`smoother`/`linear`), `frame_plan(n_keys, frames_per, easing)` → the `(segment, t)` list for every frame (each transition starts ON its left keyframe and stops short of its right, plus one final frame at t=1, so no keyframe renders twice), and `noise_t(t, window)` for the narrower window the *init noise* travels in. `scripts/morph_film.py` is the only renderer: it reconstructs each keyframe's init latent from the recorded `image_seed` exactly as diffusers' `randn_tensor` would (cuda generator for sd15/sd2, cpu for sdxl), interpolates conditioning + noise, renders every frame through the raw pipe with `latents=`, and muxes with the first ffmpeg that actually has an H.264 encoder (`pick_h264_encoder`; a conda `--disable-gpl` ffmpeg on PATH has no libx264 — `SA_FFMPEG` pins one). Endpoints therefore come back pixel-identical; the middle never existed. sd15/sd2/sdxl only (`FILM_TENSORS`). **A film has ONE resolution** (keyframe 1's own, or `--width/--height`): a keyframe of any other size is re-rendered at the film's size from a differently-shaped noise draw, so it is *not* reproduced — `keyframe_size` reads the true size off the PNG (sidecars from evolve branches record none) and the script names every off-size keyframe in the log and in `film.json.offsize_keyframes`.
+
+**Three upscalers, one endpoint.** `POST /api/refine`'s `engine` picks between them; the UI is `features/refine/RefineBar.tsx`, and each engine hides the knobs the others own.
+
+| engine | script | what it does |
+|---|---|---|
+| `hires` **(default)** | `scripts/upscale.py` | same model, same latents: enlarge (16px-aligned) → img2img the LAST `denoise` fraction of the ORIGINAL schedule |
+| `flux` | `scripts/refine_flux.py` | klein reference-regeneration in `.venv-flux` — a different model, a stronger prior, free to reinterpret |
+| `sd` | `scripts/refine.py` | general img2img refine, optionally tiled (Ultimate-SD-Upscale style) |
+
+`upscale.py` is the faithful one and takes only two knobs (`--factor`, `--denoise`); *everything* else — step count, guidance, scheduler, seed, conditioning — is replayed from the source image's own sidecars, so the pass adds detail without drift. `semantic_anarchy/upscale.py` holds the torch-free half: `target_size` (snap to `LATENT_MULTIPLE`=16, cap the long side), `denoise_steps`/`clamp_denoise` (diffusers' own `int(steps*strength)` truncation, never zero steps), and `conditioning_source` (walk `refined_from` back to the ancestor that still owns a `.npz`, so upscaling an upscale still uses the true latents). sd15/sd2/sdxl only — a flux-origin image has no replayable SD conditioning and 400s with a pointer to the FLUX engine.
 
 **`cli_args.py` is the single source of CLI truth.** `add_backend_args` defines the shared `--backend/--sampler/--temperature/--components/--comp-lo/--equalize/--truncation/--coherence/--neg-mode` set; `resolve_gen_defaults` fills steps/guidance/height/width from `BACKEND_DEFAULTS` when unset. New knobs belong here, not duplicated per script.
 
