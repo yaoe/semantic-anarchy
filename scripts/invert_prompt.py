@@ -21,7 +21,7 @@ Either way the caption is a RULER, not a leash: it shows how near words can
 get to an off-grid discovery. The residual similarity is an unpromptability
 signal. It is never fed back into generation automatically.
 
-    python scripts/invert_prompt.py --src outputs/generated/X.png --tokens 12
+    python scripts/invert_prompt.py --src outputs/generated/X.jpg --tokens 12
     python scripts/invert_prompt.py --src ... --space native
 """
 

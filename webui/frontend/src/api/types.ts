@@ -5,9 +5,10 @@
 
 export type ActionId = 'generate' | 'temp_sweep' | 'sampler_sweep' | 'mine'
 export type BackendId = 'sd15' | 'sd2' | 'sdxl' | 'flux2' | 'krea2'
-export type SamplerId = 'diagonal' | 'pca' | 'blend' | 'hybrid'
+export type SamplerId = 'diagonal' | 'pca' | 'blend' | 'hybrid' | 'split'
+export type LengthModeId = 'off' | 'corpus' | 'fixed'
 export type SchedulerId = 'default' | 'ddim' | 'euler' | 'euler_a' | 'dpm'
-export type NegModeId = 'mean' | 'empty' | 'zeros'
+export type NegModeId = 'text' | 'mean' | 'empty' | 'zeros'
 export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled'
 
 /** Runner.snapshot() job rows. */
@@ -52,8 +53,9 @@ export type GalleryKey =
   | 'sampler'
   | 'marginals'
 
-/** Gallery tabs = server buckets + the client-side films/timeline views. */
-export type TabKey = GalleryKey | 'films' | 'timeline'
+/** Gallery tabs = server buckets + the client-side films/timeline/fit views.
+ *  Labeling is NOT a tab — it is its own page at /label (see LabelApp). */
+export type TabKey = GalleryKey | 'films' | 'timeline' | 'fit'
 
 export type Images = Record<GalleryKey, ImageItem[]>
 
@@ -72,16 +74,148 @@ export interface Config {
   sdxl_models: Record<string, string>
   /** backend -> hand-picked checkpoint path (webui/model_config.json). */
   picked_models: Partial<Record<BackendId, string>>
+  /** The house sd15 CFG negative prompt (or an SA_SD15_NEGATIVE override). */
+  sd15_negative: string
   init_dir: string
   init_count: number
   init_folders: InitFolder[]
   repo: string
+  /** The fixed seed panel comparative batches render against. */
+  seed_panel: { seed: number; n: number; seeds: number[] }
+  /** Absolute path of the append-only labels dataset (git-tracked). */
+  labels_file: string
+}
+
+/* ------------------------------------------------------------- labeling --- */
+
+/** The dimensions the label queue can be sliced along (webui.app LABEL_FACETS). */
+export type FacetDim =
+  | 'experiment'
+  | 'backend'
+  | 'ckpt'
+  | 'folder'
+  | 'size'
+  | 'kind'
+  | 'sampler'
+
+/** Server sentinel for "this image has no value on that dimension". */
+export const UNSET = '__none__'
+
+/** One image waiting for a score — mirrors webui.app `_label_index`. */
+export interface LabelRow {
+  rel: string
+  url: string
+  mtime: number
+  fav: boolean
+  /** The score that currently stands for it, or null when unlabeled. */
+  score: number | null
+  experiment: string | null
+  backend: string | null
+  /** Slug of the checkpoint that rendered it. */
+  ckpt: string | null
+  /** Directory under outputs/ it lives in. */
+  folder: string | null
+  /** "512x512" — from the sidecar, or read off the PNG when that predates it. */
+  size: string | null
+  kind: string | null
+  sampler: string | null
+  distance: number | null
+  image_seed: number | null
+  /** The sidecar knobs shown (collapsibly) beside the image. */
+  knobs: Record<string, string | number | boolean>
+}
+
+/** What the queue may be narrowed to. */
+export type LabelScope = 'unlabeled' | 'all' | 'labeled'
+export type LabelBucket = 'generated' | 'favorites'
+export type LabelOrder = 'shuffle' | 'new' | 'old'
+
+export interface LabelQueue {
+  queue: LabelRow[]
+  /** Size of the whole selection, before `limit`. */
+  total: number
+  labeled: number
+  filters: Partial<Record<FacetDim, string | null>>
+  since: number | null
+  until: number | null
+  scope: LabelScope
+  bucket: LabelBucket
+  order: LabelOrder
+}
+
+/**
+ * The query string of GET /api/label/queue — i.e. the label page's entire
+ * selection, and also its TanStack Query key. Facet values are '' for "any" and
+ * `UNSET` for "images missing a value on that dimension".
+ */
+export interface LabelQueryParams extends Partial<Record<FacetDim, string>> {
+  scope: LabelScope
+  bucket: LabelBucket
+  order: LabelOrder
+  /** Salts the server's stable shuffle — bump it to reshuffle on purpose. */
+  seed: number
+  /** Unix seconds; null/undefined = open-ended. */
+  since?: number | null
+  until?: number | null
+  limit?: number
+}
+
+/** One selectable value of a facet, with how much of it is left to label. */
+export interface FacetCell {
+  value: string
+  count: number
+  unlabeled: number
+}
+
+/** GET /api/label/facets — what there is to choose from, over the whole set. */
+export interface LabelFacets {
+  total: number
+  unlabeled: number
+  favorites: number
+  /** mtime bounds of the labelable set, for the time-window picker. */
+  oldest: number | null
+  newest: number | null
+  facets: Record<FacetDim, FacetCell[]>
+}
+
+/** labels.summarize() — deliberately tail-weighted. */
+export interface LabelSummary {
+  n: number
+  keeper_rate: number | null
+  p90: number | null
+  median: number | null
+  mean: number | null
+  max: number | null
+  hist: number[]
+}
+
+export interface LabelStats {
+  /** Distinct images labeled (latest record per image). */
+  count: number
+  /** Lines in the file — higher than `count` once anything was relabeled. */
+  records: number
+  file: string
+  overall: LabelSummary
+  experiments: (LabelSummary & { id: string })[]
+}
+
+/** One row of /api/experiments. `id: ''` is the untagged pile. */
+export interface ExperimentRow {
+  id: string
+  hypothesis: string | null
+  created: number | null
+  runs: number
+  seed_panel: boolean
+  images: number
+  labeled: number
 }
 
 /* --------------------------------------------------------- model picker --- */
 
 /** What a checkpoint path turned out to be. `repo` = a cached HF id. */
 export type ModelKind = 'ckpt' | 'diffusers' | 'repo' | null
+/** What /api/fs?pick=dist lists: a prompt corpus (.txt) or a saved fit (.npz). */
+export type FsKind = ModelKind | 'prompts' | 'npz'
 
 /** One row of /api/model — mirrors webui.app `_model_row`. */
 export interface ModelRow {
@@ -119,17 +253,150 @@ export interface FsEntry {
   name: string
   path: string
   dir: boolean
-  kind: ModelKind
+  kind: FsKind
   size: number | null
+  /** pick=dist only: this corpus is already encoded for the active checkpoint. */
+  ready?: boolean
 }
 
 export interface FsListing {
   path: string
   /** null when already at a browsable root. */
   parent: string | null
-  kind: ModelKind
+  kind: FsKind
   entries: FsEntry[]
   roots: FsRoot[]
+}
+
+/** What the file browser is picking: a checkpoint, or a base distribution. */
+export type PickMode = 'model' | 'dist'
+
+export type DistKind = 'base' | 'evolved' | 'prompts' | 'file'
+
+/**
+ * One distribution choice — mirrors webui.app `describe_dist`. `base` is the
+ * prefix `--dist` receives; `files` are the .npz it resolves to, and `ready`
+ * says whether they exist for the checkpoint named in `model`.
+ */
+export interface DistRow {
+  backend: BackendId
+  kind: DistKind
+  /** The picked .txt / .npz; null for the two built-in bases. */
+  path: string | null
+  base: string
+  label: string
+  ready: boolean
+  files: { path: string; exists: boolean }[]
+  /** The fit's .meta.json sidecar, once it exists. */
+  meta: {
+    feature_shape: number[]
+    n_samples: number
+    per_token: boolean
+    has_pca: boolean
+    has_corpus: boolean
+    /** Absent on fits mined before the corpus-autopsy corrections existed. */
+    has_length_stats?: boolean
+    has_radius_band?: boolean
+    noise_floor_axes?: number | null
+  } | null
+  /**
+   * Set when this distribution was fitted from picked images (🧬 Fit) rather
+   * than mined from prompts — the manifest that names them.
+   */
+  fit?: {
+    name: string | null
+    n_samples: number | null
+    note: string | null
+    created: number | null
+    models: string[] | null
+  } | null
+  /** The checkpoint that encodes (or encoded) this corpus. */
+  model: { path: string; name: string; slug: string }
+}
+
+export interface DistConfig extends DistRow {
+  config_file: string
+  default_prompts: string
+}
+
+/* ------------------------------------------------- fit from picked images -- */
+
+/**
+ * One candidate for a selection fit — the labeling index plus the two things
+ * you select *by*: the label score that currently stands for it and the star.
+ * `latents` is what makes it fittable at all (an upscale carries none).
+ */
+export interface FitCandidate {
+  rel: string
+  url: string
+  mtime: number
+  score: number | null
+  fav: boolean
+  latents: boolean
+  experiment: string | null
+  backend: BackendId | null
+  ckpt: string | null
+  folder: string | null
+  size: string | null
+  kind: string | null
+  sampler: string | null
+  distance: number | null
+}
+
+export type FitOrder = 'new' | 'old' | 'score' | 'distance'
+export type FitScored = 'any' | 'labeled' | 'unlabeled'
+
+/** GET /api/fit/candidates — the pool a selection is drawn from. */
+export interface FitCandidates {
+  /** The whole match; `rows` is capped by `limit`. */
+  total: number
+  shown: number
+  rows: FitCandidate[]
+  backends: BackendId[]
+}
+
+/** The query string of GET /api/fit/candidates, and its query key. */
+export interface FitQueryParams extends Partial<Record<FacetDim, string>> {
+  starred?: boolean
+  scored?: FitScored
+  min_score?: number | null
+  max_score?: number | null
+  since?: number | null
+  until?: number | null
+  order?: FitOrder
+  limit?: number
+}
+
+/** One saved fit under outputs/dist_fits (GET /api/fit/list). */
+export interface SavedFit {
+  name: string
+  base: string
+  backend: BackendId | null
+  created: number | null
+  n_samples: number | null
+  note: string | null
+  models: string[]
+  ready: boolean
+  files: string[]
+  meta: DistRow['meta']
+}
+
+export interface FitRequest {
+  name: string
+  rels: string[]
+  backend?: BackendId | null
+  components?: number | null
+  note?: string | null
+  overwrite?: boolean
+}
+
+export interface FitResponse extends RunResponse {
+  name: string
+  base: string
+  backend: BackendId
+  n: number
+  /** Hand this to /api/dist as `{kind: 'file', path}` once the job lands. */
+  file: string
 }
 
 export interface Film {
@@ -211,6 +478,8 @@ export interface RunRequest {
   components?: number | null
   truncation?: number | null
   neg_mode?: NegModeId | null
+  /** sd15/sd2 CFG negative text. null = keep the script's own default. */
+  negative?: string | null
   temps?: string | null
   seeds?: string | null
   scheduler?: SchedulerId | null
@@ -226,6 +495,21 @@ export interface RunRequest {
   init_strength?: number
   ip_scale?: number
   init_folder?: string | null
+  /** Experiment id stamped into every sidecar of this batch. */
+  experiment?: string | null
+  hypothesis?: string | null
+  /**
+   * The corpus-autopsy corrections (see semantic_anarchy/distribution.py).
+   * Every one is opt-in; leaving them alone reproduces the original samplers.
+   */
+  rho?: number | null
+  length_mode?: LengthModeId | null
+  length?: number | null
+  empirical_head?: number | null
+  temp_on?: number | null
+  temp_off?: number | null
+  radius_band?: boolean
+  radius_scale?: number | null
 }
 
 export interface RefineRequest {
@@ -313,6 +597,9 @@ export interface ImageMeta {
   temperature?: number
   coherence?: number
   scheduler?: string
+  neg_mode?: string
+  /** The CFG negative text this image was pushed away from (null = none). */
+  negative?: string | null
   steps?: number
   guidance?: number
   batch_seed?: number
@@ -322,6 +609,15 @@ export interface ImageMeta {
   scale?: number
   strength?: number
   distance?: number
+  /** The corpus-autopsy knobs, recorded per image (length varies within a batch). */
+  rho?: number | null
+  length_mode?: string | null
+  length?: number | null
+  empirical_head?: number | null
+  temp_on?: number | null
+  temp_off?: number | null
+  radius_band?: number | null
+  radius_scale?: number | null
   inverted_prompt?: string
   inverted_tokens?: number
   inverted_sim?: number

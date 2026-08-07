@@ -8,7 +8,7 @@ linguistics enter. The backend is auto-detected from the filename
 (``anarchy_sd15_*`` -> sd15, ``anarchy_sdxl_*`` -> sdxl) unless ``--backend`` is
 given. Run::
 
-    python scripts/refine.py --src outputs/generated/anarchy_sdxl_7_000.png \
+    python scripts/refine.py --src outputs/generated/anarchy_sdxl_7_000.jpg \
         --scale 1.5 --steps 40 --strength 0.3
 """
 
@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.cli_args import add_backend_args, load_backend
 
 
@@ -119,8 +119,8 @@ def main(argv=None) -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     tag = f"up{str(args.scale).replace('.', 'p')}"
-    out = unique_path(args.outdir / f"{src.stem}_{tag}.png")
-    out_img.save(out)
+    out = unique_image_path(args.outdir / f"{src.stem}_{tag}{image_ext()}")
+    save_image(out_img, out)
     import json
     out.with_suffix(".json").write_text(json.dumps({
         "kind": "refine", "backend": args.backend, "refined_from": src.name,

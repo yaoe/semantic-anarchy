@@ -32,6 +32,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.clip_compat import image_features
+from semantic_anarchy.io_utils import IMAGE_EXTS
 
 EMB_FILE = Path("outputs/clip_embeds.npz")
 NOVELTY_FILE = Path("outputs/novelty.json")
@@ -49,10 +50,11 @@ def load_cache():
 
 def embed_new(names, vecs, batch=16):
     """CLIP-embed gallery images not in the cache yet."""
-    all_pngs = sorted(glob.glob("outputs/generated/anarchy_*.png"))
-    rels = [str(Path(p).relative_to("outputs")) for p in all_pngs]
+    all_imgs = sorted(q for e in IMAGE_EXTS
+                      for q in glob.glob(f"outputs/generated/anarchy_*{e}"))
+    rels = [str(Path(p).relative_to("outputs")) for p in all_imgs]
     known = set(names)
-    todo = [(r, p) for r, p in zip(rels, all_pngs) if r not in known]
+    todo = [(r, p) for r, p in zip(rels, all_imgs) if r not in known]
     print(f"[resonance] {len(rels)} images, {len(todo)} to embed", flush=True)
     if not todo:
         return names, vecs

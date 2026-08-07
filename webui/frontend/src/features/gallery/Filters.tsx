@@ -15,10 +15,15 @@ const TABS = [
   { value: 'marginals', label: 'Marginals' },
   { value: 'timeline', label: '🎬 Timeline', title: 'keyframes to travel through' },
   { value: 'films', label: '🎞 Films' },
+  {
+    value: 'fit',
+    label: '🧬 Fit',
+    title: 'fit the next distribution to a set of images you pick',
+  },
 ]
 
 /** Tabs that aren't image grids, so the sort order doesn't apply. */
-const UNSORTED: TabKey[] = ['films', 'timeline']
+const UNSORTED: TabKey[] = ['films', 'timeline', 'fit']
 
 const SORTS = [
   { value: 'new', label: 'newest first' },

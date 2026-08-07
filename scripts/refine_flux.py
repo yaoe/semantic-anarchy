@@ -9,7 +9,7 @@ prior than SDXL: it rebuilds coherent fine detail rather than sharpening pixels.
 Runs in the flux venv (.venv-flux). Model via --model / SA_FLUX2_MODEL
 (black-forest-labs/FLUX.2-klein-4B default; 9B slots in once the HF token is set).
 
-    .venv-flux/bin/python scripts/refine_flux.py --src outputs/generated/X.png --scale 2.0
+    .venv-flux/bin/python scripts/refine_flux.py --src outputs/generated/X.jpg --scale 2.0
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 
 DEFAULT_PROMPT = (
     "Faithful upscaling task: output the SAME image at a higher resolution. "
@@ -84,8 +84,8 @@ def main(argv=None) -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     tag = f"flux{str(args.scale).replace('.', 'p')}"
-    dest = unique_path(args.outdir / f"{args.src.stem}_{tag}.png")
-    out.save(dest)
+    dest = unique_image_path(args.outdir / f"{args.src.stem}_{tag}{image_ext()}")
+    save_image(out, dest)
     dest.with_suffix(".json").write_text(json.dumps({
         "kind": "refine", "engine": "flux2-klein", "model": args.model,
         "refined_from": args.src.name, "scale": args.scale,

@@ -17,7 +17,7 @@ reference-conditioned upscaling with ONE fixed seed and ONE fixed faithful
 prompt for the whole film, so the reinterpretation stays temporally stable.
 
     python scripts/morph_film.py --name pilot \
-        --images generated/a.png generated/b.png \
+        --images generated/a.jpg generated/b.jpg \
         --frames-per 24 --fps 16 --interp slerp --refine none
 """
 
@@ -35,11 +35,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from semantic_anarchy.io_utils import (  # noqa: E402
+    IMAGE_EXTS, image_ext, save_image,
+)
 from semantic_anarchy.travel import (  # noqa: E402
     EASINGS, INTERPOLATIONS, frame_plan, interpolate, loop_keys, noise_t,
 )
 
 OUT = Path("outputs")
+
+
+def frame_ext(d: Path) -> str:
+    """Which extension this frame directory is already using.
+
+    Frames are written in the configured image format (JPEG by default -- a
+    2000-frame film is where PNG really costs), but ``--resume`` on a run
+    started under a different format must keep writing what ffmpeg will later
+    glob as one numbered sequence, so an existing frame wins over the default.
+    """
+    for e in IMAGE_EXTS:
+        if next(d.glob(f"frame_*{e}"), None) is not None:
+            return e
+    return image_ext()
 
 #: Which named conditioning tensors each backend's sidecar carries. The flow
 #: backends (flux2/krea2) pack latents differently and have no reconstructible
@@ -326,8 +343,9 @@ def main(argv=None) -> int:
     lats = [init_latent(s if s is not None else 0).float().cpu().numpy()
             for s in seeds]
 
-    negatives = _sdxl_negatives(backend, m0, guidance, device, dtype) \
-        if backend == "sdxl" else {}
+    negatives = (_sdxl_negatives(backend, m0, guidance, device, dtype)
+                 if backend == "sdxl"
+                 else _sd_negatives(be.model, m0, guidance, device, dtype))
 
     def render(cond: dict, latent: np.ndarray):
         kwargs = dict(latents=torch.from_numpy(latent).to(device, dtype),
@@ -339,12 +357,14 @@ def main(argv=None) -> int:
             kwargs.update(negatives)
         else:
             kwargs["prompt_embeds"] = _t(cond["embeds"], 3, device, dtype)
+            kwargs.update(negatives)
         return pipe(**kwargs).images[0]
 
     print(f"[film] rendering {len(plan)} base frames ...", flush=True)
     t0 = time.time()
+    bext = frame_ext(base_dir)
     for fi, (s, t) in enumerate(plan):
-        if args.resume and (base_dir / f"frame_{fi:04d}.png").is_file():
+        if args.resume and (base_dir / f"frame_{fi:04d}{bext}").is_file():
             continue
         cond = {k: interpolate(keys[s]["cond"][k], keys[s + 1]["cond"][k],
                                t, args.interp)
@@ -357,7 +377,7 @@ def main(argv=None) -> int:
             # start renders flat, washed-out middles.
             tn = noise_t(t, args.noise_window, args.easing)
             lat = interpolate(lats[s], lats[s + 1], tn, "slerp")
-        render(cond, lat).save(base_dir / f"frame_{fi:04d}.png")
+        save_image(render(cond, lat), base_dir / f"frame_{fi:04d}{bext}")
         done, left = fi + 1, len(plan) - fi - 1
         eta = (time.time() - t0) / done * left
         print(f"[film]   base {done}/{len(plan)}  (eta {eta / 60:.1f}m)", flush=True)
@@ -372,7 +392,7 @@ def main(argv=None) -> int:
 
     mp4 = film_dir / f"{args.name}.mp4"
     cmd = [ffmpeg, "-y", "-framerate", str(args.fps),
-           "-i", str(render_dir / "frame_%04d.png"),
+           "-i", str(render_dir / f"frame_%04d{frame_ext(render_dir)}"),
            # yuv420p needs even dimensions; refine scales can land on odd ones.
            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            *codec_args, "-pix_fmt", "yuv420p",
@@ -406,6 +426,24 @@ def _t(a, want: int, device, dtype):
     while a.ndim < want:
         a = a[None]
     return torch.from_numpy(a).to(device, dtype)
+
+
+def _sd_negatives(model, meta: dict, guidance: float, device, dtype) -> dict:
+    """CFG negative for sd15/sd2, matching how the keyframes themselves were made.
+
+    generate.py defaults sd15 to ``neg_mode=text`` — the house negative prompt —
+    so a film that left it out would render every frame against a *different*
+    negative than its own endpoints. Passing nothing here would make diffusers
+    silently encode the empty prompt instead.
+    """
+    if guidance <= 1.0:
+        return {}
+    mode = meta.get("neg_mode") or "text"
+    if mode == "empty":
+        return {"negative_prompt_embeds": _t(model.uncond_embedding(), 3, device, dtype)}
+    if mode != "text":     # mean/zeros are sdxl-only knobs; fall back to the default
+        return {}
+    return {"negative_prompt_embeds": _t(model.negative_embedding(), 3, device, dtype)}
 
 
 def _sdxl_negatives(backend: str, meta: dict, guidance: float, device, dtype) -> dict:
@@ -461,15 +499,16 @@ def _flux_pass(args, film_dir: Path, base_dir: Path, n_frames: int,
     except Exception:
         fpipe = fpipe.to("cuda")
     fpipe.set_progress_bar_config(disable=True)
+    fext, bext = frame_ext(flux_dir), frame_ext(base_dir)
     for fi in range(n_frames):
-        if args.resume and (flux_dir / f"frame_{fi:04d}.png").is_file():
+        if args.resume and (flux_dir / f"frame_{fi:04d}{fext}").is_file():
             continue
-        src = Image.open(base_dir / f"frame_{fi:04d}.png").convert("RGB")
+        src = Image.open(base_dir / f"frame_{fi:04d}{bext}").convert("RGB")
         gen = torch.Generator(device="cpu").manual_seed(args.film_seed)
         out = fpipe(prompt=FAITHFUL_PROMPT, image=[src],
                     height=th, width=tw, num_inference_steps=28,
                     guidance_scale=4.0, generator=gen).images[0]
-        out.save(flux_dir / f"frame_{fi:04d}.png")
+        save_image(out, flux_dir / f"frame_{fi:04d}{fext}")
         print(f"[film]   flux {fi + 1}/{n_frames}", flush=True)
     return flux_dir
 

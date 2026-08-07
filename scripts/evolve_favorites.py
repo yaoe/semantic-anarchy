@@ -26,9 +26,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.cli_args import (
-    add_backend_args, resolve_gen_defaults, load_backend, dist_prefix,
+    add_backend_args, add_experiment_args, record_experiment, resolve_gen_defaults,
+    load_backend, effective_negative, dist_prefix, neg_dists_kwarg,
 )
 
 
@@ -51,7 +52,11 @@ def _favorite_anchors(backend_name: str) -> list[dict]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_backend_args(parser)
+    add_experiment_args(parser)
     parser.add_argument("--n", type=int, default=8)
+    parser.add_argument("--dist", type=Path, default=Path("outputs/dist"),
+                        help="base distribution to graft the corpus PCA axes "
+                             "from (default: the mined corpus)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="spread around your taste center (evolved std units)")
     parser.add_argument("--sampler-override", default="diagonal",
@@ -75,7 +80,7 @@ def main(argv=None) -> int:
     if args.scheduler != "default":
         from semantic_anarchy.pipeline import set_scheduler
         set_scheduler(backend.model.pipe, args.scheduler)
-    dists = backend.load_dists(dist_prefix(args, "outputs/dist"))
+    dists = backend.load_dists(dist_prefix(args, str(args.dist)))
 
     # Refit each named tensor around the elites; keep the corpus PCA axes so the
     # pca/blend samplers (and neighborhood/walk on children) still work.
@@ -83,8 +88,14 @@ def main(argv=None) -> int:
     for k, d in dists.items():
         elites = np.stack([a[k] for a in anchors])
         ev = d.refit_from_elites(elites, base_blend=args.base_blend)
+        # Graft the corpus axes (and their empirical coefficient CDFs, which are
+        # a property of those same axes) back onto the taste branch so every
+        # sampler keeps working. NOT grafted: the length split and the radius
+        # band, which are measured against the CORPUS centre -- this branch has
+        # moved, so they would describe the wrong geometry. --length-mode and
+        # --radius-band therefore warn on an evolved branch rather than lying.
         evolved[k] = replace(ev, pca_components=d.pca_components,
-                             pca_std=d.pca_std,
+                             pca_std=d.pca_std, pca_head=d.pca_head,
                              corpus_embeddings=d.corpus_embeddings)
         print(f"[evolve]   {k}: taste-center distance from corpus center = "
               f"{d.distance(evolved[k].mean):.2f}")
@@ -95,30 +106,31 @@ def main(argv=None) -> int:
     if seed is None:
         seed = int(np.random.SeedSequence().entropy) % (2**31)
     rng = np.random.default_rng(seed)
+    experiment = record_experiment(args, seed=seed)
     named = backend.sample(evolved, n=args.n, temperature=args.temperature,
                            rng=rng, sampler=args.sampler_override)
 
     print(f"[evolve] decoding {args.n} from your branch (guidance={args.guidance}, "
           f"steps={args.steps}, seed={seed}) ...")
     gen_kw = dict(guidance=args.guidance, steps=args.steps, seed=seed,
-                  neg_mode=args.neg_mode)
-    if args.backend == "sdxl":
-        gen_kw["dists"] = evolved
+                  neg_mode=args.neg_mode, **neg_dists_kwarg(args, evolved))
     images = backend.generate(named, **gen_kw)
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     for i, img in enumerate(images):
-        path = unique_path(args.outdir / f"anarchy_{args.backend}_{seed}_{i:03d}.png")
-        img.save(path)
+        path = unique_image_path(
+            args.outdir / f"anarchy_{args.backend}_{seed}_{i:03d}{image_ext()}")
+        save_image(img, path)
         one = {k: np.asarray(v)[i] for k, v in named.items()}
         np.savez(path.with_suffix(".npz"), **one)
         meta = {
-            "kind": "evolve", "backend": args.backend,
+            "kind": "evolve", "experiment": experiment, "backend": args.backend,
             "model": args.ckpt or args.model or "(default)",
             "elites": len(anchors), "base_blend": args.base_blend,
             "sampler": args.sampler_override, "temperature": args.temperature,
             "steps": args.steps, "guidance": args.guidance,
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,
+            "negative": effective_negative(backend, args.neg_mode),
             "batch_seed": seed, "image_seed": seed + i, "index": i,
             "distance": round(backend.distance(dists, one), 3),
         }

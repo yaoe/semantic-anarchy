@@ -29,6 +29,8 @@ export function Card({
   const setBreedParent = useUI((s) => s.setBreedParent)
   const addKeyframe = useUI((s) => s.addKeyframe)
   const inTimeline = useUI((s) => s.timeline.filter((r) => r === im.rel).length)
+  const toggleFitSel = useUI((s) => s.toggleFitSel)
+  const inFitSel = useUI((s) => s.fitSel.includes(im.rel))
 
   const favorite = useFavorite()
   const refine = useRefine()
@@ -167,6 +169,19 @@ export function Card({
                 onClick={() => addKeyframe(im.rel)}
               >
                 🎬{inTimeline > 1 ? `×${inTimeline}` : ''}
+              </button>
+              {/* Hand-picking for a fit happens wherever you happen to be
+                  looking — the 🧬 Fit tab shares this one selection. */}
+              <button
+                className={cn('sa-btn sa-btn-sm', inFitSel && 'border-run text-run')}
+                title={
+                  inFitSel
+                    ? 'remove from the 🧬 Fit selection'
+                    : 'add to the 🧬 Fit selection (fit a distribution on these latents)'
+                }
+                onClick={() => toggleFitSel(im.rel)}
+              >
+                {inFitSel ? '⊖' : '⊕'}
               </button>
               <button
                 className={cn('sa-btn sa-btn-sm', breedParent === im.rel && 'sa-btn-sel')}

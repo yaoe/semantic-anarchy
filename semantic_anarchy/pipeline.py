@@ -16,10 +16,169 @@ mining math, plotting, tests) runs on a machine with neither installed.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import numpy as np
+
+
+#: The house SD1.5 negative prompt, used as the CFG negative branch for every
+#: sd15 sampling step (generate, hires-fix, film, explore).
+#:
+#: Not invented here — it is the string the Eden SD1.5 stack has always sampled
+#: with. Of the 1,153 SD1.5-lineage run configs recorded across the sibling repos
+#: (``cog/eden-sd-pipelines`` results for ``eden:eden-v1`` and
+#: ``dreamlike-photoreal-2.0``), 1,140 used exactly this text, and it is
+#: hardcoded at seven more sites in ``sd-lora-trainer`` / ``diffusion_trainer``.
+#: Adopting it here keeps promptless samples in the same aesthetic basin as
+#: everything else that has been rendered off these checkpoints.
+#:
+#: Override with ``SA_SD15_NEGATIVE``; set it empty to fall back to the
+#: empty-prompt negative (equivalently, ``--neg-mode empty``).
+SD15_NEGATIVE_PROMPT = (
+    "nude, naked, poorly drawn face, ugly, tiling, out of frame, extra limbs, "
+    "disfigured, deformed body, blurry, blurred, watermark, text, grainy, "
+    "signature, cut off, draft"
+)
+
+
+def default_sd15_negative() -> Optional[str]:
+    """``SD15_NEGATIVE_PROMPT``, or the ``SA_SD15_NEGATIVE`` override.
+
+    An override set to the empty string means "no negative text" — the CFG
+    negative goes back to the empty-prompt encoding.
+    """
+    import os
+
+    override = os.environ.get("SA_SD15_NEGATIVE")
+    if override is None:
+        return SD15_NEGATIVE_PROMPT
+    return override.strip() or None
+
+
+#: Components mining never touches. Passing them to ``from_pretrained`` /
+#: ``from_single_file`` as ``None`` makes diffusers *skip loading them entirely*
+#: — for a single-file SD1.5 checkpoint that turns a multi-second, multi-GB
+#: pipeline load into ~0.4s and ~250MB of VRAM (the text encoder alone).
+ENCODE_ONLY_SKIP = (
+    "unet", "transformer", "vae", "safety_checker", "feature_extractor",
+    "image_encoder",
+)
+
+
+def encode_only_kwargs(pipeline_class) -> dict:
+    """``{component: None}`` for every skippable component this pipeline has.
+
+    Filtered against the pipeline's own ``__init__`` signature, so a class that
+    has no ``transformer`` (or no ``safety_checker``) never sees the kwarg.
+    """
+    import inspect
+
+    params = inspect.signature(pipeline_class.__init__).parameters
+    return {name: None for name in ENCODE_ONLY_SKIP if name in params}
+
+
+def _load_encode_only(build, pipeline_class, encode_only: bool):
+    """``build(skip_kwargs)`` a pipeline, encoder-only when asked.
+
+    A partial pipeline is unusual enough that it's worth being defensive: if a
+    diffusers/model combination refuses to construct one, say so and load the
+    whole thing rather than failing the mine.
+    """
+    if not encode_only:
+        return build({})
+    try:
+        pipe = build(encode_only_kwargs(pipeline_class))
+        print("[pipeline] encoder-only load: no UNet/VAE (mining never denoises)")
+        return pipe
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"[pipeline] encoder-only load failed ({exc!r}); "
+              f"loading the full pipeline instead")
+        return build({})
+
+
+@contextlib.contextmanager
+def quiet_truncation_warnings():
+    """Mute the per-batch "your input was truncated" warning while encoding.
+
+    diffusers logs it -- with the whole dropped text inlined -- once per batch.
+    Mining a corpus of long captions turns that into hundreds of multi-KB log
+    lines that bury the progress bar (and blow the dashboard's log cap).
+    Truncation at the encoder's token limit is inherent to the method, so
+    :func:`report_truncation` states it ONCE with a count and this mutes the
+    repeats.
+    """
+    import importlib
+
+    restore = []
+    for mod in ("diffusers.utils.logging", "transformers.utils.logging"):
+        try:
+            m = importlib.import_module(mod)
+            restore.append((m, m.get_verbosity()))
+            m.set_verbosity_error()
+        except Exception:                                       # noqa: BLE001
+            continue
+    try:
+        yield
+    finally:
+        for m, prev in restore:
+            try:
+                m.set_verbosity(prev)
+            except Exception:                                   # noqa: BLE001
+                pass
+
+
+def report_truncation(tokenizer, prompts) -> int:
+    """Print (once) how many prompts overflow the encoder's token limit.
+
+    A corpus of long image captions is mostly *over* CLIP's 77 tokens; that's
+    fine -- the tail is dropped and the fit is over what the encoder actually
+    saw -- but it should be visible, not silent.
+    """
+    limit = getattr(tokenizer, "model_max_length", None)
+    if not limit or limit > 1e6 or len(prompts) < 2:
+        return 0
+    with quiet_truncation_warnings():
+        lengths = [len(ids) for ids in
+                   tokenizer(list(prompts), truncation=False,
+                             padding=False)["input_ids"]]
+    over = sum(1 for n in lengths if n > limit)
+    if over:
+        print(f"[pipeline] {over}/{len(lengths)} prompts exceed the {limit}-token "
+              f"limit and are truncated (longest {max(lengths)} tokens)")
+    return over
+
+
+def _encode_batches(prompts, batch_size: int, fn, on_batch=None) -> list:
+    """Run ``fn(chunk)`` over ``prompts`` in batches, reporting progress.
+
+    ``on_batch(done)`` receives the running count of *prompts* encoded (not
+    batches), so callers can drive a progress bar without knowing the batching.
+    """
+    prompts = list(prompts)
+    batch_size = max(1, int(batch_size))
+    out = []
+    with quiet_truncation_warnings():
+        for i in range(0, len(prompts), batch_size):
+            out.append(fn(prompts[i : i + batch_size]))
+            if on_batch is not None:
+                on_batch(min(i + batch_size, len(prompts)))
+    return out
+
+
+def _stream(images: list, index: int, image, on_image) -> None:
+    """Record a finished image and hand it straight to the caller.
+
+    Every ``generate_from_embeddings`` renders one image per pipe call, so the
+    whole batch is only "done" when the last one lands. ``on_image(index,
+    image)`` lets the caller write each image the *moment* it exists instead:
+    the dashboard's gallery then shows image 1 of 8 after an eighth of the wall
+    clock, and a cancelled batch keeps everything it had already rendered.
+    """
+    images.append(image)
+    if on_image is not None:
+        on_image(index, image)
 
 
 def set_scheduler(pipe, name: Optional[str]) -> None:
@@ -210,7 +369,12 @@ class SDModel:
     pipe: object
     device: str
     model_id: str
+    #: Text used for the CFG negative branch. ``None`` = the empty prompt.
+    #: ``SD15Backend.load`` sets it to :data:`SD15_NEGATIVE_PROMPT`; sd2 leaves
+    #: it None (its OpenCLIP-H encoder was never sampled with that string).
+    negative_prompt: Optional[str] = None
     _uncond: Optional[np.ndarray] = None  # cached empty-prompt embedding
+    _neg: Optional[np.ndarray] = None     # cached negative_prompt embedding
 
     @classmethod
     def load(
@@ -220,9 +384,16 @@ class SDModel:
         dtype: str = "auto",
         ckpt: Optional[str] = None,
         single_file_config: Optional[str] = None,
+        encode_only: bool = False,
     ) -> "SDModel":
         """Load a Stable Diffusion pipeline.
 
+        ``encode_only``:
+            Load ONLY the tokenizer + text encoder (see ``ENCODE_ONLY_SKIP``).
+            Mining never denoises, so the UNet and VAE are dead weight — skipping
+            them is the difference between seconds and ~0.4s, and between GBs of
+            VRAM and ~250MB. Falls back to the full pipeline if a diffusers
+            version won't build a partial one.
         ``ckpt``:
             Path to a single-file checkpoint (``.ckpt`` / ``.safetensors``). When
             given, the pipeline is built via ``from_single_file`` -- so a local
@@ -244,19 +415,22 @@ class SDModel:
         else:
             torch_dtype = getattr(torch, dtype)
 
-        if ckpt is not None:
-            # Legacy ``.ckpt`` files are pickles that may stash a
-            # ``pytorch_lightning`` global; under torch 2.6+ from_single_file's
-            # weights_only=True load chokes on them. So for anything that isn't
-            # already safetensors we convert it ourselves (trusted local file)
-            # to a cached sibling .safetensors and load that.
-            load_path = _ensure_safetensors_ckpt(ckpt)
-            sf_kwargs = {"torch_dtype": torch_dtype}
-            if single_file_config:
-                sf_kwargs["config"] = single_file_config
-            pipe = StableDiffusionPipeline.from_single_file(load_path, **sf_kwargs)
-        else:
-            pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+        def _build(skip: dict):
+            if ckpt is not None:
+                # Legacy ``.ckpt`` files are pickles that may stash a
+                # ``pytorch_lightning`` global; under torch 2.6+ from_single_file's
+                # weights_only=True load chokes on them. So for anything that isn't
+                # already safetensors we convert it ourselves (trusted local file)
+                # to a cached sibling .safetensors and load that.
+                load_path = _ensure_safetensors_ckpt(ckpt)
+                sf_kwargs = {"torch_dtype": torch_dtype, **skip}
+                if single_file_config:
+                    sf_kwargs["config"] = single_file_config
+                return StableDiffusionPipeline.from_single_file(load_path, **sf_kwargs)
+            return StableDiffusionPipeline.from_pretrained(
+                model_id, torch_dtype=torch_dtype, **skip)
+
+        pipe = _load_encode_only(_build, StableDiffusionPipeline, encode_only)
         pipe = pipe.to(device)
         pipe.set_progress_bar_config(disable=True)
         # We deliberately keep the safety checker off: these images have no prompt
@@ -276,35 +450,57 @@ class SDModel:
     def encode_prompts(
         self,
         prompts: Iterable[str],
-        batch_size: int = 16,
+        batch_size: int = 8,
+        on_batch=None,
     ) -> np.ndarray:
-        """Encode prompts -> conditioning embeddings ``(N, 77, hidden)`` as numpy."""
+        """Encode prompts -> conditioning embeddings ``(N, 77, hidden)`` as numpy.
+
+        ``on_batch(done)`` is called after each batch with the running prompt
+        count, for progress reporting.
+        """
         import torch
 
         prompts = list(prompts)
-        out = []
-        for i in range(0, len(prompts), batch_size):
-            chunk = prompts[i : i + batch_size]
-            embeds = self.pipe.encode_prompt(
-                prompt=chunk,
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=False,
-            )
+        report_truncation(self.pipe.tokenizer, prompts)
+
+        def one(chunk):
+            with torch.no_grad():
+                embeds = self.pipe.encode_prompt(
+                    prompt=chunk,
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                )
             # diffusers returns (prompt_embeds, negative_prompt_embeds)
             prompt_embeds = embeds[0] if isinstance(embeds, tuple) else embeds
-            out.append(prompt_embeds.detach().to(torch.float32).cpu().numpy())
-        return np.concatenate(out, axis=0)
+            return prompt_embeds.detach().to(torch.float32).cpu().numpy()
+
+        return np.concatenate(_encode_batches(prompts, batch_size, one, on_batch), axis=0)
 
     def uncond_embedding(self) -> np.ndarray:
-        """The empty-prompt embedding, used as the negative branch for CFG.
+        """The empty-prompt embedding -- the corpus's geometric origin.
 
+        This is the analysis anchor (``analysis.encode_corpus`` saves it as the
+        ``uncond`` row) and the fallback negative when no negative text is set.
         Cached after the first call -- it never changes, and generation otherwise
         re-encodes the empty prompt on every batch.
         """
         if self._uncond is None:
             self._uncond = self.encode_prompts([""], batch_size=1)
         return self._uncond
+
+    def negative_embedding(self) -> np.ndarray:
+        """The CFG negative branch: :attr:`negative_prompt`, else the empty prompt.
+
+        Encoding it is the ONLY text-encoder call generation makes, it happens
+        once per process, and it is why ``negative_prompt`` must be set before
+        the UNet is skipped -- an ``encode_only`` model never generates anyway.
+        """
+        if self.negative_prompt is None:
+            return self.uncond_embedding()
+        if self._neg is None:
+            self._neg = self.encode_prompts([self.negative_prompt], batch_size=1)
+        return self._neg
 
     # ----------------------------------------------------------- decoding ---
     def generate_from_embeddings(
@@ -320,11 +516,13 @@ class SDModel:
         init_strength: float = 0.7,
         ip_images: Optional[list] = None,
         ip_scale: float = 0.7,
+        on_image=None,
     ) -> list:
         """Decode conditioning embeddings to PIL images -- no prompt involved.
 
         ``embeddings`` is ``(N, 77, hidden)``. Each is fed as ``prompt_embeds``;
-        the text encoder is never called.
+        the text encoder is never called. ``on_image(i, image)`` fires as each
+        one finishes (see :func:`_stream`).
 
         Two ways to inject an init image (mutually exclusive):
         * ``init_images`` -- IMG2IMG: start the denoiser from the init's latent
@@ -345,7 +543,7 @@ class SDModel:
         cond = torch.from_numpy(embeddings).to(self.device, dtype=param_dtype)
 
         if negative_embedding is None:
-            negative_embedding = self.uncond_embedding()
+            negative_embedding = self.negative_embedding()
         neg = np.asarray(negative_embedding, dtype=np.float32)
         if neg.ndim == 2:
             neg = neg[None]
@@ -384,7 +582,7 @@ class SDModel:
                 if ip_images:
                     kwargs["ip_adapter_image"] = ip_images[i % len(ip_images)].convert("RGB")
                 result = self.pipe(**kwargs)
-            images.append(result.images[0])
+            _stream(images, i, result.images[0], on_image)
         return images
 
     def _img2img_pipe(self):
@@ -428,7 +626,7 @@ class SDModel:
         ``cond``:
             The ORIGINAL ``(77, hidden)`` conditioning that produced the image
             (saved as a sidecar at generation time). Reusing it -- with CFG
-            (``guidance_scale > 1``, negative = empty prompt) -- makes the pass
+            (``guidance_scale > 1``, negative = :meth:`negative_embedding`) -- makes the pass
             *reinforce the same content* at higher resolution instead of drifting
             toward a generic unconditional refine. Falls back to the empty-prompt
             embedding when ``cond`` is None (older images without a sidecar).
@@ -460,7 +658,7 @@ class SDModel:
                       num_inference_steps=num_inference_steps,
                       guidance_scale=guidance_scale)
         if guidance_scale > 1.0:
-            neg = torch.from_numpy(np.asarray(self.uncond_embedding(), dtype=np.float32)).to(
+            neg = torch.from_numpy(np.asarray(self.negative_embedding(), dtype=np.float32)).to(
                 self.device, dtype=param_dtype)
             kwargs["negative_prompt_embeds"] = neg
         if seed is not None:
@@ -496,8 +694,12 @@ class SDXLModel:
         device: Optional[str] = None,
         dtype: str = "auto",
         ckpt: Optional[str] = None,
+        encode_only: bool = False,
     ) -> "SDXLModel":
-        """Load a stock SDXL pipeline (``from_pretrained`` or ``from_single_file``)."""
+        """Load a stock SDXL pipeline (``from_pretrained`` or ``from_single_file``).
+
+        ``encode_only`` loads just the two tokenizers + text encoders — mining
+        never denoises, so the UNet and VAE are dead weight."""
         import torch
         from diffusers import StableDiffusionXLPipeline
 
@@ -507,11 +709,15 @@ class SDXLModel:
         else:
             torch_dtype = getattr(torch, dtype)
 
-        if ckpt is not None:
-            load_path = _ensure_safetensors_ckpt(ckpt)
-            pipe = StableDiffusionXLPipeline.from_single_file(load_path, torch_dtype=torch_dtype)
-        else:
-            pipe = StableDiffusionXLPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
+        def _build(skip: dict):
+            if ckpt is not None:
+                load_path = _ensure_safetensors_ckpt(ckpt)
+                return StableDiffusionXLPipeline.from_single_file(
+                    load_path, torch_dtype=torch_dtype, **skip)
+            return StableDiffusionXLPipeline.from_pretrained(
+                model_id, torch_dtype=torch_dtype, **skip)
+
+        pipe = _load_encode_only(_build, StableDiffusionXLPipeline, encode_only)
         pipe = pipe.to(device)
         pipe.set_progress_bar_config(disable=True)
         return cls(pipe=pipe, device=device, model_id=ckpt or model_id)
@@ -527,7 +733,8 @@ class SDXLModel:
         return {"prompt_embeds": (tokens, hidden), "pooled": (pooled,)}
 
     # ----------------------------------------------------------- encoding ---
-    def encode_prompts(self, prompts: Iterable[str], batch_size: int = 8) -> dict:
+    def encode_prompts(self, prompts: Iterable[str], batch_size: int = 8,
+                       on_batch=None) -> dict:
         """Encode prompts -> ``{"prompt_embeds": (N,77,2048), "pooled": (N,1280)}``.
 
         SDXL ``encode_prompt`` returns a 4-tuple
@@ -537,18 +744,23 @@ class SDXLModel:
         import torch
 
         prompts = list(prompts)
-        embeds, pooled = [], []
-        for i in range(0, len(prompts), batch_size):
-            chunk = prompts[i : i + batch_size]
-            enc = self.pipe.encode_prompt(
-                prompt=chunk,
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=False,
-            )
+        report_truncation(self.pipe.tokenizer, prompts)
+
+        def one(chunk):
+            with torch.no_grad():
+                enc = self.pipe.encode_prompt(
+                    prompt=chunk,
+                    device=self.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=False,
+                )
             # 4-tuple: (prompt_embeds, neg_embeds, pooled, neg_pooled)
-            embeds.append(enc[0].detach().to(torch.float32).cpu().numpy())
-            pooled.append(enc[2].detach().to(torch.float32).cpu().numpy())
+            return (enc[0].detach().to(torch.float32).cpu().numpy(),
+                    enc[2].detach().to(torch.float32).cpu().numpy())
+
+        pairs = _encode_batches(prompts, batch_size, one, on_batch)
+        embeds = [e for e, _ in pairs]
+        pooled = [p for _, p in pairs]
         return {
             "prompt_embeds": np.concatenate(embeds, axis=0),   # (N, 77, 2048)
             "pooled": np.concatenate(pooled, axis=0),          # (N, 1280)
@@ -574,8 +786,11 @@ class SDXLModel:
         init_strength: float = 0.7,
         ip_images: Optional[list] = None,
         ip_scale: float = 0.7,
+        on_image=None,
     ) -> list:
         """Decode sampled SDXL conditioning tensors to images (no text encoder).
+
+        ``on_image(i, image)`` fires as each one finishes (see :func:`_stream`).
 
         ``embeddings`` = ``{"prompt_embeds": (N,77,2048), "pooled": (N,1280)}``.
         When ``guidance_scale > 1`` the CFG path runs and ``negatives`` (same dict
@@ -647,7 +862,7 @@ class SDXLModel:
                 if ip_images:
                     kwargs["ip_adapter_image"] = ip_images[i % len(ip_images)].convert("RGB")
                 result = self.pipe(**kwargs)
-            images.append(result.images[0])
+            _stream(images, i, result.images[0], on_image)
         return images
 
     def _img2img_pipe(self):
@@ -727,7 +942,7 @@ class SDXLModel:
 
 
 
-def _flow_pipeline_kwargs(model_id: str) -> dict:
+def _flow_pipeline_kwargs(model_id: str, encode_only: bool = False) -> dict:
     """Loading kwargs for big flow models on a 24GB-VRAM / 30GB-RAM box.
 
     The 4B klein fits in bf16 with cpu-offload. Anything bigger (klein-9B,
@@ -735,6 +950,9 @@ def _flow_pipeline_kwargs(model_id: str) -> dict:
     pipeline lives on the GPU (~12-15GB) -- bnb weights can't be cpu-offloaded,
     and unquantized they don't fit either RAM or VRAM. Override with
     SA_FLOW_QUANT=off|nf4.
+
+    ``encode_only`` mining skips the transformer entirely, so it must not be
+    named in ``components_to_quantize`` (quantizing an unloaded component).
     """
     import os
     import torch
@@ -744,6 +962,7 @@ def _flow_pipeline_kwargs(model_id: str) -> dict:
     if mode == "off" or (mode == "auto" and not big):
         return {"torch_dtype": torch.bfloat16, "_offload": True}
     from diffusers.quantizers import PipelineQuantizationConfig
+    components = ["text_encoder"] if encode_only else ["transformer", "text_encoder"]
     return {
         "torch_dtype": torch.bfloat16,
         "_offload": False,
@@ -752,7 +971,7 @@ def _flow_pipeline_kwargs(model_id: str) -> dict:
             quant_kwargs={"load_in_4bit": True,
                           "bnb_4bit_quant_type": "nf4",
                           "bnb_4bit_compute_dtype": torch.bfloat16},
-            components_to_quantize=["transformer", "text_encoder"],
+            components_to_quantize=components,
         ),
     }
 
@@ -779,14 +998,16 @@ class Flux2Model:
     @classmethod
     def load(cls, model_id: str = "black-forest-labs/FLUX.2-klein-4B",
              device: Optional[str] = None, dtype: str = "auto",
-             ckpt: Optional[str] = None) -> "Flux2Model":
+             ckpt: Optional[str] = None, encode_only: bool = False) -> "Flux2Model":
         import torch
         from diffusers import Flux2KleinPipeline
 
         device = _pick_device(device)
-        kw = _flow_pipeline_kwargs(model_id)
+        kw = _flow_pipeline_kwargs(model_id, encode_only=encode_only)
         offload = kw.pop("_offload")
-        pipe = Flux2KleinPipeline.from_pretrained(model_id, **kw)
+        pipe = _load_encode_only(
+            lambda skip: Flux2KleinPipeline.from_pretrained(model_id, **kw, **skip),
+            Flux2KleinPipeline, encode_only)
         if offload:
             try:
                 pipe.enable_model_cpu_offload()
@@ -798,13 +1019,10 @@ class Flux2Model:
         return cls(pipe=pipe, device=device, model_id=model_id)
 
     # ----------------------------------------------------------- encoding ---
-    def encode_prompts(self, prompts, batch_size: int = 8) -> np.ndarray:
+    def encode_prompts(self, prompts, batch_size: int = 8, on_batch=None) -> np.ndarray:
         import torch
 
-        prompts = list(prompts)
-        out = []
-        for i in range(0, len(prompts), batch_size):
-            chunk = prompts[i:i + batch_size]
+        def one(chunk):
             with torch.no_grad():
                 pe = self.pipe.encode_prompt(
                     prompt=chunk, device=self.device,
@@ -812,8 +1030,9 @@ class Flux2Model:
                     max_sequence_length=self.MAX_SEQ)
             if isinstance(pe, (tuple, list)):
                 pe = pe[0]
-            out.append(pe.detach().to(torch.float32).cpu().numpy())
-        return np.concatenate(out, axis=0)
+            return pe.detach().to(torch.float32).cpu().numpy()
+
+        return np.concatenate(_encode_batches(prompts, batch_size, one, on_batch), axis=0)
 
     # ----------------------------------------------------------- decoding ---
     def generate_from_embeddings(self, embeddings, negative_embedding=None,
@@ -822,7 +1041,8 @@ class Flux2Model:
                                  height: int = 1024, width: int = 1024,
                                  seed: Optional[int] = None,
                                  init_images=None, init_strength: float = 0.7,
-                                 ip_images=None, ip_scale: float = 0.7) -> list:
+                                 ip_images=None, ip_scale: float = 0.7,
+                                 on_image=None) -> list:
         import torch
 
         embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -842,7 +1062,7 @@ class Flux2Model:
             if init_images:
                 # klein's native image conditioning (kontext-style reference)
                 kwargs["image"] = [init_images[i % len(init_images)].convert("RGB")]
-            images.append(self.pipe(**kwargs).images[0])
+            _stream(images, i, self.pipe(**kwargs).images[0], on_image)
         return images
 
 
@@ -869,14 +1089,16 @@ class Krea2Model:
     @classmethod
     def load(cls, model_id: str = "krea/Krea-2-Raw",
              device: Optional[str] = None, dtype: str = "auto",
-             ckpt: Optional[str] = None) -> "Krea2Model":
+             ckpt: Optional[str] = None, encode_only: bool = False) -> "Krea2Model":
         import torch
         from diffusers import Krea2Pipeline
 
         device = _pick_device(device)
-        kw = _flow_pipeline_kwargs(model_id)
+        kw = _flow_pipeline_kwargs(model_id, encode_only=encode_only)
         offload = kw.pop("_offload")
-        pipe = Krea2Pipeline.from_pretrained(model_id, **kw)
+        pipe = _load_encode_only(
+            lambda skip: Krea2Pipeline.from_pretrained(model_id, **kw, **skip),
+            Krea2Pipeline, encode_only)
         if offload:
             try:
                 pipe.enable_model_cpu_offload()
@@ -888,21 +1110,19 @@ class Krea2Model:
         return cls(pipe=pipe, device=device, model_id=model_id)
 
     # ----------------------------------------------------------- encoding ---
-    def encode_prompts(self, prompts, batch_size: int = 8) -> np.ndarray:
+    def encode_prompts(self, prompts, batch_size: int = 8, on_batch=None) -> np.ndarray:
         import torch
 
-        prompts = list(prompts)
-        out = []
-        for i in range(0, len(prompts), batch_size):
-            chunk = prompts[i:i + batch_size]
+        def one(chunk):
             with torch.no_grad():
                 enc = self.pipe.encode_prompt(
                     prompt=chunk, device=self.device,
                     num_images_per_prompt=1, prompt_embeds=None,
                     prompt_embeds_mask=None, max_sequence_length=self.MAX_SEQ)
             pe = enc[0] if isinstance(enc, (tuple, list)) else enc
-            out.append(pe.detach().to(torch.float16).cpu().numpy())
-        return np.concatenate(out, axis=0)
+            return pe.detach().to(torch.float16).cpu().numpy()
+
+        return np.concatenate(_encode_batches(prompts, batch_size, one, on_batch), axis=0)
 
     def _uncond_embeds(self):
         import torch
@@ -922,7 +1142,8 @@ class Krea2Model:
                                  height: int = 1024, width: int = 1024,
                                  seed: Optional[int] = None,
                                  init_images=None, init_strength: float = 0.7,
-                                 ip_images=None, ip_scale: float = 0.7) -> list:
+                                 ip_images=None, ip_scale: float = 0.7,
+                                 on_image=None) -> list:
         import torch
 
         embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -949,5 +1170,5 @@ class Krea2Model:
                 kwargs["negative_prompt_embeds"] = npe.to(self.device)
                 if nmask is not None:
                     kwargs["negative_prompt_embeds_mask"] = nmask.to(self.device)
-            images.append(self.pipe(**kwargs).images[0])
+            _stream(images, i, self.pipe(**kwargs).images[0], on_image)
         return images

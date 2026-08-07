@@ -66,3 +66,18 @@ webui/frontend/dist/
 # paths to weights on *this* machine, so they're per-user: pick your models once
 # in the UI rather than committing someone else's layout.
 webui/model_config.json
+
+# The dashboard's selected base distribution (sidebar "Select base
+# distribution"). Points at a corpus / .npz on *this* machine — per-user, like
+# the checkpoint picks above.
+webui/dist_config.json
+
+# A prompt corpus's fitted latents live beside the .txt (the .npz itself is
+# already ignored; this is its metadata sidecar).
+*__*.meta.json
+
+# Prompt corpora harvested off this machine's old SD experiment folders.
+# Personal material, gathered for reading, not code. prompts_filtered/ is the
+# SD-only, explicit-stripped, de-duplicated cut of prompt_files/.
+prompt_files/
+prompts_filtered/

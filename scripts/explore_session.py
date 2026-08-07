@@ -31,9 +31,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.cli_args import (
     add_backend_args, resolve_gen_defaults, load_backend, dist_prefix,
+    neg_dists_kwarg,
 )
 
 
@@ -234,15 +235,14 @@ def main(argv=None) -> int:
                         rng=np.random.default_rng(seed), **skw,
                     )
                     gkw = dict(guidance=combo["guidance"], steps=args.steps, seed=seed,
-                               height=args.height, width=args.width, neg_mode=args.neg_mode)
-                    if args.backend == "sdxl":
-                        gkw["dists"] = combo["named"]
+                               height=args.height, width=args.width, neg_mode=args.neg_mode,
+                               **neg_dists_kwarg(args, combo["named"]))
                     img = backend.generate(named_sample, **gkw)[0]
 
                     combo_dir = run_dir / combo["label"]
                     combo_dir.mkdir(parents=True, exist_ok=True)
-                    img_path = unique_path(combo_dir / f"img_seed{seed}.png")
-                    img.save(img_path)
+                    img_path = unique_image_path(combo_dir / f"img_seed{seed}{image_ext()}")
+                    save_image(img, img_path)
                     rel = img_path.relative_to(run_dir).as_posix()
                     records[combo["label"]].append((rel, seed))
                     total += 1

@@ -16,8 +16,8 @@ Every child gets its own ``.npz`` (so it is itself explorable) and a ``.json``
 recording parents, mode, radius and its RMS z-score DISTANCE from the corpus
 center -- the "how far off-grid" gauge.
 
-    python scripts/explore.py --mode neighborhood --src outputs/generated/anarchy_sdxl_X.png --radius 0.3
-    python scripts/explore.py --mode breed --src A.png --b B.png --mutate 0.15
+    python scripts/explore.py --mode neighborhood --src outputs/generated/anarchy_sdxl_X.jpg --radius 0.3
+    python scripts/explore.py --mode breed --src A.jpg --b B.jpg --mutate 0.15
 """
 
 from __future__ import annotations
@@ -31,9 +31,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.cli_args import (
-    add_backend_args, resolve_gen_defaults, load_backend, dist_prefix,
+    add_backend_args, add_experiment_args, record_experiment, resolve_gen_defaults,
+    load_backend, effective_negative, dist_prefix, neg_dists_kwarg,
 )
 
 
@@ -60,6 +61,7 @@ def _load_anchor(png: Path) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_backend_args(parser)
+    add_experiment_args(parser)
     parser.add_argument("--mode", default="neighborhood",
                         choices=["neighborhood", "breed", "walk"])
     parser.add_argument("--direction", default="outward",
@@ -96,6 +98,8 @@ def main(argv=None) -> int:
     if seed is None:
         seed = int(np.random.SeedSequence().entropy) % (2**31)
     rng = np.random.default_rng(seed)
+    experiment = record_experiment(args, seed=seed, n=args.n,
+                                   dist=dist_prefix(args, "outputs/dist"))
 
     print(f"[explore] mode={args.mode} backend={args.backend} src={args.src.name}"
           + (f" b={args.b.name}" if args.b else "")
@@ -128,20 +132,21 @@ def main(argv=None) -> int:
     print(f"[explore] decoding {args.n} children (guidance={args.guidance}, "
           f"steps={args.steps}) ...")
     gen_kw = dict(guidance=args.guidance, steps=args.steps, seed=seed,
-                  height=args.height, width=args.width, neg_mode=args.neg_mode)
-    if args.backend == "sdxl":
-        gen_kw["dists"] = dists
+                  height=args.height, width=args.width, neg_mode=args.neg_mode,
+                  **neg_dists_kwarg(args, dists))
     images = backend.generate(named, **gen_kw)
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     for i, img in enumerate(images):
-        path = unique_path(args.outdir / f"anarchy_{args.backend}_{seed}_{i:03d}.png")
-        img.save(path)
+        path = unique_image_path(
+            args.outdir / f"anarchy_{args.backend}_{seed}_{i:03d}{image_ext()}")
+        save_image(img, path)
         one = {k: np.asarray(v)[i] for k, v in named.items()}
         np.savez(path.with_suffix(".npz"), **one)
         d = backend.distance(dists, one)
         meta = {
-            "kind": "explore", "mode": args.mode, "backend": args.backend,
+            "kind": "explore", "experiment": experiment,
+            "mode": args.mode, "backend": args.backend,
             "model": args.ckpt or args.model or "(default)",
             "parent": args.src.name,
             "parent_b": (args.b.name if args.b else None),
@@ -152,6 +157,7 @@ def main(argv=None) -> int:
             "walk_frame": (i + 1 if args.mode == "walk" else None),
             "steps": args.steps, "guidance": args.guidance,
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,
+            "negative": effective_negative(backend, args.neg_mode),
             "batch_seed": seed, "image_seed": seed + i, "index": i,
             "distance": round(d, 3), "anchor_distance": round(anchor_dist, 3),
         }

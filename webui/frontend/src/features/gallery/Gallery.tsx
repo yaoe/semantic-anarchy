@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { useImages } from '../../api/queries'
 import type { GalleryKey, ImageItem, TabKey } from '../../api/types'
+import { FitPage } from '../fit/FitPage'
 import { FilmList } from '../timeline/FilmList'
 import { Timeline } from '../timeline/Timeline'
 import { useUI, type SortKey } from '../../store'
@@ -40,7 +41,7 @@ function sortItems(list: ImageItem[], sortBy: SortKey): ImageItem[] {
 }
 
 /** Tabs that render their own thing instead of the virtualized image grid. */
-const CUSTOM_TABS: TabKey[] = ['films', 'timeline']
+const CUSTOM_TABS: TabKey[] = ['films', 'timeline', 'fit']
 const isGrid = (t: TabKey): t is GalleryKey => !CUSTOM_TABS.includes(t)
 
 /**
@@ -97,6 +98,8 @@ export function Gallery({ busy }: { busy: boolean }) {
         <Timeline />
       ) : tab === 'films' ? (
         <FilmList />
+      ) : tab === 'fit' ? (
+        <FitPage />
       ) : isLoading ? (
         <div className="p-8 text-center text-dim">loading gallery…</div>
       ) : !view.length ? (

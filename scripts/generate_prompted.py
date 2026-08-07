@@ -8,7 +8,7 @@ backend, so the discovery and the best language can do hang side by side.
 The visual gap between them is the point.
 
     python scripts/generate_prompted.py --backend sdxl --prompt "..." \
-        --parent anarchy_sdxl_123_000.png --seed 123
+        --parent anarchy_sdxl_123_000.jpg --seed 123
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.cli_args import (
     add_backend_args, resolve_gen_defaults, load_backend,
 )
@@ -73,8 +73,8 @@ def main(argv=None) -> int:
     args.outdir.mkdir(parents=True, exist_ok=True)
     stem = (Path(args.parent).stem if args.parent
             else f"anarchy_{args.backend}_{seed}")
-    dest = unique_path(args.outdir / f"{stem}_{args.prompt_kind}.png")
-    img.save(dest)
+    dest = unique_image_path(args.outdir / f"{stem}_{args.prompt_kind}{image_ext()}")
+    save_image(img, dest)
     dest.with_suffix(".json").write_text(json.dumps({
         "kind": "from_prompt", "backend": args.backend,
         "model": args.ckpt or args.model or "(default)",

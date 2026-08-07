@@ -12,8 +12,10 @@ const PARAM_ORDER = [
   'kind', 'mode', 'parent', 'parent_b', 'distance', 'anchor_distance', 'radius',
   'mutate', 'direction', 'step', 'walk_frame', 'target_distance', 'elites',
   'base_blend', 'dist', 'backend', 'model', 'sampler', 'temperature', 'coherence',
-  'components', 'comp_lo', 'equalize', 'truncation', 'steps', 'guidance',
-  'scheduler', 'neg_mode', 'height', 'width', 'init_image', 'init_mode',
+  'components', 'comp_lo', 'equalize', 'truncation',
+  'rho', 'length_mode', 'length', 'empirical_head', 'temp_on', 'temp_off',
+  'radius_band', 'radius_scale', 'steps', 'guidance',
+  'scheduler', 'neg_mode', 'negative', 'height', 'width', 'init_image', 'init_mode',
   'init_strength', 'ip_scale', 'batch_seed', 'image_seed', 'index', 'refined_from',
   'cond_from', 'engine', 'factor', 'denoise', 'denoise_steps', 'interp',
   'scale', 'strength', 'cond_reused', 'src_size', 'out_size', 'seed',
@@ -30,6 +32,12 @@ function buildCli(m: ImageMeta): string {
       `--steps ${m.steps} --guidance ${m.guidance}`
     if (m.scheduler && m.scheduler !== 'default') s += ` --scheduler ${m.scheduler}`
     if (m.coherence != null) s += ` --coherence ${m.coherence}`
+    if (m.rho) s += ` --rho ${m.rho}`
+    // `length` is per image, so a corpus-mode batch reproduces as a pin.
+    if (m.length_mode) s += ` --length-mode fixed --length ${m.length}`
+    if (m.empirical_head) s += ` --empirical-head ${m.empirical_head}`
+    if (m.sampler === 'split') s += ` --temp-on ${m.temp_on} --temp-off ${m.temp_off}`
+    if (m.radius_band != null) s += ` --target-distance ${m.radius_band}`
     return s
   }
   if (m.kind === 'refine' && m.engine === 'hires')

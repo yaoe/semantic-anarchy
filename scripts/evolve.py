@@ -28,10 +28,11 @@ from semantic_anarchy import (
     get_scorer,
 )
 from semantic_anarchy.evolve import make_image_scorer
+from semantic_anarchy.io_utils import image_ext, save_image
 
 
 def _contact_sheet(images, out_path: Path, cols: int = 4):
-    """Tile PIL images into a single contact-sheet PNG."""
+    """Tile PIL images into a single contact sheet."""
     from PIL import Image
 
     if not images:
@@ -42,7 +43,7 @@ def _contact_sheet(images, out_path: Path, cols: int = 4):
     for i, img in enumerate(images):
         sheet.paste(img, ((i % cols) * w, (i // cols) * h))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(out_path)
+    save_image(sheet, out_path)
     return out_path
 
 
@@ -107,7 +108,7 @@ def main(argv=None) -> int:
     if not args.no_sd:
         final = evolved.sample(args.pop_size, rng=rng)
         images = sd.generate_from_embeddings(final, num_inference_steps=args.steps)
-        sheet = _contact_sheet(images, args.outdir / "branch_contact_sheet.png")
+        sheet = _contact_sheet(images, args.outdir / f"branch_contact_sheet{image_ext()}")
         print(f"[evolve] contact sheet -> {sheet}")
     return 0
 

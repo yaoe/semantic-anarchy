@@ -84,16 +84,36 @@ class Backend:
 
     name: str = "base"
     tensor_names: tuple[str, ...] = ()
+    #: Whether this backend's conditioning has a CLIP-style ``(77, hidden)``
+    #: token axis whose EOS position is meaningful -- i.e. whether
+    #: :meth:`token_lengths` can supply the length-conditional fit. False for the
+    #: flow models, whose Qwen conditioning is mined at a fixed length.
+    length_conditional: bool = False
 
     # ---- distribution math (torch-free) ------------------------------------
     def fit(self, named, per_token: bool = True,
-            n_components: Optional[int] = None) -> dict:
-        """Fit one :class:`EmbeddingDistribution` per named tensor."""
+            n_components: Optional[int] = None,
+            lengths: Optional[np.ndarray] = None) -> dict:
+        """Fit one :class:`EmbeddingDistribution` per named tensor.
+
+        ``lengths`` (per-prompt EOS position, from :meth:`token_lengths`) adds the
+        content/padding split to every tensor that has a token axis; tensors that
+        don't (sdxl's ``pooled``) ignore it.
+        """
         return {
             k: EmbeddingDistribution.fit(np.asarray(v), per_token=per_token,
-                                         n_components=n_components)
+                                         n_components=n_components,
+                                         lengths=lengths)
             for k, v in named.items()
         }
+
+    def token_lengths(self, prompts) -> Optional[np.ndarray]:  # pragma: no cover
+        """``(N,)`` content length (EOS position) per prompt, or None.
+
+        Cheap -- it only runs the tokenizer, never the encoder -- so mining calls
+        it beside ``encode`` to hand the fit its length dimension.
+        """
+        return None
 
     def sample(self, dists, n: int = 1, **kw) -> dict:
         """Sample every named tensor with the SAME sampler/temperature/etc.
@@ -166,9 +186,44 @@ class Backend:
                     out[k][i] = dists[k].mean + (out[k][i] - dists[k].mean) * f
         return {k: v.astype(np.float32) for k, v in out.items()}
 
-    def retarget(self, dists, named, target: float) -> dict:
-        """Pin every sampled tensor's distance gauge to ``target`` (shell sampling)."""
+    def retarget(self, dists, named, target) -> dict:
+        """Pin every sampled tensor's distance gauge to ``target`` (shell sampling).
+
+        ``target`` is a scalar (one shell for the batch) or a per-sample array (a
+        radius *band*, e.g. from :meth:`sample_radii`). Pinning every tensor to
+        the same number also pins their mean, which is what :meth:`distance`
+        reports.
+        """
         return {k: dists[k].retarget(v, target) for k, v in named.items()}
+
+    def sample_radii(self, dists, n: int, rng=None, scale: float = 1.0):
+        """``(n,)`` target distances drawn from the corpus's own radius band.
+
+        Averaged across tensors, because :meth:`distance` is a mean across
+        tensors and the per-tensor bands are index-aligned (one fit, one corpus,
+        one prompt order). Returns None if the fit predates the band.
+        """
+        cols = [d.corpus_distance for d in dists.values()
+                if d.corpus_distance is not None]
+        if not cols or len({len(c) for c in cols}) != 1:
+            return None
+        band = np.mean(np.stack([np.asarray(c, dtype=np.float64) for c in cols]),
+                       axis=0)
+        rng = rng or np.random.default_rng()
+        return band[rng.integers(0, len(band), size=n)] * float(scale)
+
+    def draw_lengths(self, dists, n: int, rng=None, mode: str = "corpus",
+                     length: Optional[int] = None):
+        """``(n,)`` content lengths for a batch, from the first tensor that has them.
+
+        One draw shared by every tensor, so a multi-tensor conditioning set stays
+        coherent (sdxl's ``pooled`` has no token axis and ignores it anyway).
+        """
+        for name in self.tensor_names:
+            d = dists.get(name)
+            if d is not None and (d.has_length_stats or mode == "fixed"):
+                return d.draw_lengths(n, rng=rng, mode=mode, length=length)
+        return None
 
     def distance(self, dists, named_one) -> float:
         """Mean RMS z-score distance of one per-tensor sample from the corpus center."""
@@ -213,10 +268,18 @@ class Backend:
         }
 
     # ---- model-touching verbs (subclasses implement) -----------------------
-    def encode(self, prompts) -> dict:                       # pragma: no cover
+    def encode(self, prompts, batch_size: int = 8,           # pragma: no cover
+               on_batch=None) -> dict:
+        """Encode a corpus in batches. ``on_batch(done)`` gets the running
+        prompt count so a caller can draw a progress bar."""
         raise NotImplementedError
 
     def generate(self, named, **kw) -> list:                 # pragma: no cover
+        """Render one image per sampled conditioning tensor.
+
+        Images come back as a list, but the batch is rendered strictly one at a
+        time -- pass ``on_image(i, image)`` to receive each one the moment it
+        exists instead of waiting for the last."""
         raise NotImplementedError
 
 
@@ -225,31 +288,70 @@ class SD15Backend(Backend):
 
     name = "sd15"
     tensor_names = ("embeds",)
+    length_conditional = True
 
     def __init__(self, model):
         self.model = model
 
+    def token_lengths(self, prompts) -> Optional[np.ndarray]:
+        """EOS position per prompt, straight off the pipeline's own tokenizer.
+
+        Same call ``analysis.encode_corpus`` makes, so the length dimension the
+        fit conditions on is the one the distribution report measured. A prompt
+        long enough to be truncated has no EOS in its ids at all -- it is content
+        all the way to 77, which is what the fallback records.
+        """
+        tok = getattr(getattr(self, "model", None), "pipe", None)
+        tok = getattr(tok, "tokenizer", None)
+        if tok is None:
+            return None
+        seq = int(tok.model_max_length)
+        ids = np.asarray(tok(list(prompts), padding="max_length", max_length=seq,
+                             truncation=True).input_ids, dtype=np.int32)
+        hit = ids == tok.eos_token_id
+        return np.where(hit.any(axis=1), np.argmax(hit, axis=1), seq).astype(np.int32)
+
     @classmethod
-    def load(cls, model_id=None, ckpt=None, device=None):
-        from .pipeline import SDModel
+    def load(cls, model_id=None, ckpt=None, device=None, encode_only=False):
+        from .pipeline import SDModel, default_sd15_negative
         model = SDModel.load(
             model_id=model_id or "runwayml/stable-diffusion-v1-5",
-            device=device, ckpt=ckpt)
+            device=device, ckpt=ckpt, encode_only=encode_only)
+        model.negative_prompt = default_sd15_negative()
         return cls(model)
 
-    def encode(self, prompts) -> dict:
-        return {"embeds": self.model.encode_prompts(prompts)}
+    def encode(self, prompts, batch_size: int = 8, on_batch=None) -> dict:
+        return {"embeds": self.model.encode_prompts(
+            prompts, batch_size=batch_size, on_batch=on_batch)}
 
-    def generate(self, named, guidance=7.5, steps=30, seed=None,
-                 height=512, width=512, neg_mode="empty",
+    def generate(self, named, dists=None, guidance=7.5, steps=30, seed=None,
+                 height=512, width=512, neg_mode="text",
                  init_images=None, init_strength=0.7,
-                 ip_images=None, ip_scale=0.7) -> list:
-        # SD1.5 CFG negative is the empty-prompt encoding (SDModel handles it).
+                 ip_images=None, ip_scale=0.7, on_image=None) -> list:
         return self.model.generate_from_embeddings(
-            named["embeds"], num_inference_steps=steps, guidance_scale=guidance,
+            named["embeds"], negative_embedding=self._negative(named, dists, neg_mode),
+            num_inference_steps=steps, guidance_scale=guidance,
             height=height, width=width, seed=seed,
             init_images=init_images, init_strength=init_strength,
-            ip_images=ip_images, ip_scale=ip_scale)
+            ip_images=ip_images, ip_scale=ip_scale, on_image=on_image)
+
+    def _negative(self, named, dists, neg_mode):
+        """The CFG negative embedding, or None to let the model pick its default.
+
+        text  -> the model's own ``negative_prompt`` (sd15: the house negative,
+                 :data:`~.pipeline.SD15_NEGATIVE_PROMPT`; sd2: none set, so this
+                 is the empty prompt). The default.
+        empty -> the empty-prompt encoding, whatever ``negative_prompt`` says.
+        mean  -> the corpus mean, if a fitted distribution was handed in.
+        zeros -> a zero tensor of the right shape.
+        """
+        if neg_mode == "empty":
+            return self.model.uncond_embedding()
+        if neg_mode == "zeros":
+            return np.zeros((1,) + named["embeds"].shape[1:], dtype=np.float32)
+        if neg_mode == "mean" and dists is not None:
+            return dists["embeds"].mean[None]
+        return None  # "text" -- SDModel.negative_embedding()
 
 
 class SD2Backend(SD15Backend):
@@ -264,7 +366,7 @@ class SD2Backend(SD15Backend):
     name = "sd2"
 
     @classmethod
-    def load(cls, model_id=None, ckpt=None, device=None):
+    def load(cls, model_id=None, ckpt=None, device=None, encode_only=False):
         import os
         from .pipeline import SDModel
         # SD2's canonical config repo is gated; when loading a single-file ckpt
@@ -273,7 +375,8 @@ class SD2Backend(SD15Backend):
                      if ckpt else None)
         model = SDModel.load(
             model_id=model_id or "stabilityai/stable-diffusion-2-1",
-            device=device, ckpt=ckpt, single_file_config=sf_config)
+            device=device, ckpt=ckpt, single_file_config=sf_config,
+            encode_only=encode_only)
         return cls(model)
 
 
@@ -282,31 +385,39 @@ class SDXLBackend(Backend):
 
     name = "sdxl"
     tensor_names = ("prompt_embeds", "pooled")
+    #: ``prompt_embeds`` keeps CLIP's 77-token layout, so the EOS split applies
+    #: there; ``pooled`` has no token axis and the fit skips it automatically.
+    length_conditional = True
 
     def __init__(self, model):
         self.model = model
 
+    # SDXL runs two tokenizers, but both are CLIP-family and pad the same 77-slot
+    # window, so the first one's EOS position is the length either encoder saw.
+    token_lengths = SD15Backend.token_lengths
+
     @classmethod
-    def load(cls, model_id=None, ckpt=None, device=None):
+    def load(cls, model_id=None, ckpt=None, device=None, encode_only=False):
         from .pipeline import SDXLModel
         model = SDXLModel.load(
             model_id=model_id or "stabilityai/sdxl-turbo",
-            device=device, ckpt=ckpt)
+            device=device, ckpt=ckpt, encode_only=encode_only)
         return cls(model)
 
-    def encode(self, prompts) -> dict:
-        return self.model.encode_prompts(prompts)
+    def encode(self, prompts, batch_size: int = 8, on_batch=None) -> dict:
+        return self.model.encode_prompts(
+            prompts, batch_size=batch_size, on_batch=on_batch)
 
     def generate(self, named, dists=None, guidance=0.0, steps=1, seed=None,
                  height=1024, width=1024, neg_mode="mean",
                  init_images=None, init_strength=0.7,
-                 ip_images=None, ip_scale=0.7) -> list:
+                 ip_images=None, ip_scale=0.7, on_image=None) -> list:
         negatives = self._negatives(named, dists, neg_mode) if guidance > 1.0 else None
         return self.model.generate_from_embeddings(
             named, negatives=negatives, num_inference_steps=steps,
             guidance_scale=guidance, height=height, width=width, seed=seed,
             init_images=init_images, init_strength=init_strength,
-            ip_images=ip_images, ip_scale=ip_scale)
+            ip_images=ip_images, ip_scale=ip_scale, on_image=on_image)
 
     def _negatives(self, named, dists, neg_mode) -> dict:
         """Build the CFG negative for both tensors.
@@ -330,62 +441,74 @@ class Flux2Backend(SD15Backend):
     tensor fit/sample/save plumbing from sd15."""
 
     name = "flux2"
+    # Qwen3 hidden states mined at a fixed 128-token length: there is no
+    # CLIP-style EOS boundary for the length split to key on.
+    length_conditional = False
 
     @classmethod
-    def load(cls, model_id=None, ckpt=None, device=None):
+    def load(cls, model_id=None, ckpt=None, device=None, encode_only=False):
         import os
         from .pipeline import Flux2Model
         model = Flux2Model.load(
             model_id=model_id or os.environ.get(
                 "SA_FLUX2_MODEL", "black-forest-labs/FLUX.2-klein-4B"),
-            device=device)
+            device=device, encode_only=encode_only)
         return cls(model)
 
     def generate(self, named, guidance=4.0, steps=28, seed=None,
                  height=1024, width=1024, neg_mode="empty",
                  init_images=None, init_strength=0.7,
-                 ip_images=None, ip_scale=0.7) -> list:
+                 ip_images=None, ip_scale=0.7, on_image=None) -> list:
         return self.model.generate_from_embeddings(
             named["embeds"], num_inference_steps=steps, guidance_scale=guidance,
             height=height, width=width, seed=seed,
-            init_images=init_images, init_strength=init_strength)
+            init_images=init_images, init_strength=init_strength,
+            on_image=on_image)
 
 
 class Krea2Backend(SD15Backend):
     """Krea 2: one conditioning tensor of Qwen3-VL multi-layer hidden states."""
 
     name = "krea2"
+    length_conditional = False   # see Flux2Backend
 
     @classmethod
-    def load(cls, model_id=None, ckpt=None, device=None):
+    def load(cls, model_id=None, ckpt=None, device=None, encode_only=False):
         import os
         from .pipeline import Krea2Model
         model = Krea2Model.load(
             model_id=model_id or os.environ.get("SA_KREA2_MODEL", "krea/Krea-2-Raw"),
-            device=device)
+            device=device, encode_only=encode_only)
         return cls(model)
 
     def generate(self, named, guidance=4.5, steps=28, seed=None,
                  height=1024, width=1024, neg_mode="empty",
                  init_images=None, init_strength=0.7,
-                 ip_images=None, ip_scale=0.7) -> list:
+                 ip_images=None, ip_scale=0.7, on_image=None) -> list:
         return self.model.generate_from_embeddings(
             named["embeds"], num_inference_steps=steps, guidance_scale=guidance,
-            height=height, width=width, seed=seed)
+            height=height, width=width, seed=seed, on_image=on_image)
 
 
-def make_backend(name: str, model_id=None, ckpt=None, device=None) -> Backend:
-    """Load the backend named ``sd15`` or ``sdxl`` (touches torch/diffusers)."""
+def make_backend(name: str, model_id=None, ckpt=None, device=None,
+                 encode_only: bool = False) -> Backend:
+    """Load a backend by name (touches torch/diffusers).
+
+    ``encode_only`` skips the UNet/VAE — mining only ever runs the text encoder,
+    so loading the denoiser costs seconds and gigabytes for nothing.
+    """
+    kw = {"model_id": model_id, "ckpt": ckpt, "device": device,
+          "encode_only": encode_only}
     if name == "sd15":
-        return SD15Backend.load(model_id=model_id, ckpt=ckpt, device=device)
+        return SD15Backend.load(**kw)
     if name == "sd2":
-        return SD2Backend.load(model_id=model_id, ckpt=ckpt, device=device)
+        return SD2Backend.load(**kw)
     if name == "sdxl":
-        return SDXLBackend.load(model_id=model_id, ckpt=ckpt, device=device)
+        return SDXLBackend.load(**kw)
     if name == "flux2":
-        return Flux2Backend.load(model_id=model_id, ckpt=ckpt, device=device)
+        return Flux2Backend.load(**kw)
     if name == "krea2":
-        return Krea2Backend.load(model_id=model_id, ckpt=ckpt, device=device)
+        return Krea2Backend.load(**kw)
     raise ValueError(f"unknown backend {name!r}; choose sd15 | sd2 | sdxl | flux2 | krea2")
 
 

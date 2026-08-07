@@ -20,11 +20,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.aesthetic import get_scorer
+from semantic_anarchy.io_utils import IMAGE_EXTS
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--glob", default="outputs/generated/anarchy_*.png")
+    ap.add_argument("--glob", default=None,
+                    help="paths to score (default: every gallery image)")
     ap.add_argument("--out", type=Path, default=Path("outputs/scores.json"))
     ap.add_argument("--rescore", action="store_true")
     ap.add_argument("--batch", type=int, default=16)
@@ -39,7 +41,9 @@ def main(argv=None) -> int:
         except Exception:
             scores = {}
 
-    paths = sorted(glob.glob(args.glob))
+    paths = (sorted(glob.glob(args.glob)) if args.glob else
+             sorted(q for e in IMAGE_EXTS
+                    for q in glob.glob(f"outputs/generated/anarchy_*{e}")))
     todo = [p for p in paths if Path(p).relative_to("outputs").as_posix() not in scores]
     print(f"[score] {len(paths)} images, {len(todo)} to score", flush=True)
     if not todo:

@@ -5,13 +5,15 @@ import type { TabKey } from './api/types'
 import { Gallery } from './features/gallery/Gallery'
 import { Filters } from './features/gallery/Filters'
 import { JobList } from './features/jobs/JobList'
+import { DistPicker } from './features/distribution/DistPicker'
 import { ModelPicker } from './features/model/ModelPicker'
 import { JobLog } from './features/jobs/JobLog'
+import { LabelLink } from './features/labeling/LabelLink'
 import { StatusDot } from './features/jobs/StatusDot'
 import { ExploreBar } from './features/refine/ExploreBar'
 import { RefineBar } from './features/refine/RefineBar'
 import { AnalyzeBar } from './features/taste/AnalyzeBar'
-import { EvolveBar } from './features/taste/EvolveBar'
+import { FitLink } from './features/fit/FitLink'
 import { ScoreBar } from './features/taste/ScoreBar'
 import { WipeDialog } from './features/taste/WipeDialog'
 import { ParamPanel } from './params/ParamPanel'
@@ -103,7 +105,16 @@ export default function App() {
               auto, so any stray wide child would add a sideways scrollbar. The
               sidebar scrolls vertically only; its content wraps to fit. */}
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-clip p-4 pt-1">
-            <ParamPanel after={{ model: <ModelPicker /> }} />
+            <ParamPanel
+              after={{
+                model: (
+                  <>
+                    <ModelPicker />
+                    <DistPicker />
+                  </>
+                ),
+              }}
+            />
             <h2 className="sa-h2">Jobs</h2>
             <JobList jobs={jobs} />
           </div>
@@ -115,7 +126,8 @@ export default function App() {
           <Filters
             actions={
               <>
-                <EvolveBar />
+                <LabelLink />
+                <FitLink />
                 <AnalyzeBar />
                 <ScoreBar />
                 <WipeDialog />

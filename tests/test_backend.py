@@ -106,3 +106,153 @@ def test_sd15_single_tensor_save_layout(tmp_path):
     assert written == [tmp_path / "dist.npz"]
     loaded = b.load_dists(prefix)
     np.testing.assert_allclose(loaded["embeds"].mean, dists["embeds"].mean)
+
+
+# --------------------------------------------------------- CFG negative ---
+
+def test_sd15_neg_mode_dispatch():
+    """``_negative`` maps neg_mode to an embedding without touching torch.
+
+    ``None`` means "let SDModel use its own negative_prompt" -- that's the
+    ``text`` default, the one path that needs a loaded text encoder.
+    """
+    b = dist_backend("sd15")
+    named = _sd15_named(4)
+    dists = b.fit(named, per_token=True, n_components=4)
+
+    assert b._negative(named, dists, "text") is None
+    zeros = b._negative(named, dists, "zeros")
+    assert zeros.shape == (1, 77, 768) and not zeros.any()
+    mean = b._negative(named, dists, "mean")
+    np.testing.assert_allclose(mean[0], dists["embeds"].mean.reshape(77, 768))
+    # mean with no fitted distribution degrades to the default, never crashes
+    assert b._negative(named, None, "mean") is None
+
+
+def test_default_sd15_negative_env(monkeypatch):
+    from semantic_anarchy.pipeline import SD15_NEGATIVE_PROMPT, default_sd15_negative
+
+    monkeypatch.delenv("SA_SD15_NEGATIVE", raising=False)
+    assert default_sd15_negative() == SD15_NEGATIVE_PROMPT
+    monkeypatch.setenv("SA_SD15_NEGATIVE", "blurry, jpeg artifacts")
+    assert default_sd15_negative() == "blurry, jpeg artifacts"
+    # explicitly empty = no negative text, back to the empty-prompt encoding
+    monkeypatch.setenv("SA_SD15_NEGATIVE", "  ")
+    assert default_sd15_negative() is None
+
+
+def test_sd15_neg_mode_default_is_text():
+    """resolve_gen_defaults picks the house negative for sd15, mean for sdxl."""
+    import argparse
+
+    from semantic_anarchy.cli_args import resolve_gen_defaults
+
+    def resolved(backend):
+        a = argparse.Namespace(backend=backend, steps=None, guidance=None,
+                               neg_mode=None, height=None, width=None)
+        resolve_gen_defaults(a)
+        return a.neg_mode
+
+    assert resolved("sd15") == "text"
+    assert resolved("sdxl") == "mean"
+    assert resolved("sd2") == "empty"
+
+
+def test_effective_negative_only_for_text_mode():
+    """The sidecar records the words, not just the mode -- and only when used."""
+    from types import SimpleNamespace
+
+    from semantic_anarchy.cli_args import effective_negative
+
+    sd15 = SimpleNamespace(model=SimpleNamespace(negative_prompt="ugly, blurry"))
+    sdxl = SimpleNamespace(model=SimpleNamespace())        # tensor negative, no text
+
+    assert effective_negative(sd15, "text") == "ugly, blurry"
+    for mode in ("empty", "mean", "zeros"):
+        assert effective_negative(sd15, mode) is None
+    assert effective_negative(sdxl, "text") is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase-1 knobs at the backend seam: one length draw, one radius band and one
+# knob dict shared by every named tensor, so a multi-tensor conditioning set
+# stays coherent.
+# --------------------------------------------------------------------------- #
+def _lengths(n=30, seq=77, seed=0):
+    return np.random.default_rng(seed).integers(3, seq, size=n).astype(np.int32)
+
+
+def test_fit_adds_the_length_split_only_where_there_is_a_token_axis():
+    be = dist_backend("sdxl")
+    named = _sdxl_named(n=60)
+    dists = be.fit(named, n_components=8, lengths=_lengths(60))
+    assert dists["prompt_embeds"].has_length_stats     # (77, 2048)
+    assert not dists["pooled"].has_length_stats        # (1280,) -- no token axis
+
+
+def test_one_length_draw_is_shared_by_every_tensor():
+    be = dist_backend("sdxl")
+    dists = be.fit(_sdxl_named(n=60), n_components=8, lengths=_lengths(60))
+    rng = np.random.default_rng(1)
+    lens = be.draw_lengths(dists, 4, rng=rng, mode="fixed", length=20)
+    assert lens.tolist() == [20, 20, 20, 20]
+    named = be.sample(dists, n=4, rng=np.random.default_rng(2), lengths=lens)
+    # pooled has no token axis and simply ignores the knob rather than erroring.
+    assert named["prompt_embeds"].shape == (4, 77, 2048)
+    assert named["pooled"].shape == (4, 1280)
+
+
+def test_draw_lengths_returns_none_without_a_length_fit():
+    be = dist_backend("sd15")
+    dists = be.fit(_sd15_named(n=20), n_components=4)   # no lengths
+    assert be.draw_lengths(dists, 4, mode="corpus") is None
+
+
+def test_sample_radii_averages_the_per_tensor_bands():
+    be = dist_backend("sdxl")
+    dists = be.fit(_sdxl_named(n=40), n_components=8)
+    radii = be.sample_radii(dists, 6, rng=np.random.default_rng(3))
+    assert radii.shape == (6,) and (radii > 0).all()
+    # And retarget accepts that per-sample band, pinning the reported gauge.
+    named = be.sample(dists, n=6, rng=np.random.default_rng(4))
+    pinned = be.retarget(dists, named, radii)
+    got = [be.distance(dists, {k: v[i] for k, v in pinned.items()})
+           for i in range(6)]
+    assert np.allclose(got, radii, rtol=1e-3)
+
+
+def test_length_conditional_flag_matches_the_conditioning_layout():
+    for name in ("sd15", "sd2", "sdxl"):
+        assert dist_backend(name).length_conditional
+    for name in ("flux2", "krea2"):
+        assert not dist_backend(name).length_conditional
+
+
+def test_sampler_kwargs_covers_every_sample_knob():
+    """cli_args is the single source of CLI truth -- so it must stay in sync."""
+    import argparse
+    import inspect
+
+    from semantic_anarchy.cli_args import add_backend_args, sampler_kwargs
+
+    p = argparse.ArgumentParser()
+    add_backend_args(p)
+    args = p.parse_args([])
+    packed = sampler_kwargs(args)
+    accepted = set(inspect.signature(EmbeddingDistribution.sample).parameters)
+    assert set(packed).issubset(accepted)
+    # Every knob sample() takes (bar the plumbing) has a flag behind it.
+    assert accepted - set(packed) == {"self", "n", "temperature", "rng"}
+
+
+def test_neg_dists_kwarg_reaches_every_backend_with_a_tensor_negative():
+    """The `mean`/`zeros` neg-modes are a no-op without the fitted dists."""
+    import argparse
+
+    from semantic_anarchy.cli_args import neg_dists_kwarg
+
+    dists = {"embeds": object()}
+    for name in ("sd15", "sd2", "sdxl"):
+        assert neg_dists_kwarg(argparse.Namespace(backend=name), dists) == {"dists": dists}
+    for name in ("flux2", "krea2"):
+        assert neg_dists_kwarg(argparse.Namespace(backend=name), dists) == {}

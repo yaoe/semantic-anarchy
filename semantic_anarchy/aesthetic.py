@@ -26,6 +26,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from .clip_compat import image_features
+from .io_utils import image_ext, save_image
 
 # The LAION aesthetic predictor expects a 768-d CLIP ViT-L/14 image embedding.
 _CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
@@ -89,9 +90,9 @@ class HumanScorer(Scorer):
     def score(self, images: Sequence) -> np.ndarray:
         scores = []
         for i, img in enumerate(images):
-            path = self.display_dir / f"rate_{i:03d}.png"
+            path = self.display_dir / f"rate_{i:03d}{image_ext()}"
             try:
-                img.save(path)
+                save_image(img, path)
             except Exception:
                 path = None
             where = f" (saved {path})" if path else ""

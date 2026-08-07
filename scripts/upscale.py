@@ -17,7 +17,7 @@ reproduces the *original generation* at a higher resolution:
 Chains: upscaling an upscale walks ``refined_from`` back to the ancestor that
 still owns the conditioning, so 2x then 2x again keeps using the true latents.
 
-    python scripts/upscale.py --src outputs/generated/anarchy_sd15_7_000.png \
+    python scripts/upscale.py --src outputs/generated/anarchy_sd15_7_000.jpg \
         --factor 2.0 --denoise 0.3
 """
 
@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.cli_args import add_backend_args, load_backend
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_image_path
 from semantic_anarchy.upscale import (
     LATENT_MULTIPLE, clamp_denoise, conditioning_source, denoise_steps, target_size,
 )
@@ -146,8 +146,8 @@ def main(argv=None) -> int:
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     tag = f"hires{str(args.factor).replace('.', 'p')}"
-    out = unique_path(args.outdir / f"{src.stem}_{tag}.png")
-    out_img.save(out)
+    out = unique_image_path(args.outdir / f"{src.stem}_{tag}{image_ext()}")
+    save_image(out_img, out)
     out.with_suffix(".json").write_text(json.dumps({
         "kind": "refine", "engine": "hires", "backend": backend_name,
         "refined_from": src.name, "cond_from": origin.name,

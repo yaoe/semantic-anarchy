@@ -32,8 +32,9 @@ The deck's move (slide 9): **X out the text encoder. "There is no prompt."**
 2. **Sample & drift** — draw brand-new conditioning straight from the distribution
    and decode it. A `--temperature` knob and a `--sampler` choice control *where*
    you draw from (see below). The text encoder is never touched at generation time.
-3. **Select / evolve** — keep what scores well ("aesthetic resonance"), and evolve
-   the distribution into personalized branches.
+3. **Select & refit** — keep what scores well ("aesthetic resonance"), then fit a
+   *new* distribution to the conditioning of the images you kept
+   (`scripts/fit_selection.py`, no GPU needed) and sample that instead.
 
 ## One method, two models — `--backend {sd15, sdxl}`
 
@@ -65,10 +66,22 @@ out into the less-typical tails (chaos by design).
 | `pca` | draw within the low-rank corpus subspace (real axes of variation) | **`temperature > 1` extrapolates coherently OUTSIDE the corpus hull** |
 | `blend --coherence λ` | interpolate the diagonal & PCA covariances (`λ=1` pca, `λ=0` diagonal) | dial how far onto the manifold |
 | `hybrid` | SLERP-fuse two real corpus embeddings (concept fusion) | stays inside the hull |
+| `split --temp-on/--temp-off` | a diagonal draw cut into its PCA-subspace projection and the orthogonal remainder, each with its own temperature | the diagnostic: *which* half carries the good weirdness |
+
+Four further knobs come from measuring where that model disagrees with the real
+corpus — `--rho` (row coherence), `--length-mode`/`--length` (the past-EOS
+content/padding split), `--empirical-head` (leading PCA coefficients from the
+corpus's own CDF) and `--radius-band` (per-sample target radius). Each is off by
+default, so the samplers above are unchanged unless you ask.
+See [docs/reference/sampler-corrections.md](docs/reference/sampler-corrections.md).
 
 `--components` (top-N principal axes), `--truncation` (typical-set clip),
-`--neg-mode {mean,empty,zeros}` (SDXL CFG negative; `mean` pushes away from the
-average prompt toward the sample) round out the set.
+`--neg-mode {text,mean,empty,zeros}` (the CFG negative branch; defaults to
+`text` — the house SD1.5 negative prompt — on sd15 and `mean` — push away from
+the average prompt toward the sample — on sdxl) and `--negative "..."` (that
+negative prompt's actual words, also editable in the dashboard's Advanced
+panel) round out the set. See
+[docs/reference/negative-prompt.md](docs/reference/negative-prompt.md).
 
 ## Install
 
@@ -118,7 +131,7 @@ frame N pixel-identical to the keyframes and everything between brand new.
 
 ```bash
 python scripts/morph_film.py --name driftA --refine none \
-    --images generated/anarchy_sd15_A_000.png generated/anarchy_sd15_B_001.png \
+    --images generated/anarchy_sd15_A_000.jpg generated/anarchy_sd15_B_001.jpg \
     --frames-per 24 --fps 16 --interp slerp --easing smooth --loop
 # -> outputs/films/driftA/driftA.mp4 (+ base/ frames + film.json)
 ```
@@ -150,6 +163,7 @@ semantic_anarchy/
 scripts/
   mine_distribution.py · generate.py · temperature_sweep.py · sampler_sweep.py
   explore.py            local navigation around an existing image
+  fit_selection.py      refit a distribution on the latents of images you picked
   morph_film.py         latent travel through keyframes -> x264 mp4
   explore_session.py    unattended time-budgeted gallery
   demo_no_sd.py         the torch-free demo
