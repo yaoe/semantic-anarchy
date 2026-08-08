@@ -62,14 +62,15 @@ init_images/
 webui/frontend/node_modules/
 webui/frontend/dist/
 
-# The dashboard's hand-picked checkpoint paths (sidebar model picker). Absolute
-# paths to weights on *this* machine, so they're per-user: pick your models once
-# in the UI rather than committing someone else's layout.
-webui/model_config.json
+# Everything the dashboard remembers between restarts: the hand-picked
+# checkpoint per backend, the selected base distribution, and the whole UI store
+# (every sidebar value, the timeline, the fit selection). Absolute paths to
+# weights on *this* machine, so it's per-user: pick your models once in the UI
+# rather than committing someone else's layout.
+config.json
 
-# The dashboard's selected base distribution (sidebar "Select base
-# distribution"). Points at a corpus / .npz on *this* machine — per-user, like
-# the checkpoint picks above.
+# Superseded by config.json above; still read once, to migrate an old install.
+webui/model_config.json
 webui/dist_config.json
 
 # A prompt corpus's fitted latents live beside the .txt (the .npz itself is

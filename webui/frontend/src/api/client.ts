@@ -33,6 +33,7 @@ import type {
   ModelRow,
   NativePickResult,
   PickMode,
+  PrefsPayload,
   RefineRequest,
   RunRequest,
   RunResponse,
@@ -103,6 +104,12 @@ export const api = {
     return res.text()
   },
   logStreamUrl: (jobId: number) => `/api/log/${jobId}/stream`,
+
+  // ---- persisted UI defaults (config.json -> "ui"; see lib/prefs.ts) ----
+  prefs: () => req<PrefsPayload>('/api/prefs'),
+  /** `null` forgets the stored blob and falls back to the schema defaults. */
+  savePrefs: (ui: unknown | null) =>
+    post<{ ok: boolean; stored: boolean }>('/api/prefs', { ui }),
 
   // ---- model picker ----
   model: () => req<ModelConfig>('/api/model'),

@@ -331,7 +331,7 @@ export const PARAM_SCHEMA: ParamField[] = [
 
   /* ------------------------------------------------------------- sampler */
   // Which distribution to sample is NOT a form value — it's server-side state
-  // (webui/dist_config.json, per backend) driven by features/distribution/
+  // (config.json -> "dists", per backend) driven by features/distribution/
   // DistPicker, which App slots under the Model group right below the
   // checkpoint picker (the two pick a matched pair). Nothing here sends
   // `dist`, so /api/run falls through to that persisted choice.

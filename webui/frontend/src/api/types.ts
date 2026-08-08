@@ -72,7 +72,7 @@ export interface Config {
   sd2_ckpt: string
   sd2_ckpt_exists: boolean
   sdxl_models: Record<string, string>
-  /** backend -> hand-picked checkpoint path (webui/model_config.json). */
+  /** backend -> hand-picked checkpoint path (config.json -> "models"). */
   picked_models: Partial<Record<BackendId, string>>
   /** The house sd15 CFG negative prompt (or an SA_SD15_NEGATIVE override). */
   sd15_negative: string
@@ -84,6 +84,17 @@ export interface Config {
   seed_panel: { seed: number; n: number; seeds: number[] }
   /** Absolute path of the append-only labels dataset (git-tracked). */
   labels_file: string
+  /** Absolute path of the gitignored config.json this install persists into. */
+  config_file: string
+}
+
+/**
+ * `GET /api/prefs` — the persisted UI store (config.json -> "ui"), verbatim as
+ * zustand serialised it, or null when this install has never saved one.
+ */
+export interface PrefsPayload {
+  ui: Record<string, unknown> | null
+  config_file: string
 }
 
 /* ------------------------------------------------------------- labeling --- */

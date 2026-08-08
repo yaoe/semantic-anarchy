@@ -243,7 +243,7 @@ export function useFs(
   })
 }
 
-/** The distribution this backend samples from (webui/dist_config.json). */
+/** The distribution this backend samples from (config.json -> "dists"). */
 export function useDistConfig(backend: BackendId, model?: string | null) {
   return useQuery({
     queryKey: qk.dist(backend, model),

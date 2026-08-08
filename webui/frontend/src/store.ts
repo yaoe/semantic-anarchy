@@ -8,8 +8,9 @@
  * the typed /api/run payload happens once, in params/schema.ts.
  */
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist } from 'zustand/middleware'
 
+import { serverPrefsStorage } from './lib/prefs'
 import { DEFAULT_VALUES, aspectDims, type Values } from './params/schema'
 import type { TabKey } from './api/types'
 
@@ -321,6 +322,10 @@ export const useUI = create<UIState>()(
     {
       name: 'semantic-anarchy-ui',
       version: 5,
+      // Persisted SERVER-side (config.json -> "ui"), so the sidebar comes back
+      // the same on every device that opens this dashboard. Asynchronous, hence
+      // one render at the schema defaults before the stored blob lands.
+      storage: createJSONStorage(() => serverPrefsStorage),
       // v1 -> v2: the same-latent hires pass became the upscale default. Anyone
       // still carrying the old 'flux' default gets moved onto it; an explicit
       // 'sd' pick is left alone. (A plain version bump would drop the whole

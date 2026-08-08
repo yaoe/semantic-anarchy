@@ -205,17 +205,79 @@ FLUX2_MODEL = os.environ.get("SA_FLUX2_MODEL", "black-forest-labs/FLUX.2-klein-4
 KREA2_MODEL = os.environ.get("SA_KREA2_MODEL", "krea/Krea-2-Raw")
 
 # --------------------------------------------------------------------------- #
-# Hand-picked checkpoints (webui/model_config.json)
+# Persisted dashboard config (config.json)
+# --------------------------------------------------------------------------- #
+# ONE gitignored file at the repo root holds everything the dashboard has to
+# remember between restarts, in three sections:
+#
+#   models — per-backend hand-picked checkpoint (sidebar model picker)
+#   dists  — per-backend base distribution (sidebar distribution picker)
+#   ui     — the frontend's own persisted store blob (every sidebar form value,
+#            the timeline, the fit selection, the label-page settings) exactly
+#            as zustand serialises it. The server stores it verbatim and never
+#            looks inside; the schema lives in frontend/src/store.ts.
+#
+# It is machine-specific (absolute paths to weights that live somewhere else on
+# everyone else's disk), hence gitignored — pick your models once in the UI
+# rather than committing someone else's layout. `ui` living here rather than in
+# localStorage is what makes the defaults follow the *server*, so the tailnet
+# phone and the desktop open the same setup.
+CONFIG_FILE = Path(os.environ.get("SA_CONFIG", str(REPO / "config.json")))
+# The per-section files this replaced. Folded in once, when config.json doesn't
+# exist yet, so an existing install doesn't forget its checkpoint on upgrade.
+LEGACY_CONFIG_FILES = {
+    "models": Path(
+        os.environ.get("SA_MODEL_CONFIG", str(REPO / "webui" / "model_config.json"))
+    ),
+    "dists": Path(
+        os.environ.get("SA_DIST_CONFIG", str(REPO / "webui" / "dist_config.json"))
+    ),
+}
+# One lock for the whole file — the sections share a file, so they share a lock.
+# Reentrant because the section writers below are called from inside a `with`.
+_config_lock = threading.RLock()
+
+
+def _read_json_dict(path: Path) -> dict:
+    """A JSON object from disk, or ``{}`` for missing/garbled/non-object."""
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_config() -> dict:
+    """The whole config file, or the migrated legacy sections on first run."""
+    cfg = _read_json_dict(CONFIG_FILE)
+    if cfg:
+        return cfg
+    merged = {}
+    for section, path in LEGACY_CONFIG_FILES.items():
+        old = _read_json_dict(path).get(section)
+        if isinstance(old, dict) and old:
+            merged[section] = old
+    return merged
+
+
+def save_config_section(section: str, value) -> None:
+    """Replace one section, leaving the others untouched (``None`` drops it)."""
+    with _config_lock:
+        cfg = load_config()
+        if value is None:
+            cfg.pop(section, None)
+        else:
+            cfg[section] = value
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Hand-picked checkpoints (config.json -> "models")
 # --------------------------------------------------------------------------- #
 # The env-var defaults above are the *fallback*. The model picker in the sidebar
 # writes a per-backend absolute path here, and that wins whenever it is set —
-# so the choice survives a restart without anyone editing run.sh. The file is
-# machine-specific (everyone's weights live somewhere else), hence gitignored.
-MODEL_CONFIG_FILE = Path(
-    os.environ.get("SA_MODEL_CONFIG", str(REPO / "webui" / "model_config.json"))
-)
-_model_cfg_lock = threading.Lock()
-
+# so the choice survives a restart without anyone editing run.sh.
 CKPT_EXTS = (".safetensors", ".ckpt")
 # What makes a folder a diffusers model rather than just a folder of files.
 DIFFUSERS_MARKERS = ("model_index.json", "unet", "transformer")
@@ -231,20 +293,15 @@ MODEL_DEFAULTS = {
 
 
 def load_model_config() -> dict:
-    """``{backend: path}`` of hand-picked checkpoints (missing file -> ``{}``)."""
-    try:
-        raw = json.loads(MODEL_CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-    models = raw.get("models") if isinstance(raw, dict) else None
+    """``{backend: path}`` of hand-picked checkpoints (nothing picked -> ``{}``)."""
+    models = load_config().get("models")
     if not isinstance(models, dict):
         return {}
     return {k: v for k, v in models.items() if k in BACKENDS and isinstance(v, str) and v}
 
 
 def save_model_config(models: dict) -> None:
-    MODEL_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MODEL_CONFIG_FILE.write_text(json.dumps({"models": models}, indent=2) + "\n")
+    save_config_section("models", models)
 
 
 def path_kind(p: Path) -> Optional[str]:
@@ -299,7 +356,7 @@ def effective_model(backend: str, model_key: Optional[str] = None) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Base distribution (webui/dist_config.json)
+# Base distribution (config.json -> "dists")
 # --------------------------------------------------------------------------- #
 # Which fit `--dist` points at. Two built-ins (the repo's own mined corpus and
 # the evolved ★ branch) plus two "point at a file on disk" kinds:
@@ -310,11 +367,6 @@ def effective_model(backend: str, model_key: Optional[str] = None) -> str:
 #   file    — an .npz someone already mined/evolved, picked directly.
 #
 # Persisted per backend so a restart comes back to the same distribution.
-DIST_CONFIG_FILE = Path(
-    os.environ.get("SA_DIST_CONFIG", str(REPO / "webui" / "dist_config.json"))
-)
-_dist_cfg_lock = threading.Lock()
-
 BASE_DIST = "outputs/dist"              # the repo's mined corpus (prompts_1000)
 EVOLVED_DIST = "outputs/dist_evolved"   # scripts/evolve_favorites.py's branch
 DEFAULT_PROMPTS = "prompts_1000.txt"
@@ -324,12 +376,8 @@ DIST_LABELS = {"base": "base corpus", "evolved": "evolved ★ branch"}
 
 
 def load_dist_config() -> dict:
-    """``{backend: {"kind": ..., "path": ...}}`` (missing/garbled file -> ``{}``)."""
-    try:
-        raw = json.loads(DIST_CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-    dists = raw.get("dists") if isinstance(raw, dict) else None
+    """``{backend: {"kind": ..., "path": ...}}`` (nothing picked -> ``{}``)."""
+    dists = load_config().get("dists")
     if not isinstance(dists, dict):
         return {}
     out = {}
@@ -341,8 +389,7 @@ def load_dist_config() -> dict:
 
 
 def save_dist_config(dists: dict) -> None:
-    DIST_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DIST_CONFIG_FILE.write_text(json.dumps({"dists": dists}, indent=2) + "\n")
+    save_config_section("dists", dists)
 
 
 def resolve_dist_file(path: str, kind: Optional[str] = None) -> Path:
@@ -2372,7 +2419,54 @@ def api_config() -> JSONResponse:
             "seeds": list(labelset.SEED_PANEL),
         },
         "labels_file": str(LABELS_FILE),
+        "config_file": str(CONFIG_FILE),
     })
+
+
+# --------------------------------------------------------------------------- #
+# UI preferences (config.json -> "ui")
+# --------------------------------------------------------------------------- #
+# The frontend's persisted store, parked server-side so the sidebar comes back
+# the same on every device that opens the dashboard (and survives clearing a
+# browser's storage). The blob is opaque here — its shape, its version and its
+# migrations are frontend/src/store.ts's business; this end only bounds how big
+# it is allowed to get.
+UI_PREFS_MAX_BYTES = 4_000_000
+
+
+@app.get("/api/prefs")
+def api_prefs_get() -> JSONResponse:
+    """The stored UI blob, or ``null`` when nothing has been saved yet."""
+    with _config_lock:
+        ui = load_config().get("ui")
+    return JSONResponse({
+        "ui": ui if isinstance(ui, dict) else None,
+        "config_file": str(CONFIG_FILE),
+    })
+
+
+@app.post("/api/prefs")
+async def api_prefs_set(request: Request) -> JSONResponse:
+    """Store (``{"ui": {...}}``) or forget (``{"ui": null}``) the UI blob.
+
+    The body is read raw rather than through a pydantic model because the last
+    write of a session arrives via ``navigator.sendBeacon``, which sets its own
+    content type.
+    """
+    body = await request.body()
+    if len(body) > UI_PREFS_MAX_BYTES:
+        raise HTTPException(413, f"prefs too large ({len(body)} bytes)")
+    try:
+        data = json.loads(body or b"null")
+    except Exception:
+        raise HTTPException(400, "prefs body is not JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "prefs body must be a JSON object")
+    ui = data.get("ui")
+    if ui is not None and not isinstance(ui, dict):
+        raise HTTPException(400, "prefs 'ui' must be an object or null")
+    save_config_section("ui", ui)
+    return JSONResponse({"ok": True, "stored": ui is not None})
 
 
 # --------------------------------------------------------------------------- #
@@ -2399,11 +2493,11 @@ def _model_row(backend: str, picked: dict) -> dict:
 
 @app.get("/api/model")
 def api_model_get() -> JSONResponse:
-    with _model_cfg_lock:
+    with _config_lock:
         picked = load_model_config()
     return JSONResponse({
         "backends": {b: _model_row(b, picked) for b in sorted(BACKENDS)},
-        "config_file": str(MODEL_CONFIG_FILE),
+        "config_file": str(CONFIG_FILE),
         "native_picker": native_picker_tool(),
         "roots": [{"name": r.name or str(r), "path": str(r)} for r in browse_roots()],
     })
@@ -2418,7 +2512,7 @@ class ModelSelectRequest(BaseModel):
 def api_model_set(req: ModelSelectRequest) -> JSONResponse:
     if req.backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {req.backend!r}")
-    with _model_cfg_lock:
+    with _config_lock:
         picked = load_model_config()
         if req.path and req.path.strip():
             picked[req.backend] = str(validate_model_path(req.path))
@@ -2436,11 +2530,11 @@ def api_dist_get(backend: str = "sd15", model: Optional[str] = None) -> JSONResp
     """The distribution this backend currently samples from."""
     if backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {backend!r}")
-    with _dist_cfg_lock:
+    with _config_lock:
         cfg = load_dist_config()
     return JSONResponse({
         **current_dist(backend, model, cfg),
-        "config_file": str(DIST_CONFIG_FILE),
+        "config_file": str(CONFIG_FILE),
         "default_prompts": DEFAULT_PROMPTS,
     })
 
@@ -2480,7 +2574,7 @@ def api_dist_set(req: DistSelectRequest) -> JSONResponse:
     if not row["ready"]:
         missing = ", ".join(f["path"] for f in row["files"] if not f["exists"])
         raise HTTPException(400, f"not encoded yet (missing {missing})")
-    with _dist_cfg_lock:
+    with _config_lock:
         cfg = load_dist_config()
         cfg[req.backend] = {"kind": req.kind, "path": path}
         save_dist_config(cfg)

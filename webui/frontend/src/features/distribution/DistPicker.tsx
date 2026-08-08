@@ -19,7 +19,7 @@ const ICON: Record<string, string> = {
  * group. The trigger opens the picker; the two lines under it are the current
  * choice and how big a fit it is.
  *
- * The choice is server-side state (webui/dist_config.json, per backend), not a
+ * The choice is server-side state (config.json -> "dists", per backend), not a
  * form value — it survives a restart and applies to every action, so it lives
  * here rather than in params/schema.ts.
  */

@@ -41,7 +41,7 @@ export SA_PORT="${SA_PORT:-8800}"
 
 # SD1.5 single-file checkpoint. Default points at a checkpoint that exists on
 # this machine; override with SA_SD15_CKPT to use a different one. A checkpoint
-# hand-picked in the dashboard's Model panel (webui/model_config.json) wins over
+# hand-picked in the dashboard's Model panel (config.json -> "models") wins over
 # this — this is only the fallback for a backend nothing has been picked for.
 export SA_SD15_CKPT="${SA_SD15_CKPT:-/home/rednax/SSD2TB/Github_repos/ComfyUI/models/checkpoints/SD15/juggernaut_reborn.safetensors}"
 
