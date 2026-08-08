@@ -45,16 +45,37 @@ def _post(path, body):
         return json.load(r)
 
 
-def _get(path):
-    with urllib.request.urlopen(BASE + path, timeout=60) as r:
-        return json.load(r)
+def _get(path, tries=60, delay=10.0):
+    """GET, surviving a dashboard restart underneath us (restart.sh, a reboot).
+
+    An overnight run is worth more than any single round, so a refused
+    connection waits the server out instead of killing the hunt.
+    """
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(BASE + path, timeout=60) as r:
+                return json.load(r)
+        except Exception as e:
+            if i == 0:
+                print(f"[hunt] dashboard unreachable ({e!r}); waiting for it "
+                      f"to come back ...", flush=True)
+            time.sleep(delay)
+    raise SystemExit(f"[hunt] dashboard down for {tries * delay / 60:.0f} min -> exiting")
 
 
 def wait_for(job_id, poll=4.0):
     while True:
-        for j in _get("/api/state")["jobs"]:
+        jobs = _get("/api/state")["jobs"]
+        for j in jobs:
             if j["id"] == job_id and j["status"] in ("done", "error", "cancelled"):
                 return j["status"]
+        # The queue is in-memory: a server restart wipes it and ids start over,
+        # so our job will never appear again. Detect that and move on rather
+        # than polling forever for a job that no longer exists.
+        if jobs and max(j["id"] for j in jobs) < job_id:
+            print(f"[hunt]   job {job_id} lost to a server restart; continuing",
+                  flush=True)
+            return "lost"
         time.sleep(poll)
 
 

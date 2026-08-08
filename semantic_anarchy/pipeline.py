@@ -16,6 +16,7 @@ mining math, plotting, tests) runs on a machine with neither installed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -445,6 +446,11 @@ class SDModel:
         return self._img2img(**kwargs).images[0]
 
 
+# Below this much free VRAM at load time, SDXL runs CPU-offloaded instead of
+# fully resident (env SA_SDXL_RESIDENT_GB to tune for a different card).
+SDXL_RESIDENT_VRAM = int(float(os.environ.get("SA_SDXL_RESIDENT_GB", "12")) * 2**30)
+
+
 @dataclass
 class SDXLModel:
     """Thin wrapper around a STOCK diffusers ``StableDiffusionXLPipeline``.
@@ -484,12 +490,32 @@ class SDXLModel:
         else:
             torch_dtype = getattr(torch, dtype)
 
+        # Free VRAM before the weights land, so we can tell a card we have to
+        # ourselves from one another process is already sitting on.
+        free_before = (torch.cuda.mem_get_info()[0]
+                       if device == "cuda" and torch.cuda.is_available() else None)
+
         if ckpt is not None:
             load_path = _ensure_safetensors_ckpt(ckpt)
             pipe = StableDiffusionXLPipeline.from_single_file(load_path, torch_dtype=torch_dtype)
         else:
             pipe = StableDiffusionXLPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-        pipe = pipe.to(device)
+
+        # SDXL at 1024^2 wants ~12GB resident. Below that, keep only the module
+        # currently executing on the GPU -- the UNet vacates before the VAE
+        # decodes, which is exactly where a crowded card OOMs. Same arithmetic,
+        # same output, a few seconds of transfers per job.
+        offloaded = False
+        if free_before is not None and free_before < SDXL_RESIDENT_VRAM:
+            try:
+                pipe.enable_model_cpu_offload()
+                offloaded = True
+                print(f"[sdxl] only {free_before / 2**30:.1f}GB VRAM free -- "
+                      f"sequential CPU offload enabled", flush=True)
+            except Exception as exc:
+                print(f"[sdxl] cpu offload unavailable ({exc!r})", flush=True)
+        if not offloaded:
+            pipe = pipe.to(device)
         pipe.set_progress_bar_config(disable=True)
         return cls(pipe=pipe, device=device, model_id=ckpt or model_id)
 
