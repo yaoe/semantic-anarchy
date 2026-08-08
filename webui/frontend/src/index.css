@@ -1,0 +1,202 @@
+@import 'tailwindcss';
+
+/* ------------------------------------------------------------------------- *
+ * Palette — ported from the :root variables of the legacy inline dashboard
+ * (webui/app.py INDEX_HTML), plus the accent inks that used to be hard-coded
+ * inside the vanilla-JS card/lightbox templates.
+ * ------------------------------------------------------------------------- */
+@theme {
+  --color-bg: #0d0e12;
+  --color-panel: #16181f;
+  --color-panel2: #1d2029;
+  --color-line: #2a2e3a;
+  --color-line2: #3a4150;
+  --color-ink: #e7e9ee;
+  --color-dim: #9aa0ad;
+  --color-accent: #e0533d;
+  --color-ok: #4caf50;
+  --color-run: #e0a13d;
+  --color-err: #e0533d;
+  --color-done: #2e7d32;
+
+  /* metric inks (score / distance / novelty / resonance / star / links) */
+  --color-score: #7fae7f;
+  --color-dist: #b48ee0;
+  --color-nov: #e0a13d;
+  --color-res: #e07ab8;
+  --color-star: #ffcf4d;
+  --color-link: #6fb3e0;
+  --color-pez: #d4b96a;
+  --color-native: #8fd48a;
+  --color-danger: #d98a8a;
+
+  --color-logbg: #07080b;
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, Menlo, Monaco, 'Cascadia Code', monospace;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+  }
+}
+
+@layer components {
+  /* The primitives the legacy sheet defined by tag selector. Kept as classes so
+     Radix-rendered triggers and native inputs stay pixel-identical. */
+  .sa-input {
+    @apply w-full bg-panel2 text-ink border border-line rounded-[7px] px-[9px] py-[7px]
+           text-[14px] leading-normal outline-none transition-colors
+           placeholder:text-dim/60 focus:border-line2 disabled:opacity-50;
+  }
+  .sa-btn {
+    @apply bg-panel2 text-ink border border-line rounded-[7px] px-[10px] py-[8px]
+           text-[14px] leading-normal cursor-pointer transition-colors
+           hover:border-line2 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .sa-btn-sel {
+    @apply bg-accent border-accent text-white hover:border-accent;
+  }
+  /* The Run button, in the same amber as the "a job is running" chrome. */
+  .sa-btn-run {
+    @apply bg-run border-run text-[#1a1206] hover:border-run hover:bg-[#eeb14c];
+  }
+  /* Stop: dark red, so it reads as "abort" against the amber Run it sits on. */
+  .sa-btn-stop {
+    @apply bg-[#6d1616] border-[#8f2020] text-[#ffdada]
+           hover:bg-[#8f2020] hover:border-[#b52a2a];
+  }
+  .sa-btn-sm {
+    @apply px-2 py-[2px] text-[11px] rounded-md;
+  }
+  /* Range inputs — the browser default is light-grey chrome that fights the
+     palette, so both engines' track and thumb are restyled by hand. */
+  /* Height matches .sa-input so a slider and a select sitting side by side in an
+     `items-end` toolbar line their tracks up with the select's midline. */
+  .sa-range {
+    @apply h-[34px] w-full cursor-pointer appearance-none bg-transparent
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .sa-range::-webkit-slider-runnable-track {
+    @apply h-[4px] rounded-full bg-line;
+  }
+  .sa-range::-webkit-slider-thumb {
+    @apply -mt-[5px] h-[14px] w-[14px] appearance-none rounded-full
+           border border-line2 bg-ink transition-colors;
+  }
+  .sa-range::-moz-range-track {
+    @apply h-[4px] rounded-full bg-line;
+  }
+  .sa-range::-moz-range-thumb {
+    @apply h-[14px] w-[14px] rounded-full border border-line2 bg-ink;
+  }
+  .sa-range:hover::-webkit-slider-thumb,
+  .sa-range:focus-visible::-webkit-slider-thumb {
+    @apply border-accent;
+  }
+  .sa-range:hover::-moz-range-thumb,
+  .sa-range:focus-visible::-moz-range-thumb {
+    @apply border-accent;
+  }
+  .sa-label {
+    @apply block text-[12px] text-dim mt-[10px] mb-[3px];
+  }
+  .sa-h2 {
+    @apply text-[12px] uppercase tracking-[0.8px] text-dim mt-[18px] mb-2;
+  }
+  /* Hints routinely quote filesystem paths, which have no break opportunities
+     for the line breaker — without this one long path widens the 320px sidebar
+     and gives the whole pane a horizontal scrollbar. */
+  .sa-hint {
+    @apply text-[11px] text-dim mt-1 break-words;
+  }
+  .sa-panel {
+    @apply bg-panel border border-line rounded-lg;
+  }
+}
+
+/* "Something is on the GPU right now" — a light sweeping the header's bottom
+   edge. Mounted only while a job runs, so it costs nothing when idle. */
+@keyframes sa-run-sweep {
+  from {
+    background-position: -55% 0;
+  }
+  to {
+    background-position: 155% 0;
+  }
+}
+.sa-runline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  pointer-events: none;
+  background-image: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-run),
+    transparent
+  );
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  animation: sa-run-sweep 2.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sa-runline {
+    animation: none;
+    background-image: none;
+    background-color: var(--color-run);
+    opacity: 0.5;
+  }
+}
+
+/* Scrollbars — dark and unobtrusive across the three scroll panes. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2e3a transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2e3a;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a4150;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Numeric inputs: hide the spinners, they fight the dark palette. */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+}

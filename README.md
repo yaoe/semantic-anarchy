@@ -110,6 +110,29 @@ python scripts/temperature_sweep.py --backend sdxl --dist outputs/dist \
     --model ~/models/sdxl-base --sampler pca --temps 1,2,3,4 --steps 30 --guidance 7
 ```
 
+**Latent travel films** — interpolate between images you already made and render
+the walk as an x264 mp4. Every generated image keeps its exact conditioning in a
+`.npz` sidecar, so a keyframe can be revisited: the film blends the conditioning
+*and* the init noise (rebuilt from the recorded seed), which makes frame 0 and
+frame N pixel-identical to the keyframes and everything between brand new.
+
+```bash
+python scripts/morph_film.py --name driftA --refine none \
+    --images generated/anarchy_sd15_A_000.png generated/anarchy_sd15_B_001.png \
+    --frames-per 24 --fps 16 --interp slerp --easing smooth --loop
+# -> outputs/films/driftA/driftA.mp4 (+ base/ frames + film.json)
+```
+
+A film has **one** resolution — keyframe 1's own, or `--width/--height`. A keyframe
+made at a different size is re-rendered at the film's size from a differently-shaped
+noise draw, so it is *not* reproduced exactly; the script names every such keyframe
+before it starts.
+
+In the dashboard this is the **🎬 Timeline** tab: hit 🎬 on any image to add it
+as a keyframe, drag the keyframes into the order you want, set fps / frames-per-hop
+/ interpolation, and render — the mp4 plays inline in the 🎞 Films tab. Mixed
+backends or mixed resolutions are flagged there before you spend the GPU time.
+
 `prompts_1000.txt` is a wide, deterministic "good" corpus you can regenerate with
 `python gen_prompts.py`. Distributions are saved backend-namespaced (`sd15` keeps
 `outputs/dist`; `sdxl` writes `outputs/dist_sdxl__*`), so the two never clash.
@@ -122,9 +145,12 @@ semantic_anarchy/
   backend.py        Backend abstraction — sd15 (1 tensor) / sdxl (2); encode/fit/sample/generate
   pipeline.py       SDModel (SD1.5) + SDXLModel (SDXL) — stock diffusers, lazy torch import
   cli_args.py       shared --backend argparse wiring + per-family defaults
+  travel.py         keyframe films — slerp/lerp, easing, frame schedule (pure numpy)
   viz.py · aesthetic.py · evolve.py · cli.py
 scripts/
   mine_distribution.py · generate.py · temperature_sweep.py · sampler_sweep.py
+  explore.py            local navigation around an existing image
+  morph_film.py         latent travel through keyframes -> x264 mp4
   explore_session.py    unattended time-budgeted gallery
   demo_no_sd.py         the torch-free demo
 tests/                  pytest — distribution + evolution + backend abstraction (all torch-free)
@@ -152,7 +178,8 @@ pytest -q
 Covers: fit recovers known mean/std; sampling shapes + temperature scaling; PCA
 extrapolation (no clipping); save/load round-trip; the backend abstraction
 (sd15/sdxl two-tensor fit/sample, sampler dispatch); evolution raising the mean
-score on an analytic objective.
+score on an analytic objective; and the film trajectory math (interpolation
+endpoints, easing curves, frame schedule, noise window).
 
 ## License
 

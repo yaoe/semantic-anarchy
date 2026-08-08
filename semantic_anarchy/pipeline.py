@@ -46,6 +46,27 @@ def set_scheduler(pipe, name: Optional[str]) -> None:
     pipe.scheduler = cls.from_config(pipe.scheduler.config)
 
 
+def _resample(name: Optional[str]):
+    """PIL resampling filter by name. ``lanczos`` (the default) is the sharpest;
+    ``bicubic`` is softer, ``nearest`` keeps hard pixel edges for the denoiser to
+    re-interpret."""
+    from PIL import Image
+
+    table = {"lanczos": Image.LANCZOS, "bicubic": Image.BICUBIC,
+             "nearest": Image.NEAREST, "bilinear": Image.BILINEAR}
+    return table.get((name or "lanczos").lower(), Image.LANCZOS)
+
+
+def _refine_target(image, scale: float, size=None) -> tuple[int, int]:
+    """Target ``(w, h)`` for a refine pass: an explicit ``size`` wins (already
+    snapped to a valid diffusion grid by ``upscale.target_size``), otherwise
+    ``scale`` the source and round to 8."""
+    if size is not None:
+        return max(8, int(size[0])), max(8, int(size[1]))
+    w, h = image.size
+    return max(8, round(w * scale / 8) * 8), max(8, round(h * scale / 8) * 8)
+
+
 def tiled_upscale(image, scale, tile, overlap, fn):
     """Ultimate-SD-Upscale-style detail pass.
 
@@ -398,7 +419,8 @@ class SDModel:
     # ----------------------------------------------------------- refine ---
     def refine_image(self, image, scale: float = 2.0, num_inference_steps: int = 50,
                      strength: float = 0.35, guidance_scale: float = 1.0,
-                     seed: Optional[int] = None, cond=None, scheduler=None):
+                     seed: Optional[int] = None, cond=None, scheduler=None,
+                     size=None, interp: str = "lanczos"):
         """Upscale + add denoising steps to an existing image (img2img hires-fix).
 
         The image is Lanczos-upscaled to ``scale x`` then run through an img2img
@@ -412,10 +434,12 @@ class SDModel:
             toward a generic unconditional refine. Falls back to the empty-prompt
             embedding when ``cond`` is None (older images without a sidecar).
         ``scheduler``: optional sampler swap (e.g. ``ddim``).
+        ``size``: explicit ``(w, h)`` target, overriding ``scale`` -- how
+            ``scripts/upscale.py`` pins a 16-px-aligned resolution.
+        ``interp``: resampling filter for the enlarge (lanczos/bicubic/nearest).
         """
         import torch
         from diffusers import AutoPipelineForImage2Image
-        from PIL import Image
 
         if getattr(self, "_img2img", None) is None:
             self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
@@ -424,9 +448,8 @@ class SDModel:
             except Exception:
                 pass
         set_scheduler(self._img2img, scheduler)
-        w, h = image.size
-        tw, th = max(8, round(w * scale / 8) * 8), max(8, round(h * scale / 8) * 8)
-        init = image.convert("RGB").resize((tw, th), Image.LANCZOS)
+        tw, th = _refine_target(image, scale, size)
+        init = image.convert("RGB").resize((tw, th), _resample(interp))
 
         param_dtype = next(self.pipe.unet.parameters()).dtype
         src = self.uncond_embedding() if cond is None else cond
@@ -682,17 +705,18 @@ class SDXLModel:
     # ----------------------------------------------------------- refine ---
     def refine_image(self, image, scale: float = 1.5, num_inference_steps: int = 50,
                      strength: float = 0.35, guidance_scale: float = 1.0,
-                     seed: Optional[int] = None, cond=None, scheduler=None):
+                     seed: Optional[int] = None, cond=None, scheduler=None,
+                     size=None, interp: str = "lanczos"):
         """SDXL img2img upscale/refine (see SDModel.refine_image).
 
         ``cond`` is the original ``{"prompt_embeds": (77,2048), "pooled": (1280,)}``
         saved at generation time; reused (with CFG, negative = empty prompt) so the
         hires pass reinforces the same content. Falls back to the empty prompt when
         ``cond`` is None. VAE tiling keeps the high-res decode within memory.
+        ``size``/``interp`` as in SDModel.refine_image.
         """
         import torch
         from diffusers import AutoPipelineForImage2Image
-        from PIL import Image
 
         if getattr(self, "_img2img", None) is None:
             self._img2img = AutoPipelineForImage2Image.from_pipe(self.pipe)
@@ -701,9 +725,8 @@ class SDXLModel:
             except Exception:
                 pass
         set_scheduler(self._img2img, scheduler)
-        w, h = image.size
-        tw, th = max(8, round(w * scale / 8) * 8), max(8, round(h * scale / 8) * 8)
-        init = image.convert("RGB").resize((tw, th), Image.LANCZOS)
+        tw, th = _refine_target(image, scale, size)
+        init = image.convert("RGB").resize((tw, th), _resample(interp))
 
         param_dtype = next(self.pipe.unet.parameters()).dtype
         src = self.uncond() if cond is None else cond

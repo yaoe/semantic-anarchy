@@ -22,11 +22,13 @@ venv python passed in ``SA_PYTHON``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import queue
 import shlex
+import struct
 import subprocess
 import threading
 import time
@@ -34,8 +36,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
@@ -150,11 +159,214 @@ SDXL_MODEL_DEFAULTS = {
     "sdxl-turbo": {"steps": 1, "guidance": 0.0},
 }
 
+FLUX2_MODEL = os.environ.get("SA_FLUX2_MODEL", "black-forest-labs/FLUX.2-klein-4B")
+KREA2_MODEL = os.environ.get("SA_KREA2_MODEL", "krea/Krea-2-Raw")
+
+# --------------------------------------------------------------------------- #
+# Hand-picked checkpoints (webui/model_config.json)
+# --------------------------------------------------------------------------- #
+# The env-var defaults above are the *fallback*. The model picker in the sidebar
+# writes a per-backend absolute path here, and that wins whenever it is set —
+# so the choice survives a restart without anyone editing run.sh. The file is
+# machine-specific (everyone's weights live somewhere else), hence gitignored.
+MODEL_CONFIG_FILE = Path(
+    os.environ.get("SA_MODEL_CONFIG", str(REPO / "webui" / "model_config.json"))
+)
+_model_cfg_lock = threading.Lock()
+
+CKPT_EXTS = (".safetensors", ".ckpt")
+# What makes a folder a diffusers model rather than just a folder of files.
+DIFFUSERS_MARKERS = ("model_index.json", "unet", "transformer")
+
+# Per-backend fallback when nothing is hand-picked (env vars / cached HF ids).
+MODEL_DEFAULTS = {
+    "sd15": SD15_CKPT,
+    "sd2": SD2_CKPT,
+    "sdxl": SDXL_MODELS[SDXL_DEFAULT_MODEL],
+    "flux2": FLUX2_MODEL,
+    "krea2": KREA2_MODEL,
+}
+
+
+def load_model_config() -> dict:
+    """``{backend: path}`` of hand-picked checkpoints (missing file -> ``{}``)."""
+    try:
+        raw = json.loads(MODEL_CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+    models = raw.get("models") if isinstance(raw, dict) else None
+    if not isinstance(models, dict):
+        return {}
+    return {k: v for k, v in models.items() if k in BACKENDS and isinstance(v, str) and v}
+
+
+def save_model_config(models: dict) -> None:
+    MODEL_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_CONFIG_FILE.write_text(json.dumps({"models": models}, indent=2) + "\n")
+
+
+def path_kind(p: Path) -> Optional[str]:
+    """``"ckpt"`` for a single-file checkpoint, ``"diffusers"`` for a model folder."""
+    if p.is_file():
+        return "ckpt" if p.suffix.lower() in CKPT_EXTS else None
+    if p.is_dir():
+        return "diffusers" if any((p / m).exists() for m in DIFFUSERS_MARKERS) else None
+    return None
+
+
+def validate_model_path(path: str) -> Path:
+    """Resolve + sanity-check a hand-picked model path, or 400."""
+    p = Path(os.path.expanduser(path.strip())).resolve()
+    if not p.exists():
+        raise HTTPException(400, f"path does not exist: {p}")
+    kind = path_kind(p)
+    if kind is None:
+        if p.is_file():
+            raise HTTPException(400, f"not a checkpoint (.safetensors/.ckpt): {p.name}")
+        raise HTTPException(
+            400, f"not a diffusers model folder (no model_index.json): {p}"
+        )
+    return p
+
+
+def model_flags_for_path(path: str) -> list[str]:
+    """A diffusers *folder* loads via from_pretrained (--model); a single-file
+    .ckpt/.safetensors via from_single_file (--ckpt)."""
+    return ["--model", path] if Path(path).is_dir() else ["--ckpt", path]
+
+
+def selected_model(backend: str) -> Optional[str]:
+    """The hand-picked path for a backend, if one is configured."""
+    return load_model_config().get(backend)
+
+
+# --------------------------------------------------------------------------- #
+# Filesystem browsing (fallback picker) + the native OS dialog
+# --------------------------------------------------------------------------- #
+def browse_roots() -> list:
+    """Roots the in-browser file browser may walk. Extra ones via SA_MODEL_ROOTS
+    (``:``-separated) — the native dialog is not restricted this way, since that
+    one is driven by whoever is sitting at the machine."""
+    cands = [Path.home(), REPO, Path("/mnt"), Path("/media"), Path("/opt")]
+    for extra in os.environ.get("SA_MODEL_ROOTS", "").split(os.pathsep):
+        if extra.strip():
+            cands.append(Path(os.path.expanduser(extra.strip())))
+    out, seen = [], set()
+    for c in cands:
+        try:
+            r = c.resolve()
+        except OSError:
+            continue
+        if r.is_dir() and str(r) not in seen:
+            seen.add(str(r))
+            out.append(r)
+    return out
+
+
+def resolve_browse_path(path: Optional[str]) -> Path:
+    """Sandbox a browse request to ``browse_roots()``."""
+    roots = browse_roots()
+    if not path:
+        return roots[0]
+    p = Path(os.path.expanduser(path)).resolve()
+    for r in roots:
+        if p == r or r in p.parents:
+            break
+    else:
+        raise HTTPException(403, f"outside the browsable roots: {p}")
+    if not p.is_dir():
+        raise HTTPException(400, f"not a directory: {p}")
+    return p
+
+
+def _display_env() -> dict:
+    """Environment for the native dialog. Falls back to SA_DISPLAY when the
+    server was started from a headless shell but a desktop session exists."""
+    env = dict(os.environ)
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        if os.environ.get("SA_DISPLAY"):
+            env["DISPLAY"] = os.environ["SA_DISPLAY"]
+    return env
+
+
+def native_picker_tool() -> Optional[str]:
+    """Which OS file dialog we can drive on *this host*, or None."""
+    import shutil
+    import sys as _sys
+
+    if _sys.platform == "darwin":
+        return "osascript" if shutil.which("osascript") else None
+    env = _display_env()
+    if not (env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")):
+        return None
+    for tool in ("zenity", "kdialog"):
+        if shutil.which(tool):
+            return tool
+    return None
+
+
+# One dialog at a time: a second one would sit invisible behind the first.
+_picker_lock = threading.Lock()
+PICKER_TIMEOUT = 300.0
+
+
+def run_native_picker(mode: str, start: Optional[str]) -> Optional[str]:
+    """Pop a real OS file dialog on the server's desktop; return the picked path
+    (None = the user cancelled). ``mode`` is ``"file"`` or ``"folder"``."""
+    tool = native_picker_tool()
+    if tool is None:
+        raise HTTPException(
+            409, "no OS file dialog available on the server host "
+                 "(no DISPLAY, or zenity/kdialog not installed)"
+        )
+    if not _picker_lock.acquire(blocking=False):
+        raise HTTPException(409, "a file dialog is already open on the server")
+    try:
+        # `start` only ever reaches argv as a directory path we resolved
+        # ourselves, and every call is a list (no shell).
+        try:
+            start_dir = str(resolve_browse_path(start)) if start else str(Path.home())
+        except HTTPException:
+            start_dir = str(Path.home())
+        title = "Pick a checkpoint folder" if mode == "folder" else "Pick a .safetensors checkpoint"
+        if tool == "zenity":
+            argv = ["zenity", "--file-selection", f"--title={title}",
+                    f"--filename={start_dir}/"]
+            if mode == "folder":
+                argv.append("--directory")
+            else:
+                argv += ["--file-filter=Checkpoints | *.safetensors *.ckpt",
+                         "--file-filter=All files | *"]
+        elif tool == "kdialog":
+            argv = (["kdialog", "--title", title, "--getexistingdirectory", start_dir]
+                    if mode == "folder"
+                    else ["kdialog", "--title", title, "--getopenfilename",
+                          start_dir, "*.safetensors *.ckpt|Checkpoints"])
+        else:  # osascript (macOS)
+            kind = "folder" if mode == "folder" else "file"
+            argv = ["osascript", "-e",
+                    f'POSIX path of (choose {kind} with prompt "{title}")']
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=PICKER_TIMEOUT, env=_display_env())
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "the file dialog timed out (nobody picked anything)")
+        except OSError as exc:
+            raise HTTPException(500, f"could not launch {tool}: {exc}")
+        out = proc.stdout.strip()
+        if proc.returncode != 0 or not out:
+            return None                       # cancelled / dismissed
+        return out.splitlines()[0].strip()
+    finally:
+        _picker_lock.release()
+
+
 # Allow-lists so user input can never become an arbitrary command.
 BACKENDS = {"sd15", "sd2", "sdxl", "flux2", "krea2"}
 SAMPLERS = {"diagonal", "pca", "blend", "hybrid"}
 NEG_MODES = {"mean", "empty", "zeros"}
 SCHEDULERS = {"default", "ddim", "euler", "euler_a", "dpm"}
+INTERPS = {"lanczos", "bicubic", "bilinear", "nearest"}    # hires upscale resampler
 
 # Gallery buckets keyed by filename prefix.
 GALLERY_BUCKETS = [
@@ -179,6 +391,7 @@ class Job:
     started: Optional[float] = None
     ended: Optional[float] = None
     log: list[str] = field(default_factory=list)
+    cancel_requested: bool = False   # set by cancel(); decides the final status
     _proc: Optional[subprocess.Popen] = None
 
 
@@ -205,16 +418,33 @@ class Runner:
         return self._jobs.get(job_id)
 
     def cancel(self, job_id: int) -> bool:
+        """Stop one job. Only ever touches that job's *child process* — the
+        server, this worker thread and the rest of the queue keep running."""
         job = self._jobs.get(job_id)
         if not job:
             return False
         if job.status == "queued":
             job.status = "cancelled"
+            job.log.append("[webui] cancelled before it started")
             return True
-        if job.status == "running" and job._proc:
-            job._proc.terminate()
+        proc = job._proc
+        if job.status == "running" and proc:
+            job.cancel_requested = True
+            job.log.append("[webui] cancel requested — SIGTERM")
+            proc.terminate()
+            threading.Thread(target=self._reap, args=(job, proc), daemon=True).start()
             return True
         return False
+
+    @staticmethod
+    def _reap(job: Job, proc: subprocess.Popen, grace: float = 15.0) -> None:
+        """SIGTERM is only a request, and a process inside a CUDA call can take
+        a while to notice. Escalate once, on this job's pid alone."""
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            job.log.append(f"[webui] still alive after {grace:.0f}s — SIGKILL")
+            proc.kill()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -257,7 +487,12 @@ class Runner:
                     if len(job.log) > 5000:
                         del job.log[:1000]
                 job.rc = job._proc.wait()
-                job.status = "done" if job.rc == 0 else "error"
+                # A cancelled job exits non-zero (rc -15 / -9); that is not an
+                # error, so don't paint the queue red for it.
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                else:
+                    job.status = "done" if job.rc == 0 else "error"
             except Exception as exc:                    # noqa: BLE001
                 job.log.append(f"[webui] launch failed: {exc!r}")
                 job.status = "error"
@@ -306,12 +541,26 @@ class RunRequest(BaseModel):
 
 
 def _model_flags(req: RunRequest) -> list[str]:
-    """--ckpt for single-file backends (sd15/sd2), --model for sdxl (cached HF id)."""
+    """--ckpt for single-file backends (sd15/sd2), --model for sdxl (cached HF id).
+
+    A checkpoint hand-picked in the sidebar (webui/model_config.json) overrides
+    all of that for its backend.
+    """
+    picked = selected_model(req.backend)
+    if picked:
+        if not Path(picked).exists():
+            raise HTTPException(
+                400, f"{req.backend}: selected checkpoint no longer exists: {picked}"
+            )
+        return model_flags_for_path(picked)
     if req.backend in SINGLE_FILE_CKPT:
         ckpt = SINGLE_FILE_CKPT[req.backend]
-        if not Path(ckpt).exists():
+        p = Path(ckpt)
+        if not p.exists():
             raise HTTPException(400, f"{req.backend} checkpoint not found: {ckpt}")
-        return ["--ckpt", ckpt]
+        # A diffusers *folder* loads via from_pretrained (--model); a single-file
+        # .ckpt/.safetensors loads via from_single_file (--ckpt).
+        return ["--model", ckpt] if p.is_dir() else ["--ckpt", ckpt]
     if req.backend == "flux2":
         return ["--model", os.environ.get("SA_FLUX2_MODEL",
                                           "black-forest-labs/FLUX.2-klein-4B")]
@@ -466,9 +715,14 @@ def _clean_csv(s: str) -> str:
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="Semantic Anarchy Explorer")
 
+# Built React frontend (webui/frontend/dist). Mounted at "/" at the BOTTOM of
+# this file, after every /api route exists, so the SPA only catches what's left.
+FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
+
+@app.get("/legacy", response_class=HTMLResponse)
+def legacy_index() -> str:
+    """The original inline dashboard, kept reachable until parity is confirmed."""
     return INDEX_HTML
 
 
@@ -479,16 +733,28 @@ def api_run(req: RunRequest) -> JSONResponse:
     return JSONResponse({"job_id": job.id, "label": label})
 
 
+#: Upscale engines, in the order the UI offers them.
+#: hires -- scripts/upscale.py: same model, same latents, last `strength` of the
+#:          ORIGINAL schedule. The faithful default.
+#: flux  -- scripts/refine_flux.py: klein reference-regeneration (different model).
+#: sd    -- scripts/refine.py: general img2img, optionally tiled.
+REFINE_ENGINES = {"hires", "flux", "sd"}
+
+#: The hires pass replays conditioning, so only SD-family sidecars qualify.
+HIRES_BACKENDS = {"sd15", "sd2", "sdxl"}
+
+
 class RefineRequest(BaseModel):
     src: str                          # filename (or outputs-relative path) of a PNG
-    scale: float = 1.5
-    steps: Optional[int] = None
-    strength: float = 0.35
+    scale: float = 2.0                # upscale factor (hires: snapped to 16px)
+    steps: Optional[int] = None       # hires: unset = the original's own step count
+    strength: float = 0.3             # hires: fraction of the original schedule re-run
     scheduler: Optional[str] = None   # default ddim in refine.py when unset
     tiled: bool = True                # tiled native-res detail pass (Ultimate-SD-Upscale style)
     overlap: int = 128
-    engine: str = "flux"              # flux (klein reference-regen) | sd (tiled img2img)
+    engine: str = "hires"             # hires (same-latent) | flux (klein) | sd (img2img)
     prompt: Optional[str] = None      # flux engine: override the upscale instruction
+    interp: str = "lanczos"           # hires: resampling filter for the enlarge
 
 
 @app.post("/api/refine")
@@ -504,6 +770,8 @@ def api_refine(req: RefineRequest) -> JSONResponse:
             src = alt
     if base not in src.parents or src.suffix.lower() != ".png" or not src.is_file():
         raise HTTPException(404, f"source not found under outputs/: {req.src}")
+    if req.engine not in REFINE_ENGINES:
+        raise HTTPException(400, f"bad engine {req.engine!r}")
     if not (0.0 < req.scale <= 3.0):
         raise HTTPException(400, "scale must be in (0, 3]")
     if not (0.0 < req.strength <= 1.0):
@@ -516,6 +784,24 @@ def api_refine(req: RefineRequest) -> JSONResponse:
     else:
         backend = "sd15"
     model = _model_flags(RunRequest(action="refine", backend=backend))
+    if req.engine == "hires":
+        # The conditioning may live one or more `refined_from` hops back (this is
+        # also the pre-flight: an untraceable source 400s instead of burning a job).
+        origin = _explorable_source(src)
+        obackend = next((b for b in ("sdxl", "sd2") if f"anarchy_{b}_" in origin.name), "sd15")
+        if obackend not in HIRES_BACKENDS:
+            raise HTTPException(400, f"{obackend} latents can't be replayed; use the FLUX engine")
+        if req.interp not in INTERPS:
+            raise HTTPException(400, f"bad interp {req.interp!r}")
+        model = _model_flags(RunRequest(action="refine", backend=obackend))
+        argv = [PYTHON, "-u", "scripts/upscale.py", "--backend", obackend, *model,
+                "--src", str(src), "--factor", str(req.scale),
+                "--denoise", str(req.strength), "--interp", req.interp]
+        if req.steps is not None:
+            argv += ["--steps", str(int(req.steps))]
+        label = f"upscale · {obackend} · {src.name} · x{req.scale} · d{req.strength}"
+        job = RUNNER.submit("refine", label, argv)
+        return JSONResponse({"job_id": job.id, "label": label})
     if req.engine == "flux":
         argv = [FLUX_PYTHON, "-u", "scripts/refine_flux.py", "--src", str(src),
                 "--scale", str(req.scale)]
@@ -806,6 +1092,71 @@ def api_log(job_id: int) -> str:
     return "\n".join(job.log)
 
 
+# How often the SSE generator looks for freshly appended lines, and how long it
+# waits before emitting a keep-alive comment on a silent job.
+_SSE_TICK = 0.4
+_SSE_PING_EVERY = 15.0
+
+
+@app.get("/api/log/{job_id}/stream")
+async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
+    """Server-sent events: the job's log, pushed as it is appended.
+
+    Replaces polling ``/api/log/{job_id}`` (which still works). Each ``lines``
+    frame carries a JSON array of *new* lines and an ``id:`` equal to the number
+    of lines sent so far, so a reconnecting EventSource resumes exactly where it
+    left off via ``Last-Event-ID`` instead of replaying the whole transcript.
+
+    The runner trims its buffer at 5000 lines; when that happens the cursor is
+    past the end, and a ``reset`` frame tells the client to clear and re-sync.
+    """
+    job = RUNNER.get(job_id)
+    if not job:
+        raise HTTPException(404, "no such job")
+
+    try:
+        idx = int(request.headers.get("last-event-id") or 0)
+    except ValueError:
+        idx = 0
+
+    async def gen():
+        nonlocal idx
+        last_ping = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+            log = job.log
+            n = len(log)
+            if idx > n:                       # buffer was trimmed under us
+                idx = 0
+                yield "event: reset\ndata: {}\n\n"
+                continue
+            if n > idx:
+                chunk = log[idx:n]
+                idx = n
+                yield f"id: {idx}\nevent: lines\ndata: {json.dumps(chunk)}\n\n"
+                last_ping = time.monotonic()
+                continue
+            if job.status in ("done", "error", "cancelled"):
+                payload = json.dumps({"status": job.status, "rc": job.rc})
+                yield f"event: status\ndata: {payload}\n\n"
+                return
+            if time.monotonic() - last_ping > _SSE_PING_EVERY:
+                last_ping = time.monotonic()
+                yield ": ping\n\n"
+            await asyncio.sleep(_SSE_TICK)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",      # don't let a reverse proxy buffer it
+        },
+    )
+
+
 @app.get("/api/images")
 def api_images() -> JSONResponse:
     favs = load_favs()
@@ -1039,6 +1390,190 @@ def api_wipe() -> JSONResponse:
     return JSONResponse({"deleted": len(doomed), "files": n_files})
 
 
+# --------------------------------------------------------------------------- #
+# Films — latent travel through a timeline of keyframes
+# --------------------------------------------------------------------------- #
+# Backends whose sidecars morph_film.py can interpolate (FILM_TENSORS there).
+FILM_BACKENDS = {"sd15", "sd2", "sdxl"}
+FILM_INTERPS = {"slerp", "lerp"}
+FILM_EASINGS = {"smooth", "smoother", "linear"}
+FILM_REFINES = {"none", "flux"}
+MAX_FILM_KEYS = 64
+MAX_FILM_FRAMES = 3000            # a 3-minute film at 16fps; past this it's a typo
+
+
+def _png_size(p: Path) -> Optional[tuple[int, int]]:
+    """``(height, width)`` straight out of the PNG's IHDR chunk — no PIL here.
+
+    The rendered pixels are ground truth: older sidecars (evolve branches)
+    recorded no height/width at all.
+    """
+    try:
+        with p.open("rb") as f:
+            head = f.read(24)
+        if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+            return None
+        w, h = struct.unpack(">II", head[16:24])
+        return int(h), int(w)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _keyframe_row(raw: str) -> dict:
+    """Everything the timeline needs to warn BEFORE a render is queued."""
+    row = {"rel": raw, "source": None, "backend": None,
+           "height": None, "width": None, "filmable": False, "error": None}
+    try:
+        src = _explorable_source(_resolve_output_png(raw))
+    except HTTPException as exc:
+        row["error"] = str(exc.detail)
+        return row
+    row["source"] = src.relative_to(OUTPUTS.resolve()).as_posix()
+    backend = "sd15"
+    for cand in ("flux2", "krea2", "sdxl", "sd2"):
+        if f"anarchy_{cand}_" in src.name:
+            backend = cand
+            break
+    row["backend"] = backend
+    size = _png_size(src)
+    if size:
+        row["height"], row["width"] = size
+    row["filmable"] = backend in FILM_BACKENDS
+    if not row["filmable"]:
+        row["error"] = f"{backend} keyframes can't be filmed yet"
+    return row
+
+
+class KeyframesRequest(BaseModel):
+    images: list[str]
+
+
+@app.post("/api/keyframes")
+def api_keyframes(req: KeyframesRequest) -> JSONResponse:
+    """Probe the timeline's keyframes: backend, real resolution, filmability.
+
+    Read-only and cheap (a 24-byte header read per image) — the UI calls it on
+    every timeline edit so mixed backends or mixed resolutions surface as a
+    warning instead of as a surprise in the finished film.
+    """
+    return JSONResponse([_keyframe_row(r) for r in req.images[:MAX_FILM_KEYS]])
+
+
+class FilmRequest(BaseModel):
+    images: list[str]                 # ordered keyframes (outputs-relative)
+    name: Optional[str] = None        # slugified; auto-named when blank
+    height: Optional[int] = None      # film resolution; None = keyframe 1's own
+    width: Optional[int] = None
+    fps: int = 16
+    frames_per: int = 24              # frames rendered per transition
+    interp: str = "slerp"             # slerp | lerp
+    easing: str = "smooth"            # smooth | smoother | linear
+    loop: bool = False                # travel last -> first too
+    refine: str = "none"              # none | flux (klein upscale of every frame)
+    scale: float = 1.5                # flux refine scale
+    fixed_noise: bool = False         # conditioning-only travel
+    noise_window: float = 1.0         # centered fraction of a transition the noise moves in
+    film_seed: int = 42
+    steps: Optional[int] = None       # override the keyframes' own values
+    guidance: Optional[float] = None
+
+
+def _film_name(requested: Optional[str]) -> str:
+    """Slugify the requested name (or invent one) and never reuse a folder."""
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", (requested or "").strip()).strip("-")[:40]
+    if not stem:
+        stem = f"travel_{time.strftime('%m%d_%H%M%S')}"
+    root = OUTPUTS / "films"
+    name, i = stem, 2
+    while (root / name).exists():
+        name = f"{stem}-{i}"
+        i += 1
+    return name
+
+
+@app.post("/api/film")
+def api_film(req: FilmRequest) -> JSONResponse:
+    """Queue a latent-travel film through the timeline's keyframes.
+
+    Every keyframe is resolved to the image that actually owns the conditioning
+    (upscales redirect to their original), sandboxed under outputs/, and checked
+    to come from the same backend — mixing them would interpolate tensors that
+    don't share a space.
+    """
+    if req.interp not in FILM_INTERPS:
+        raise HTTPException(400, f"bad interp {req.interp!r}")
+    if req.easing not in FILM_EASINGS:
+        raise HTTPException(400, f"bad easing {req.easing!r}")
+    if req.refine not in FILM_REFINES:
+        raise HTTPException(400, f"bad refine {req.refine!r}")
+    if not (2 <= len(req.images) <= MAX_FILM_KEYS):
+        raise HTTPException(400, f"a film needs 2–{MAX_FILM_KEYS} keyframes "
+                                 f"(got {len(req.images)})")
+    if not (1 <= req.fps <= 60):
+        raise HTTPException(400, "fps must be in 1–60")
+    if not (1 <= req.frames_per <= 480):
+        raise HTTPException(400, "frames between keyframes must be in 1–480")
+    if not (0.05 <= req.noise_window <= 1.0):
+        raise HTTPException(400, "noise window must be in 0.05–1.0")
+    if not (0.0 < req.scale <= 3.0):
+        raise HTTPException(400, "scale must be in (0, 3]")
+    for dim, val in (("height", req.height), ("width", req.width)):
+        if val is not None and (not (64 <= val <= 2048) or val % 8):
+            raise HTTPException(400, f"{dim} must be a multiple of 8 in 64–2048")
+    segments = len(req.images) if req.loop else len(req.images) - 1
+    frames = segments * req.frames_per + 1
+    if frames > MAX_FILM_FRAMES:
+        raise HTTPException(400, f"{frames} frames is over the {MAX_FILM_FRAMES} "
+                                 f"cap — lower 'frames between keyframes'")
+
+    rels, backends = [], set()
+    for raw in req.images:
+        src = _explorable_source(_resolve_output_png(raw))
+        rels.append(src.relative_to(OUTPUTS.resolve()).as_posix())
+        b = "sd15"
+        for cand in ("flux2", "krea2", "sdxl", "sd2"):
+            if f"anarchy_{cand}_" in src.name:
+                b = cand
+                break
+        backends.add(b)
+    if len(backends) > 1:
+        raise HTTPException(400, f"keyframes mix backends ({', '.join(sorted(backends))})"
+                                 " — their conditioning tensors aren't compatible")
+    backend = backends.pop()
+    if backend not in FILM_BACKENDS:
+        raise HTTPException(400, f"{backend} images can't be filmed yet "
+                                 f"(supported: {', '.join(sorted(FILM_BACKENDS))})")
+
+    name = _film_name(req.name)
+    python = FLUX_PYTHON if req.refine == "flux" else python_for(backend)
+    argv = [python, "-u", "scripts/morph_film.py", "--name", name,
+            "--fps", str(req.fps), "--frames-per", str(req.frames_per),
+            "--interp", req.interp, "--easing", req.easing,
+            "--refine", req.refine, "--noise-window", str(req.noise_window),
+            "--film-seed", str(int(req.film_seed))]
+    if req.loop:
+        argv += ["--loop"]
+    if req.fixed_noise:
+        argv += ["--fixed-noise"]
+    if req.refine == "flux":
+        argv += ["--scale", str(req.scale)]
+    if req.steps is not None:
+        argv += ["--steps", str(int(req.steps))]
+    if req.guidance is not None:
+        argv += ["--guidance", str(req.guidance)]
+    if req.height:
+        argv += ["--height", str(int(req.height))]
+    if req.width:
+        argv += ["--width", str(int(req.width))]
+    argv += ["--images", *rels]
+
+    label = (f"film · {name} · {len(rels)} keys × {req.frames_per} · "
+             f"{frames}f @ {req.fps}fps · {req.interp}")
+    job = RUNNER.submit("film", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "name": name,
+                         "frames": frames})
+
+
 class FilmDeleteRequest(BaseModel):
     dir: str
 
@@ -1072,13 +1607,17 @@ def api_films() -> JSONResponse:
                         info = json.loads(mj.read_text())
                     except Exception:
                         pass
+                st = mp4.stat()
                 films.append({
                     "name": mp4.stem, "dir": d.name,
                     "rel": str(mp4.relative_to(OUTPUTS)),
-                    "mtime": mp4.stat().st_mtime,
+                    "mtime": st.st_mtime, "size": st.st_size,
                     "frames": info.get("frames"), "fps": info.get("fps"),
                     "keyframes": info.get("keyframes", []),
                     "refine": info.get("refine"),
+                    "interp": info.get("interp"), "easing": info.get("easing"),
+                    "loop": info.get("loop"), "backend": info.get("backend"),
+                    "duration": info.get("duration"),
                 })
     films.sort(key=lambda f: f["mtime"], reverse=True)
     return JSONResponse(films)
@@ -1093,10 +1632,117 @@ def api_config() -> JSONResponse:
         "sd2_ckpt": SD2_CKPT,
         "sd2_ckpt_exists": Path(SD2_CKPT).exists(),
         "sdxl_models": SDXL_MODELS,
+        # Hand-picked checkpoints (webui/model_config.json) — these override the
+        # env-var defaults above, so the sidebar hints have to know about them.
+        "picked_models": load_model_config(),
         "init_dir": str(INIT_DIR),
         "init_count": init_images_count(),
         "init_folders": init_folders(),
         "repo": str(REPO),
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Model picker
+# --------------------------------------------------------------------------- #
+def _model_row(backend: str, picked: dict) -> dict:
+    sel = picked.get(backend)
+    default = MODEL_DEFAULTS[backend]
+    effective = sel or default
+    p = Path(effective)
+    # An HF repo id ("stabilityai/...") is neither a file nor a folder here —
+    # it resolves out of the HF cache at load time, so "exists" is unknowable.
+    is_local = sel is not None or p.is_absolute()
+    return {
+        "backend": backend,
+        "selected": sel,
+        "default": default,
+        "effective": effective,
+        "name": p.name if is_local else effective,
+        "kind": path_kind(p) if is_local else "repo",
+        "exists": p.exists() if is_local else None,
+    }
+
+
+@app.get("/api/model")
+def api_model_get() -> JSONResponse:
+    with _model_cfg_lock:
+        picked = load_model_config()
+    return JSONResponse({
+        "backends": {b: _model_row(b, picked) for b in sorted(BACKENDS)},
+        "config_file": str(MODEL_CONFIG_FILE),
+        "native_picker": native_picker_tool(),
+        "roots": [{"name": r.name or str(r), "path": str(r)} for r in browse_roots()],
+    })
+
+
+class ModelSelectRequest(BaseModel):
+    backend: str
+    path: Optional[str] = None       # None / "" clears back to the default
+
+
+@app.post("/api/model")
+def api_model_set(req: ModelSelectRequest) -> JSONResponse:
+    if req.backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {req.backend!r}")
+    with _model_cfg_lock:
+        picked = load_model_config()
+        if req.path and req.path.strip():
+            picked[req.backend] = str(validate_model_path(req.path))
+        else:
+            picked.pop(req.backend, None)
+        save_model_config(picked)
+    return JSONResponse(_model_row(req.backend, picked))
+
+
+class BrowseRequest(BaseModel):
+    mode: str = "file"               # file | folder
+    start: Optional[str] = None
+
+
+@app.post("/api/model/native")
+def api_model_native(req: BrowseRequest) -> JSONResponse:
+    """Open a real OS file dialog *on the machine running this server*. Useless
+    from a remote tailnet device — the UI falls back to /api/fs there."""
+    if req.mode not in ("file", "folder"):
+        raise HTTPException(400, f"unknown mode {req.mode!r}")
+    path = run_native_picker(req.mode, req.start)
+    if path is None:
+        return JSONResponse({"cancelled": True, "path": None})
+    return JSONResponse({"cancelled": False, "path": str(validate_model_path(path))})
+
+
+@app.get("/api/fs")
+def api_fs(path: Optional[str] = None) -> JSONResponse:
+    """One directory listing for the in-browser fallback picker: subfolders plus
+    single-file checkpoints, sandboxed to browse_roots()."""
+    here = resolve_browse_path(path)
+    roots = browse_roots()
+    entries = []
+    try:
+        children = sorted(here.iterdir(), key=lambda p: p.name.lower())
+    except PermissionError:
+        raise HTTPException(403, f"not readable: {here}")
+    for c in children:
+        if c.name.startswith("."):
+            continue
+        try:
+            if c.is_dir():
+                entries.append({"name": c.name, "path": str(c), "dir": True,
+                                "kind": path_kind(c), "size": None})
+            elif c.suffix.lower() in CKPT_EXTS:
+                entries.append({"name": c.name, "path": str(c), "dir": False,
+                                "kind": "ckpt", "size": c.stat().st_size})
+        except OSError:
+            continue
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    at_root = any(here == r for r in roots)
+    return JSONResponse({
+        "path": str(here),
+        "parent": None if at_root else str(here.parent),
+        "kind": path_kind(here),
+        "entries": entries,
+        "roots": [{"name": r.name or str(r), "path": str(r)} for r in roots],
     })
 
 
@@ -1348,14 +1994,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="refineBar" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;
          margin:0 0 12px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:8px">
-      <div><label style="margin-top:0">Upscale ×</label>
-        <select id="rfScale" style="width:90px"><option>1.25</option><option selected>1.5</option><option>2.0</option></select></div>
-      <div><label style="margin-top:0">Steps</label>
-        <input id="rfSteps" type="number" placeholder="40" style="width:80px"></div>
       <div><label style="margin-top:0">Engine</label>
-        <select id="rfEngine" style="width:150px">
-          <option value="flux" selected>FLUX klein (best)</option>
+        <select id="rfEngine" style="width:170px">
+          <option value="hires" selected>Same-latent hires</option>
+          <option value="flux">FLUX klein</option>
           <option value="sd">SD img2img</option></select></div>
+      <div class="rfHires"><label style="margin-top:0"
+           title="target = source × this, snapped to a multiple of 16 px">Upscale <b id="rfFactorOut">×2.00</b></label>
+        <input id="rfFactor" type="range" min="1" max="3" step="0.05" value="2.0" style="width:150px"></div>
+      <div class="rfHires"><label style="margin-top:0"
+           title="fraction of the ORIGINAL schedule re-run on the enlarged image, with the same latents and seed">Denoise <b id="rfDenoiseOut">0.30 · last 30%</b></label>
+        <input id="rfDenoise" type="range" min="0.05" max="1" step="0.05" value="0.3" style="width:165px"></div>
+      <div class="rfOther"><label style="margin-top:0">Upscale ×</label>
+        <select id="rfScale" style="width:90px"><option>1.25</option><option selected>1.5</option><option>2.0</option></select></div>
+      <div class="rfOther"><label style="margin-top:0">Steps</label>
+        <input id="rfSteps" type="number" placeholder="40" style="width:80px"></div>
       <div><label style="margin-top:0">SD mode</label>
         <select id="rfMode" style="width:140px"><option value="tiled" selected>Detail (tiled)</option>
           <option value="single">Standard (1 pass)</option></select></div>
@@ -1759,7 +2412,13 @@ function refinePrompt() {
   return null;   // faithful -> script default
 }
 async function refineImage(name, btn) {
-  const body = {
+  // hires owns its own two knobs and reads steps/guidance/scheduler/seed off the
+  // source image's sidecar; the other engines take the rest of the bar.
+  const body = $("#rfEngine").value === "hires" ? {
+    src: name, engine: "hires", tiled: false,
+    scale: parseFloat($("#rfFactor").value),
+    strength: parseFloat($("#rfDenoise").value),
+  } : {
     src: name,
     scale: parseFloat($("#rfScale").value),
     steps: $("#rfSteps").value.trim() === "" ? null : Number($("#rfSteps").value),
@@ -1782,7 +2441,8 @@ const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distan
   "direction","step","walk_frame","target_distance","elites","base_blend","dist",
   "backend","model","sampler","temperature","coherence",
   "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
-  "batch_seed","image_seed","index","refined_from","scale","strength","cond_reused","out_size","seed"];
+  "batch_seed","image_seed","index","refined_from","cond_from","engine","factor","denoise",
+  "denoise_steps","interp","scale","strength","cond_reused","src_size","out_size","seed"];
 let currentRel = null, currentScore = null;
 async function openLight(src, rel, score){
   currentRel = rel; currentScore = score;
@@ -1808,7 +2468,7 @@ async function openLight(src, rel, score){
     if (!keys.length) { box.innerHTML = `<span style="color:#9aa0ad">${rel} — no params recorded (pre-dates param logging)</span>${scoreLine}` + inv; return; }
     const ordered = PARAM_ORDER.filter(k => k in m && m[k] !== null);
     const cli = buildCli(m);
-    const LINKED = new Set(["parent", "parent_b", "refined_from"]);
+    const LINKED = new Set(["parent", "parent_b", "refined_from", "cond_from"]);
     const render = k => {
       let v = m[k];
       if (LINKED.has(k) && typeof v === "string")
@@ -1866,6 +2526,8 @@ function buildCli(m){
     if (m.coherence!=null) s += ` --coherence ${m.coherence}`;
     return s;
   }
+  if (m.kind === "refine" && m.engine === "hires") return `upscale.py --src ${m.refined_from || "<orig>"} --factor ${m.factor} --denoise ${m.denoise} --interp ${m.interp}`;
+  if (m.kind === "refine" && m.engine === "flux2-klein") return `refine_flux.py --src ${m.refined_from || "<orig>"} --scale ${m.scale} --steps ${m.steps}`;
   if (m.kind === "refine") return `refine.py --src <orig> --scale ${m.scale} --strength ${m.strength} --steps ${m.steps} --guidance ${m.guidance} --scheduler ${m.scheduler}`;
   if (m.kind === "explore") {
     let s = `explore.py --mode ${m.mode} --src ${m.parent} --seed ${m.batch_seed}`;
@@ -1896,6 +2558,21 @@ $("#lightmeta").onclick = (e) => e.stopPropagation();
 $("#rfPromptSel").onchange = () => {
   $("#rfPromptCustomWrap").style.display = $("#rfPromptSel").value === "custom" ? "" : "none";
 };
+// Engine switch: each engine shows only the knobs it actually reads.
+function rfSyncEngine() {
+  const hires = $("#rfEngine").value === "hires";
+  document.querySelectorAll(".rfHires").forEach(e => e.style.display = hires ? "" : "none");
+  document.querySelectorAll(".rfOther").forEach(e => e.style.display = hires ? "none" : "");
+}
+$("#rfEngine").onchange = rfSyncEngine;
+$("#rfFactor").oninput = () => {
+  $("#rfFactorOut").textContent = "×" + Number($("#rfFactor").value).toFixed(2);
+};
+$("#rfDenoise").oninput = () => {
+  const v = Number($("#rfDenoise").value);
+  $("#rfDenoiseOut").textContent = v.toFixed(2) + " · last " + Math.round(v * 100) + "%";
+};
+rfSyncEngine();
 $("#sortBy").onchange = () => { shown = PAGE; renderGallery(); };
 $("#wipeBtn").onclick = async () => {
   const p = await (await fetch("/api/wipe/preview")).json();
@@ -1958,11 +2635,27 @@ $(".main").addEventListener("scroll", maybeLoadMore, {passive: true});
 </html>"""
 
 
+# --------------------------------------------------------------------------- #
+# Static frontend — mounted LAST so every /api route above wins the match.
+# --------------------------------------------------------------------------- #
+if (FRONTEND_DIST / "index.html").is_file():
+    # html=True serves index.html for "/" (and for unknown sub-paths, which a
+    # future client-side router would need).
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+else:
+    # Not built yet -> keep the inline dashboard on "/" so the tool still works.
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> str:
+        return INDEX_HTML
+
+
 if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("SA_HOST", "127.0.0.1")
     port = int(os.environ.get("SA_PORT", "8800"))
+    built = (FRONTEND_DIST / "index.html").is_file()
     print(f"[webui] python (jobs) = {PYTHON}")
+    print(f"[webui] frontend      = {'dist (react)' if built else 'inline (legacy)'}")
     print(f"[webui] serving on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")

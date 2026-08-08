@@ -25,6 +25,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from .clip_compat import image_features
+
 # The LAION aesthetic predictor expects a 768-d CLIP ViT-L/14 image embedding.
 _CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
 _CLIP_EMBED_DIM = 768
@@ -183,7 +185,7 @@ class AestheticScorer(Scorer):
 
         with torch.no_grad():
             inputs = self._processor(images=list(images), return_tensors="pt").to(self._device)
-            feats = self._clip.get_image_features(**inputs)
+            feats = image_features(self._clip, inputs)
             feats = feats / feats.norm(dim=-1, keepdim=True)
             scores = self._model(feats.float()).squeeze(-1)
         return scores.detach().cpu().numpy().astype(np.float32)

@@ -55,3 +55,14 @@ EXPLORE.md
 
 # user-provided init images (img2img entropy injection)
 init_images/
+
+# ------------------------------------------------------------- web frontend ---
+# The dashboard's React app: sources are committed, installed deps and the
+# build output are not (webui/app.py serves dist/ when it exists).
+webui/frontend/node_modules/
+webui/frontend/dist/
+
+# The dashboard's hand-picked checkpoint paths (sidebar model picker). Absolute
+# paths to weights on *this* machine, so they're per-user: pick your models once
+# in the UI rather than committing someone else's layout.
+webui/model_config.json
