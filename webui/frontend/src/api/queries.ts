@@ -38,6 +38,7 @@ export const qk = {
   labelStats: ['labelStats'] as const,
   labelFacets: ['labelFacets'] as const,
   labelQueue: (k: LabelQueryParams) => ['labelQueue', k] as const,
+  tags: ['tags'] as const,
   wipePreview: ['wipePreview'] as const,
   meta: (rel: string) => ['meta', rel] as const,
   model: ['model'] as const,
@@ -170,6 +171,44 @@ export function useSubmitLabel(key: LabelQueryParams) {
       // Facet counts carry an "unlabeled" column, so they move on every label —
       // but the queue itself is deliberately NOT invalidated (see above).
       qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/**
+ * The tag vocabulary — every aesthetic universe in use, commonest first.
+ *
+ * Derived server-side from what images actually wear, so a tag appears the
+ * moment it is first assigned and retires when the last image drops it. There
+ * is no separate "create tag" call.
+ */
+export function useTags(enabled = true) {
+  return useQuery({ queryKey: qk.tags, queryFn: api.tags, enabled, staleTime: 15_000 })
+}
+
+/**
+ * Set an image's universes. The whole set is sent, so this one mutation covers
+ * assign, un-assign and create.
+ *
+ * Optimistic like `useSubmitLabel`, and for the same reason: tagging is done at
+ * keyboard speed and a round trip per chip would be felt. The queue row is
+ * patched in place rather than refetched, so the cursor never moves under you.
+ */
+export function useSetTags(key: LabelQueryParams) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, tags }: { rel: string; tags: string[] }) => api.setTags(rel, tags),
+    onMutate: async ({ rel, tags }) => {
+      qc.setQueryData<LabelQueue>(qk.labelQueue(key), (old) =>
+        old ? { ...old, queue: old.queue.map((r) => (r.rel === rel ? { ...r, tags } : r)) } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.tags })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+      // The gallery shows tag chips too, but it is a different (and much
+      // heavier) query — let it pick them up on its own poll rather than
+      // refetching 10k rows for one chip.
     },
   })
 }

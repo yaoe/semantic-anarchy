@@ -66,6 +66,10 @@ from semantic_anarchy import dist_paths  # noqa: E402
 # the score range and the tail-weighted summary all live there so the dashboard,
 # scripts/experiment_report.py and the tests can't disagree about what a label is.
 from semantic_anarchy import labels as labelset  # noqa: E402
+# The other half of a judgement, same discipline: which aesthetic universe an
+# image belongs to. Separate stream from the score because a tag is set-valued
+# and a score is scalar -- see semantic_anarchy/tags.py.
+from semantic_anarchy import tags as tagset  # noqa: E402
 # Torch-free too: fitting a distribution to the latents of a picked set of
 # images is pure numpy over sidecars that already exist, so the naming rules and
 # the manifest format are shared with scripts/fit_selection.py rather than
@@ -1567,6 +1571,7 @@ def api_images() -> JSONResponse:
     scores = _load_json("scores.json")
     novelty = _load_json("novelty.json")
     resonance = _load_json("resonance.json")
+    tag_map = current_tags()
     buckets: dict[str, list] = {k: [] for k, _ in GALLERY_BUCKETS}
     buckets["favorites"] = []
     buckets["top"] = []
@@ -1594,6 +1599,7 @@ def api_images() -> JSONResponse:
                         "dist": _distance_for(rel),
                         "nov": novelty.get(rel),
                         "res": resonance.get(rel),
+                        "tags": tag_map.get(rel),
                     }
                     buckets[key].append(item)
                     by_rel[rel] = item
@@ -1713,6 +1719,37 @@ def labeled_scores() -> dict:
             for rel, rec in labelset.latest_by_rel(load_labels()).items()}
 
 
+TAGS_FILE = tagset.tags_file()         # repo/labels/tags.jsonl (SA_TAGS_FILE overrides)
+
+_tags_cache: tuple = (None, [])
+
+
+def load_tag_records() -> list:
+    """Every tag record, cached against the file's (mtime, size) like the labels."""
+    global _tags_cache
+    try:
+        st = TAGS_FILE.stat()
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if _tags_cache[0] == key:
+        return _tags_cache[1]
+    recs = tagset.read_records(TAGS_FILE)
+    _tags_cache = (key, recs)
+    return recs
+
+
+def current_tags() -> dict:
+    """rel -> the tag set that currently stands for it.
+
+    Deliberately NOT folded into ``_label_index``'s row cache: that cache is
+    keyed on the image's mtime, and tagging changes no pixel — a tag written now
+    would not appear until the file was touched. Tags are merged into rows at
+    request time instead, exactly like ``score`` and ``fav``.
+    """
+    return tagset.latest_by_rel(load_tag_records())
+
+
 #: The dimensions the queue can be sliced along, each exposed as a facet with
 #: counts. Every one is derived from the image's own sidecar/pixels — no new
 #: bookkeeping — and every one is an *equality* filter, so the UI is a row of
@@ -1798,6 +1835,22 @@ def _facet_ok(row: dict, dim: str, want: str) -> bool:
     return (have is None or have == "") if want == UNSET else have == want
 
 
+def _tag_filter(tag_map: dict, want: str):
+    """A predicate on ``rel`` — ``None`` when there is no tag filter.
+
+    Tags are the one dimension that is set-valued, so this can't go through
+    :func:`_facet_ok`'s equality test: an image wearing three universes has to
+    match on any of them. ``__none__`` selects the untagged, which is the useful
+    inverse — "what haven't I sorted into a universe yet?".
+    """
+    if not want:
+        return None
+    if want == UNSET:
+        return lambda rel: rel not in tag_map
+    hits = tagset.tagged_with(tag_map, want)
+    return lambda rel: rel in hits
+
+
 def _select(rows: list, filters: dict, since: Optional[float],
             until: Optional[float]) -> list:
     out = []
@@ -1832,7 +1885,11 @@ def api_label_facets() -> JSONResponse:
     scores = labeled_scores()
     favs = load_favs()
     rows = _label_index()
-    tally: dict = {dim: {} for dim in LABEL_FACETS}
+    tag_map = current_tags()
+    # "tag" is a facet of the queue but not of LABEL_FACETS: those are the
+    # equality dimensions read off the row itself, and this one is set-valued
+    # and lives in its own dataset.
+    tally: dict = {dim: {} for dim in (*LABEL_FACETS, "tag")}
     for row in rows:
         unlabeled = row["rel"] not in scores
         for dim in LABEL_FACETS:
@@ -1840,11 +1897,19 @@ def api_label_facets() -> JSONResponse:
             cell = tally[dim].setdefault(key, {"value": key, "count": 0, "unlabeled": 0})
             cell["count"] += 1
             cell["unlabeled"] += int(unlabeled)
+        # Tags are set-valued, so one image feeds several cells (or the UNSET
+        # one). Counted here rather than in the row loop above because the row
+        # cache is keyed on the image's mtime and a tag write touches no pixel.
+        for key in tag_map.get(row["rel"]) or (UNSET,):
+            cell = tally["tag"].setdefault(key, {"value": key, "count": 0, "unlabeled": 0})
+            cell["count"] += 1
+            cell["unlabeled"] += int(unlabeled)
     times = [r["mtime"] for r in rows]
     return JSONResponse({
         "total": len(rows),
         "unlabeled": sum(1 for r in rows if r["rel"] not in scores),
         "favorites": sum(1 for r in rows if r["rel"] in favs),
+        "tagged": sum(1 for r in rows if r["rel"] in tag_map),
         "oldest": min(times) if times else None,
         "newest": max(times) if times else None,
         "facets": {
@@ -1862,6 +1927,7 @@ def api_label_queue(experiment: Optional[str] = None, scope: str = "unlabeled",
                     backend: Optional[str] = None, ckpt: Optional[str] = None,
                     folder: Optional[str] = None, size: Optional[str] = None,
                     kind: Optional[str] = None, sampler: Optional[str] = None,
+                    tag: Optional[str] = None,
                     since: Optional[float] = None,
                     until: Optional[float] = None) -> JSONResponse:
     """The images to label next, shuffled within the selection by default.
@@ -1877,6 +1943,7 @@ def api_label_queue(experiment: Optional[str] = None, scope: str = "unlabeled",
         raise HTTPException(400, f"bad bucket {bucket!r}")
     scores = labeled_scores()
     favs = load_favs()
+    tag_map = current_tags()
     filters = {
         "experiment": (experiment or "").strip(),
         "backend": (backend or "").strip(),
@@ -1886,17 +1953,22 @@ def api_label_queue(experiment: Optional[str] = None, scope: str = "unlabeled",
         "kind": (kind or "").strip(),
         "sampler": (sampler or "").strip(),
     }
+    want_tag = (tag or "").strip()
+    keep = _tag_filter(tag_map, want_tag)
 
     rows = []
     for row in _select(_label_index(), filters, since, until):
         if bucket == "favorites" and row["rel"] not in favs:
+            continue
+        if keep is not None and not keep(row["rel"]):
             continue
         score = scores.get(row["rel"])
         if scope == "unlabeled" and score is not None:
             continue
         if scope == "labeled" and score is None:
             continue
-        rows.append({**row, "score": score, "fav": row["rel"] in favs})
+        rows.append({**row, "score": score, "fav": row["rel"] in favs,
+                     "tags": tag_map.get(row["rel"], [])})
 
     total = len(rows)
     if order == "new":
@@ -1909,7 +1981,8 @@ def api_label_queue(experiment: Optional[str] = None, scope: str = "unlabeled",
         "queue": rows[:max(1, min(2000, limit))],
         "total": total,
         "labeled": sum(1 for r in rows if r["score"] is not None),
-        "filters": {k: v or None for k, v in filters.items()},
+        "filters": {**{k: v or None for k, v in filters.items()},
+                    "tag": want_tag or None},
         "since": since,
         "until": until,
         "scope": scope,
@@ -1939,6 +2012,41 @@ def api_label(req: LabelRequest) -> JSONResponse:
     return JSONResponse({"ok": True, "rel": rel, "score": rec["score"],
                          "experiment": rec["experiment"],
                          "count": len(labeled_scores())})
+
+
+class TagRequest(BaseModel):
+    rel: str
+    #: The COMPLETE set this image should wear from now on — not a delta. The
+    #: client always knows the current set (it is in the row), so sending the
+    #: whole thing makes assign and un-assign one idempotent call.
+    tags: list[str] = []
+
+
+@app.post("/api/tag")
+def api_tag(req: TagRequest) -> JSONResponse:
+    """Set an image's aesthetic universes. Appends; history is never rewritten."""
+    base = OUTPUTS.resolve()
+    target = (base / req.rel).resolve()
+    if base not in target.parents or target.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(404, "not an outputs image")
+    rel = target.relative_to(base).as_posix()
+    rec = tagset.make_record(rel, req.tags)
+    tagset.append_record(rec, TAGS_FILE)
+    return JSONResponse({"ok": True, "rel": rel, "tags": rec["tags"],
+                         "vocabulary": tagset.vocabulary(load_tag_records())})
+
+
+@app.get("/api/tags")
+def api_tags() -> JSONResponse:
+    """The tag vocabulary — derived from what images actually wear, commonest first."""
+    records = load_tag_records()
+    tag_map = tagset.latest_by_rel(records)
+    return JSONResponse({
+        "tags": tagset.vocabulary(records),
+        "tagged": len(tag_map),
+        "records": len(records),
+        "file": str(TAGS_FILE),
+    })
 
 
 @app.get("/api/labels")
@@ -2637,7 +2745,8 @@ FIT_SCORED = ("any", "labeled", "unlabeled")
 
 def _fit_rows(filters: dict, since: Optional[float], until: Optional[float],
               starred: bool, scored: str, min_score: Optional[int],
-              max_score: Optional[int], latents_only: bool = True) -> list:
+              max_score: Optional[int], latents_only: bool = True,
+              tag: str = "") -> list:
     """Candidate images for a fit, with their label score and star.
 
     Deliberately the SAME index the labeling queue is built from
@@ -2647,9 +2756,13 @@ def _fit_rows(filters: dict, since: Optional[float], until: Optional[float],
     """
     scores = labeled_scores()
     favs = load_favs()
+    tag_map = current_tags()
+    keep = _tag_filter(tag_map, (tag or "").strip())
     out = []
     for row in _select(_label_index(), filters, since, until):
         if latents_only and not row.get("latents"):
+            continue
+        if keep is not None and not keep(row["rel"]):
             continue
         fav = row["rel"] in favs
         if starred and not fav:
@@ -2665,7 +2778,8 @@ def _fit_rows(filters: dict, since: Optional[float], until: Optional[float],
             continue
         if max_score is not None and (score is None or score > max_score):
             continue
-        out.append({**row, "score": score, "fav": fav})
+        out.append({**row, "score": score, "fav": fav,
+                    "tags": tag_map.get(row["rel"], [])})
     return out
 
 
@@ -2673,7 +2787,7 @@ def _fit_rows(filters: dict, since: Optional[float], until: Optional[float],
 def api_fit_candidates(backend: Optional[str] = None, experiment: Optional[str] = None,
                        ckpt: Optional[str] = None, folder: Optional[str] = None,
                        size: Optional[str] = None, kind: Optional[str] = None,
-                       sampler: Optional[str] = None,
+                       sampler: Optional[str] = None, tag: Optional[str] = None,
                        since: Optional[float] = None, until: Optional[float] = None,
                        starred: bool = False, scored: str = "any",
                        min_score: Optional[int] = None,
@@ -2700,7 +2814,8 @@ def api_fit_candidates(backend: Optional[str] = None, experiment: Optional[str] 
         "kind": (kind or "").strip(),
         "sampler": (sampler or "").strip(),
     }
-    rows = _fit_rows(filters, since, until, starred, scored, min_score, max_score)
+    rows = _fit_rows(filters, since, until, starred, scored, min_score, max_score,
+                     tag=(tag or "").strip())
     if order == "old":
         rows.sort(key=lambda r: r["mtime"])
     elif order == "score":

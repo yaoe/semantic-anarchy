@@ -25,6 +25,9 @@ const DIMS: { dim: FacetDim; label: string; any: string; width: number }[] = [
   { dim: 'folder', label: 'Folder', any: 'any folder', width: 140 },
   { dim: 'kind', label: 'Made by', any: 'any source', width: 130 },
   { dim: 'sampler', label: 'Sampler', any: 'any sampler', width: 130 },
+  // Fitting a distribution to ONE aesthetic universe is the point of tagging:
+  // pick the universe here and --sampler pca on the result means "more of that".
+  { dim: 'tag', label: 'Universe', any: 'any universe', width: 160 },
 ]
 
 const SCORED: Option[] = [

@@ -7,7 +7,7 @@
  * by default so the score stays perceptual rather than analytical.
  *
  * Keys: 0–9 score + advance · ←/→ navigate (relabeling allowed, latest wins) ·
- * Space skip · s star · k knobs.
+ * Space skip · s star · k knobs · t tag box · shift+1…9 toggle a universe.
  *
  * WHICH images are queued is `QueueBar`'s job, and the cursor/progress readout
  * is `LabelApp`'s single status line; this component is the score strip, the
@@ -15,11 +15,19 @@
  */
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { useConfig, useFavorite, useLabelQueue, useSubmitLabel } from '../../api/queries'
+import {
+  useConfig,
+  useFavorite,
+  useLabelQueue,
+  useSetTags,
+  useSubmitLabel,
+  useTags,
+} from '../../api/queries'
 import type { LabelRow } from '../../api/types'
 import { cn, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
 import { useLabelSelection } from './selection'
+import { TagStrip } from './TagStrip'
 
 /** Score → ink, so a past call reads at a glance without being read. */
 function scoreTone(s: number): string {
@@ -96,8 +104,11 @@ export function LabelPage() {
   const selection = useLabelSelection()
   const { data: queue, isLoading } = useLabelQueue(selection)
   const { data: config } = useConfig()
+  const { data: vocab } = useTags()
   const submit = useSubmitLabel(selection)
+  const setTags = useSetTags(selection)
   const favorite = useFavorite()
+  const tagInputRef = useRef<HTMLInputElement>(null)
 
   const rows: LabelRow[] = useMemo(() => queue?.queue ?? [], [queue])
   const at = Math.min(index, Math.max(0, rows.length - 1))
@@ -135,10 +146,35 @@ export function LabelPage() {
     if (row) favorite.mutate({ rel: row.rel, on: !row.fav })
   }, [row, favorite])
 
+  const applyTags = useCallback(
+    (tags: string[]) => {
+      if (row) setTags.mutate({ rel: row.rel, tags })
+    },
+    [row, setTags],
+  )
+
+  // shift+<n> toggles the nth universe. Scoring does NOT advance here on
+  // purpose: an image can wear several, so the cursor stays put until you say
+  // otherwise with a score, Space or an arrow.
+  const toggleNth = useCallback(
+    (n: number) => {
+      const cell = vocab?.tags?.[n - 1]
+      if (!row || !cell) return
+      const worn = row.tags ?? []
+      const on = worn.some((t) => t.toLocaleLowerCase() === cell.tag.toLocaleLowerCase())
+      applyTags(
+        on
+          ? worn.filter((t) => t.toLocaleLowerCase() !== cell.tag.toLocaleLowerCase())
+          : [...worn, cell.tag],
+      )
+    },
+    [row, vocab, applyTags],
+  )
+
   // One window-level handler. Held in a ref so the listener is attached once
   // rather than re-bound on every cursor move.
-  const stateRef = useRef({ score, advance, star, showKnobs })
-  stateRef.current = { score, advance, star, showKnobs }
+  const stateRef = useRef({ score, advance, star, showKnobs, toggleNth })
+  stateRef.current = { score, advance, star, showKnobs, toggleNth }
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null
@@ -148,7 +184,16 @@ export function LabelPage() {
       // printable keys — so while a queue picker is open, "4" is a search, not
       // a score. Anything with an open popup wins the keyboard.
       if (document.querySelector('[role="listbox"], [role="dialog"]')) return
-      const { score: sc, advance: adv, star: st, showKnobs: kn } = stateRef.current
+      const { score: sc, advance: adv, star: st, showKnobs: kn, toggleNth: tn } =
+        stateRef.current
+      // Shift+digit is a universe, not a score. Read off e.code because the
+      // shifted key is '!' / '@' / … and varies by layout.
+      if (e.shiftKey && /^Digit[1-9]$/.test(e.code)) {
+        e.preventDefault()
+        tn(Number(e.code.slice(5)))
+        return
+      }
+      if (e.shiftKey) return
       if (e.key >= '0' && e.key <= '9') {
         e.preventDefault()
         sc(Number(e.key))
@@ -164,15 +209,25 @@ export function LabelPage() {
       } else if (e.key === 'k') {
         e.preventDefault()
         setLabel('knobs', kn ? '' : '1')
+      } else if (e.key === 't') {
+        e.preventDefault()      // else the 't' lands in the box we just focused
+        tagInputRef.current?.focus()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [setLabel])
+  }, [setLabel, tagInputRef])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">
       <ScoreStrip row={row} onPick={score} onStar={star} />
+      <TagStrip
+        tags={row?.tags ?? []}
+        vocabulary={vocab?.tags ?? []}
+        onSet={applyTags}
+        inputRef={tagInputRef}
+        disabled={!row}
+      />
 
       <div className="relative flex min-h-0 flex-1 items-center justify-center">
         {isLoading ? (

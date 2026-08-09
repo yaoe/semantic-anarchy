@@ -73,6 +73,7 @@ export const DEFAULT_LABEL: Record<string, string> = {
   size: '',
   kind: '',
   sampler: '',
+  tag: '',             // aesthetic universe; '__none__' = not sorted into one
   since: '',           // unix seconds, '' = open-ended
   until: '',
   scope: 'unlabeled',
@@ -85,7 +86,7 @@ export const DEFAULT_LABEL: Record<string, string> = {
 
 /** Resetting the selection must not also reset how you like to look at it. */
 export const LABEL_FILTER_KEYS = [
-  'experiment', 'backend', 'ckpt', 'folder', 'size', 'kind', 'sampler',
+  'experiment', 'backend', 'ckpt', 'folder', 'size', 'kind', 'sampler', 'tag',
   'since', 'until',
 ] as const
 
@@ -105,6 +106,7 @@ export const DEFAULT_FIT: Record<string, string> = {
   size: '',
   kind: '',
   sampler: '',
+  tag: '',              // aesthetic universe; '__none__' = not sorted into one
   since: '',            // unix seconds, '' = open-ended
   until: '',
   starred: '',          // '1' = ★ only
@@ -119,7 +121,7 @@ export const DEFAULT_FIT: Record<string, string> = {
 
 /** Cleared by "clear filters"; `name`/`note`/`order` are not filters. */
 export const FIT_FILTER_KEYS = [
-  'experiment', 'backend', 'ckpt', 'folder', 'size', 'kind', 'sampler',
+  'experiment', 'backend', 'ckpt', 'folder', 'size', 'kind', 'sampler', 'tag',
   'since', 'until', 'starred', 'scored', 'minScore', 'maxScore',
 ] as const
 

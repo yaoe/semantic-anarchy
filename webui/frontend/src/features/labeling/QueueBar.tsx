@@ -2,7 +2,7 @@
  * Which images to label — the queue builder above the labeling page.
  *
  * Every control is an equality filter on something the image itself carries
- * (experiment, backend, checkpoint, folder, resolution, kind, sampler) plus a
+ * (experiment, backend, checkpoint, folder, resolution, kind, sampler, universe) plus a
  * time window on when it was rendered. The options come from
  * `/api/label/facets`, computed over the WHOLE labelable set with counts, so a
  * choice never makes another option disappear — how many images a given
@@ -26,6 +26,10 @@ const DIMS: { dim: FacetDim; label: string; any: string; width: number }[] = [
   { dim: 'folder', label: 'Folder', any: 'any folder', width: 150 },
   { dim: 'kind', label: 'Made by', any: 'any source', width: 140 },
   { dim: 'sampler', label: 'Sampler', any: 'any sampler', width: 140 },
+  // The one facet that isn't read off the image: an aesthetic universe is a
+  // human judgement kept in labels/tags.jsonl. Filtering it means "wears this
+  // tag", and `__none__` is "not sorted into a universe yet".
+  { dim: 'tag', label: 'Universe', any: 'any universe', width: 170 },
 ]
 
 const SCOPES = [
@@ -122,7 +126,13 @@ export function QueueBar({ queue }: { queue?: LabelQueue }) {
   // looking at, where "3 filters" would send you back in to find out.
   const active: string[] = [
     label.experiment === UNSET ? 'untagged' : label.experiment,
-    ...DIMS.map((d) => (label[d.dim] === UNSET ? `no ${d.dim}` : label[d.dim])),
+    ...DIMS.map((d) =>
+      label[d.dim] === UNSET
+        ? d.dim === 'tag'
+          ? 'no universe'
+          : `no ${d.dim}`
+        : label[d.dim],
+    ),
     activeWindow === 'all time' ? '' : activeWindow,
     label.scope === 'unlabeled' ? '' : label.scope,
     label.bucket === 'favorites' ? '★ only' : '',

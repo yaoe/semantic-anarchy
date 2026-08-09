@@ -24,6 +24,7 @@ export function useLabelSelection(): LabelQueryParams {
       size: label.size,
       kind: label.kind,
       sampler: label.sampler,
+      tag: label.tag,
       scope: (label.scope as LabelScope) || 'unlabeled',
       bucket: (label.bucket as LabelBucket) || 'generated',
       order: (label.order as LabelOrder) || 'shuffle',

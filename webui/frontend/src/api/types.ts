@@ -41,6 +41,8 @@ export interface ImageItem {
   dist: number | null
   nov: number | null
   res: number | null
+  /** Aesthetic universes, when it wears any (absent/null = untagged). */
+  tags?: string[] | null
 }
 
 /** Server-side buckets of /api/images (GALLERY_BUCKETS + the derived three). */
@@ -108,6 +110,13 @@ export type FacetDim =
   | 'size'
   | 'kind'
   | 'sampler'
+  /**
+   * The aesthetic universe an image was sorted into. Unlike every other facet
+   * this one is NOT read off the image's sidecar — it is a human judgement kept
+   * in labels/tags.jsonl — and it is set-valued, so filtering means "wears this
+   * tag" rather than "equals this value".
+   */
+  | 'tag'
 
 /** Server sentinel for "this image has no value on that dimension". */
 export const UNSET = '__none__'
@@ -134,6 +143,8 @@ export interface LabelRow {
   image_seed: number | null
   /** The sidecar knobs shown (collapsibly) beside the image. */
   knobs: Record<string, string | number | boolean>
+  /** Aesthetic universes this image wears; [] when it has been sorted nowhere. */
+  tags: string[]
 }
 
 /** What the queue may be narrowed to. */
@@ -183,10 +194,26 @@ export interface LabelFacets {
   total: number
   unlabeled: number
   favorites: number
+  /** How many labelable images currently wear at least one tag. */
+  tagged: number
   /** mtime bounds of the labelable set, for the time-window picker. */
   oldest: number | null
   newest: number | null
   facets: Record<FacetDim, FacetCell[]>
+}
+
+/** One tag in use, with how many images wear it. GET /api/tags. */
+export interface TagCell {
+  tag: string
+  count: number
+}
+
+/** GET /api/tags — the vocabulary, derived from what images actually wear. */
+export interface TagVocabulary {
+  tags: TagCell[]
+  tagged: number
+  records: number
+  file: string
 }
 
 /** labels.summarize() — deliberately tail-weighted. */

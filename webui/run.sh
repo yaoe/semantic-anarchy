@@ -16,13 +16,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Interpreter that has torch+diffusers (jobs run via this). Override with SA_PYTHON.
-# Prefer the repo's uv-managed .venv (torch 2.6 + diffusers 0.39 + transformers 5.x
-# with the torchvision-free CLIP fallback). Fall back to whatever python is on PATH
-# so an activated env still works if the .venv is absent.
+# Prefer a repo-local .venv if one is ever built here; otherwise use the shared
+# env this machine actually runs on (torch 2.11+cu128, diffusers 0.33.1) -- the
+# same default restart.sh hardcodes, so the two scripts agree. NOT a bare PATH
+# python3: that one has no fastapi, and app.py died on `import fastapi` several
+# lines after this script printed "bind = ...", which reads like a network fault.
+SHARED_PY="/home/dream/Desktop/AI/sdxl-travel-ablation/.venv/bin/python"
 if [[ -x "$REPO/.venv/bin/python" ]]; then
   DEFAULT_PY="$REPO/.venv/bin/python"
 else
-  DEFAULT_PY="$(command -v python3 || command -v python || true)"
+  DEFAULT_PY="$SHARED_PY"
 fi
 export SA_PYTHON="${SA_PYTHON:-$DEFAULT_PY}"
 
@@ -41,9 +44,10 @@ export SA_PORT="${SA_PORT:-8800}"
 
 # SD1.5 single-file checkpoint. Default points at a checkpoint that exists on
 # this machine; override with SA_SD15_CKPT to use a different one. A checkpoint
-# hand-picked in the dashboard's Model panel (config.json -> "models") wins over
+# hand-picked in the dashboard's Model panel (webui/model_config.json) wins over
 # this — this is only the fallback for a backend nothing has been picked for.
-export SA_SD15_CKPT="${SA_SD15_CKPT:-/home/rednax/SSD2TB/Github_repos/ComfyUI/models/checkpoints/SD15/juggernaut_reborn.safetensors}"
+export SA_SD15_CKPT="${SA_SD15_CKPT:-$HOME/models/v1-5-pruned-emaonly.safetensors}"
+export SA_SD2_CKPT="${SA_SD2_CKPT:-$HOME/models/v2-1_768-ema-pruned.safetensors}"
 
 echo "[run] repo      = $REPO"
 echo "[run] jobs py   = $SA_PYTHON"

@@ -924,6 +924,26 @@ class EmbeddingDistribution:
         )
 
     # --------------------------------------------------------------- io -------
+    @staticmethod
+    def _npz_path(path: str | Path) -> Path:
+        """``<prefix>`` -> ``<prefix>.npz``, idempotent and dot-safe.
+
+        NOT ``Path.with_suffix``: a fit tagged with the checkpoint that encoded
+        it can carry a dot mid-name (``corpus__…-xl-base-1.0_sdxl__pooled``),
+        whose "suffix" is ``.0_sdxl__pooled`` -- with_suffix would replace that,
+        silently rewriting the model slug out of the filename.
+        """
+        s = str(path)
+        return Path(s if s.endswith(".npz") else s + ".npz")
+
+    @staticmethod
+    def _meta_path(path: str | Path) -> Path:
+        """The ``.meta.json`` sibling of a fit (see :meth:`_npz_path`)."""
+        s = str(path)
+        if s.endswith(".npz"):
+            s = s[: -len(".npz")]
+        return Path(s + ".meta.json")
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -953,15 +973,13 @@ class EmbeddingDistribution:
             "has_radius_band": self.corpus_distance is not None,
             "noise_floor_axes": self.noise_floor_axes(),
         }
-        path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
+        self._meta_path(path).write_text(json.dumps(meta, indent=2))
 
     @classmethod
     def load(cls, path: str | Path) -> "EmbeddingDistribution":
-        path = Path(path)
-        if path.suffix != ".npz":
-            path = path.with_suffix(".npz")
+        path = cls._npz_path(path)
         data = np.load(path)
-        meta = json.loads(path.with_suffix(".meta.json").read_text())
+        meta = json.loads(cls._meta_path(path).read_text())
         return cls(
             mean=data["mean"],
             std=data["std"],

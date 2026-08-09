@@ -114,6 +114,22 @@ export function Card({
         <span className="truncate" title={im.rel}>
           {im.name}
         </span>
+        {/* Aesthetic universes, assigned on the 🏷 label page. Shown above the
+            numbers because it says what KIND of thing this is, which frames
+            every score under it. */}
+        {im.tags?.length ? (
+          <div className="flex flex-wrap gap-1">
+            {im.tags.map((t) => (
+              <span
+                key={t}
+                className="rounded-full border border-line2 px-1.5 py-px text-[10px] text-tag"
+                title={`aesthetic universe: ${t}`}
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
           {im.score != null ? (
             <span className="text-score" title="aesthetic score">

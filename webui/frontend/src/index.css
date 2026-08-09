@@ -28,6 +28,9 @@
   --color-link: #6fb3e0;
   --color-pez: #d4b96a;
   --color-native: #8fd48a;
+  /* aesthetic universe (🏷 tags) — cool and quiet, so a chip reads as a
+     CATEGORY beside the warm metric inks rather than competing with them */
+  --color-tag: #79c6c0;
   --color-danger: #d98a8a;
 
   --color-logbg: #07080b;

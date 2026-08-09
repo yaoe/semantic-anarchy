@@ -10,6 +10,7 @@ import type {
   DistKind,
   DistRow,
   EvolveRequest,
+  ExperimentRow,
   ExploreRequest,
   Film,
   FilmRequest,
@@ -20,14 +21,13 @@ import type {
   FitResponse,
   FsListing,
   GenPromptRequest,
-  ExperimentRow,
   ImageMeta,
   Images,
   InvertRequest,
   KeyframeRow,
   LabelFacets,
-  LabelQueue,
   LabelQueryParams,
+  LabelQueue,
   LabelStats,
   ModelConfig,
   ModelRow,
@@ -39,6 +39,8 @@ import type {
   RunResponse,
   SavedFit,
   StateSnapshot,
+  TagCell,
+  TagVocabulary,
   TasteBand,
   WipePreview,
   WipeResult,
@@ -162,6 +164,13 @@ export const api = {
     post<{ ok: boolean; rel: string; score: number; count: number }>('/api/label', {
       rel,
       score,
+    }),
+  tags: () => req<TagVocabulary>('/api/tags'),
+  /** Sets the COMPLETE tag set for an image — assign and un-assign are one call. */
+  setTags: (rel: string, tags: string[]) =>
+    post<{ ok: boolean; rel: string; tags: string[]; vocabulary: TagCell[] }>('/api/tag', {
+      rel,
+      tags,
     }),
 
   // ---- mutations on the library ----

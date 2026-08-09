@@ -55,6 +55,7 @@ function toQuery(fit: Record<string, string>): FitQueryParams {
     size: fit.size || undefined,
     kind: fit.kind || undefined,
     sampler: fit.sampler || undefined,
+    tag: fit.tag || undefined,
     starred: fit.starred === '1' || undefined,
     scored: (fit.scored as FitScored) || 'any',
     min_score: numOrNull(fit.minScore),
