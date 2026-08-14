@@ -1,8 +1,11 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 
-import type { TabKey } from '../../api/types'
+import { useTags } from '../../api/queries'
+import { UNSET, type TabKey } from '../../api/types'
 import { Segmented } from '../../components/ui/Segmented'
 import { Select } from '../../components/ui/Select'
+import type { Option } from '../../params/schema'
+import { cn } from '../../lib/utils'
 import { useUI, type SortKey } from '../../store'
 
 const TABS = [
@@ -34,12 +37,29 @@ const SORTS = [
   { value: 'res', label: 'resonance ↓' },
 ]
 
-/** Gallery tab strip + sort order + whatever action buttons are passed in. */
+/** Gallery tab strip + universe filter + sort order + any action buttons. */
 export function Filters({ actions }: { actions?: ReactNode }) {
   const tab = useUI((s) => s.tab)
   const setTab = useUI((s) => s.setTab)
   const sortBy = useUI((s) => s.sortBy)
   const setSortBy = useUI((s) => s.setSortBy)
+  const tagFilter = useUI((s) => s.tagFilter)
+  const setTagFilter = useUI((s) => s.setTagFilter)
+  const { data: vocab } = useTags()
+
+  // Counts are over the whole labelable set, not the current tab — the same
+  // convention the label page's facets use, so a universe never appears to
+  // vanish just because you are looking at ★ Favorites.
+  const tagOptions: Option[] = useMemo(() => {
+    const opts: Option[] = [{ value: '', label: 'any universe' }]
+    for (const t of vocab?.tags ?? []) {
+      opts.push({ value: t.tag, label: `${t.tag} (${t.count})`, title: `${t.count} images overall` })
+    }
+    if (vocab?.tags?.length) {
+      opts.push({ value: UNSET, label: 'untagged', title: 'not sorted into a universe yet' })
+    }
+    return opts
+  }, [vocab])
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -50,6 +70,16 @@ export function Filters({ actions }: { actions?: ReactNode }) {
         grow={false}
         itemClassName="!py-[5px] !text-[12px]"
       />
+      {!UNSORTED.includes(tab) && tagOptions.length > 1 ? (
+        <Select
+          value={tagFilter}
+          onChange={setTagFilter}
+          options={tagOptions}
+          ariaLabel="filter by aesthetic universe"
+          title="filter by aesthetic universe (🏷 tags)"
+          className="ml-auto !w-[190px] !py-[5px] !text-[12px]"
+        />
+      ) : null}
       {!UNSORTED.includes(tab) ? (
         <Select
           value={sortBy}
@@ -57,7 +87,10 @@ export function Filters({ actions }: { actions?: ReactNode }) {
           options={SORTS}
           ariaLabel="gallery order"
           title="gallery order"
-          className="ml-auto !w-[150px] !py-[5px] !text-[12px]"
+          className={cn(
+            '!w-[150px] !py-[5px] !text-[12px]',
+            tagOptions.length > 1 ? '' : 'ml-auto',
+          )}
         />
       ) : (
         <span className="ml-auto" />

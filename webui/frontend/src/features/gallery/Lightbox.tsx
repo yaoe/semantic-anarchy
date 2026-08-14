@@ -1,11 +1,25 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 
-import { qk, useGenPrompt, useInvert, useJobWatcher, useMeta } from '../../api/queries'
-import type { ImageItem, ImageMeta } from '../../api/types'
-import { imgSrc } from '../../lib/utils'
+import {
+  qk,
+  useAnimate,
+  useFavorite,
+  useGenPrompt,
+  useInvert,
+  useJobWatcher,
+  useMeta,
+  useScoreImage,
+  useTagImage,
+  useTags,
+} from '../../api/queries'
+import type { ImageItem, ImageMeta, MotionLora } from '../../api/types'
+import { imgSrc, numOr } from '../../lib/utils'
+import { ANIM_DENOISE, ANIM_MAX_FRAMES, WAN_FRAMES } from '../animate/AnimateBar'
 import { useUI } from '../../store'
+import { ScoreStrip } from '../labeling/ScoreStrip'
+import { TagStrip } from '../labeling/TagStrip'
 
 /** Field order of the param dump, copied from the legacy PARAM_ORDER. */
 const PARAM_ORDER = [
@@ -104,20 +118,127 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   const genprompt = useGenPrompt()
   const watch = useJobWatcher()
 
+  // The judgement comes from /api/meta rather than the gallery row, because a
+  // parent link can pin an image that isn't in the current view at all -- and
+  // toggling a universe needs the CURRENT set, not an empty fallback.
+  const { data: vocab } = useTags(open)
+  const tools = useUI((s) => s.tools)
+  const animate = useAnimate()
+  const favorite = useFavorite()
+  const scoreImage = useScoreImage()
+  const tagImage = useTagImage()
+  const tagInputRef = useRef<HTMLInputElement>(null)
+  const labelScore = meta?.label_score ?? null
+  const labelTags = meta?.label_tags ?? []
+  const fav = item?.fav ?? false
+
+  const pickScore = useCallback(
+    (n: number) => {
+      if (rel) scoreImage.mutate({ rel, score: n })
+    },
+    [rel, scoreImage],
+  )
+  const toggleStar = useCallback(() => {
+    if (rel) favorite.mutate({ rel, on: !fav })
+  }, [rel, fav, favorite])
+  const applyTags = useCallback(
+    (tags: string[]) => {
+      if (rel) tagImage.mutate({ rel, tags })
+    },
+    [rel, tagImage],
+  )
+
+  // Held in refs for the same reason the label page does it: the listener is
+  // attached once per open, not re-bound on every score or cursor move.
+  const scoreRef = useRef(pickScore)
+  const starRef = useRef(toggleStar)
+  const tagRef = useRef(applyTags)
+  const tagsRef = useRef(labelTags)
+  const vocabRef = useRef(vocab?.tags)
+  scoreRef.current = pickScore
+  starRef.current = toggleStar
+  tagRef.current = applyTags
+  tagsRef.current = labelTags
+  vocabRef.current = vocab?.tags
+
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
+      // Typing a universe name must not score the image or flip to the next one.
+      const t = e.target as HTMLElement | null
+      if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      // Same bindings as the 🏷 label page, so the judgement is muscle memory
+      // wherever it is made: shift+<n> is a universe, a bare digit is a score.
+      if (e.shiftKey && /^Digit[1-9]$/.test(e.code)) {
+        e.preventDefault()
+        const cell = vocabRef.current?.[Number(e.code.slice(5)) - 1]
+        const worn = tagsRef.current
+        if (cell) {
+          const on = worn.some((x) => x.toLocaleLowerCase() === cell.tag.toLocaleLowerCase())
+          tagRef.current(
+            on
+              ? worn.filter((x) => x.toLocaleLowerCase() !== cell.tag.toLocaleLowerCase())
+              : [...worn, cell.tag],
+          )
+        }
+        return
+      }
+      if (e.shiftKey) return
       if (e.key === 'ArrowLeft') {
         e.preventDefault()
         move(-1, items.length)
       } else if (e.key === 'ArrowRight') {
         e.preventDefault()
         move(1, items.length)
+      } else if (e.key >= '0' && e.key <= '9') {
+        e.preventDefault()
+        scoreRef.current(Number(e.key))
+      } else if (e.key === 's') {
+        e.preventDefault()
+        starRef.current()
+      } else if (e.key === 't') {
+        e.preventDefault()      // else the 't' lands in the box we just focused
+        tagInputRef.current?.focus()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open, items.length, move])
+
+  const wanEngine = tools.anEngine === 'wan'
+  const doAnimate = () => {
+    if (!rel) return
+    animate.mutate(
+      wanEngine
+        ? {
+            src: rel,
+            engine: 'wan',
+            wan_model: (tools.wnModel || '2.2-a14b') as '2.2-a14b' | '2.1-14b',
+            frames: numOr(tools.wnFrames, WAN_FRAMES),
+            // blank = the engine's own default (6 with Lightning, 30 without)
+            steps: (tools.wnSteps ?? '').trim() === '' ? null : Number(tools.wnSteps),
+            lightning: tools.wnLightning === '1',
+            size: (tools.wnSize ?? '').trim() === '' ? null : Number(tools.wnSize),
+            quant: (tools.wnQuant || 'nf4') as 'nf4' | 'fp8',
+            guidance: numOr(tools.wnGuidance, 1),
+            prompt: (tools.wnPrompt ?? '').trim() || null,
+            seed: (tools.wnSeed ?? '').trim() === '' ? null : Number(tools.wnSeed),
+            smooth_fps: numOr(tools.anSmooth, 0),
+          }
+        : {
+            src: rel,
+            engine: 'animatediff',
+            strength: tools.anSource === 'cond' ? 0 : numOr(tools.anDenoise, ANIM_DENOISE),
+            frames: numOr(tools.anFrames, ANIM_MAX_FRAMES),
+            smooth_fps: numOr(tools.anSmooth, 0),
+            motion_lora: (tools.anLora || 'none') as MotionLora,
+            prompt: (tools.anPrompt ?? '').trim() || null,
+            // Pixels mode truncates the denoise schedule; FreeInit needs all of it.
+            free_init: tools.anSource === 'cond' ? numOr(tools.anFreeInit, 0) : 0,
+          },
+    )
+  }
 
   const runInvert = (space: 'clip' | 'native') => {
     if (!rel) return
@@ -192,10 +313,31 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
                        bg-logbg/[.92] px-4 py-2.5 font-mono text-[12px] leading-[1.6] text-[#cfd3dc]"
             onClick={(e) => e.stopPropagation()}
           >
+            {/* Judge without leaving the gallery: the same strips the 🏷 label
+                page uses, on the same keys. */}
+            <div className="mb-2 flex flex-col gap-2 font-sans">
+              <ScoreStrip
+                score={labelScore}
+                fav={fav}
+                onPick={pickScore}
+                onStar={toggleStar}
+                disabled={!rel}
+              />
+              <TagStrip
+                tags={labelTags}
+                vocabulary={vocab?.tags ?? []}
+                onSet={applyTags}
+                inputRef={tagInputRef}
+                disabled={!rel}
+              />
+            </div>
+
             <div className="mb-1 text-run">
               {rel}
               {score != null ? (
-                <span className="ml-2.5 text-score">aesthetic {score.toFixed(2)}</span>
+                <span className="ml-2.5 text-score" title="LAION aesthetic model">
+                  aesthetic {score.toFixed(2)}
+                </span>
               ) : null}
             </div>
 
@@ -223,6 +365,20 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
             {/* discovered hard prompts (PEZ / native inversion) + timeline */}
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              {rel && (wanEngine ? /anarchy_/.test(rel) : /anarchy_(sd15|sd2)_/.test(rel)) ? (
+                <button
+                  className="sa-btn sa-btn-sm"
+                  title={
+                    wanEngine
+                      ? 'animate with Wan 2.1 (minutes) — lands in the 🎞 Films tab'
+                      : 'animate with AnimateDiff (~20s) — lands in the 🎞 Films tab'
+                  }
+                  disabled={animate.isPending}
+                  onClick={doAnimate}
+                >
+                  🎥 animate{wanEngine ? ' (Wan)' : ''}
+                </button>
+              ) : null}
               {rel && /anarchy_/.test(rel) ? (
                 <button
                   className="sa-btn sa-btn-sm"

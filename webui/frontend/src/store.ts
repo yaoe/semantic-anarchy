@@ -33,6 +33,27 @@ export const DEFAULT_TOOLS: Record<string, string> = {
   exRadius: '',
   exN: '',
   wkStep: '',
+  // 🎥 Animate (AnimateDiff). 'pixels' starts from the image you can see, which
+  // is what keeps a flux upscale's enhancement; 'cond' re-renders the off-grid
+  // coordinate itself in motion.
+  anEngine: 'animatediff',
+  anSource: 'pixels',
+  anDenoise: '0.6',
+  anFrames: '16',
+  anSmooth: '24',
+  anLora: 'none',
+  anPrompt: '',          // text to drive the motion ('' = the image's own conditioning)
+  anFreeInit: '0',       // FreeInit iterations; 3 steadies boiling frames at 3x cost
+  // wan: its own frame count and steps, so switching engines doesn't clobber
+  // AnimateDiff's numbers (16 frames means something different to each).
+  wnModel: '2.2-a14b',
+  wnFrames: '49',
+  wnSteps: '',          // '' = the engine's own default (6 lightning / 30 not)
+  wnLightning: '1',     // step-distillation LoRA: faster AND closer to source
+  wnSize: '',           // '' = Wan's own rule (square -> 640); 768 = keep yours
+  wnGuidance: '1',      // 1 = CFG off. Higher needs a CONTENT prompt to aim at
+  wnSeed: '',           // '' = fresh random each run
+  wnQuant: 'nf4',       // fp8 = the reference precision, at the cost of swapping
 }
 
 /**
@@ -179,6 +200,9 @@ interface UIState {
 
   sortBy: SortKey
   setSortBy: (s: SortKey) => void
+  /** Gallery tag filter: '' = any universe, '__none__' = untagged, else the tag. */
+  tagFilter: string
+  setTagFilter: (t: string) => void
 
   /** -1 = closed. Indexes into the gallery's current (sorted) view. */
   lightboxIndex: number
@@ -201,6 +225,7 @@ const partialize = (s: UIState) => ({
   tools: s.tools,
   tab: s.tab,
   sortBy: s.sortBy,
+  tagFilter: s.tagFilter,
   logCollapsed: s.logCollapsed,
   timeline: s.timeline,
   film: s.film,
@@ -306,6 +331,8 @@ export const useUI = create<UIState>()(
 
       sortBy: 'new',
       setSortBy: (sortBy) => set({ sortBy }),
+      tagFilter: '',
+      setTagFilter: (tagFilter) => set({ tagFilter }),
 
       lightboxIndex: -1,
       openLightbox: (i) => set({ lightboxIndex: i }),

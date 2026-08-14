@@ -24,76 +24,11 @@ import {
   useTags,
 } from '../../api/queries'
 import type { LabelRow } from '../../api/types'
-import { cn, imgSrc } from '../../lib/utils'
+import { imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
+import { ScoreStrip } from './ScoreStrip'
 import { useLabelSelection } from './selection'
 import { TagStrip } from './TagStrip'
-
-/** Score → ink, so a past call reads at a glance without being read. */
-function scoreTone(s: number): string {
-  if (s >= 7) return 'text-score'
-  if (s >= 4) return 'text-dim'
-  return 'text-danger'
-}
-
-/**
- * The 0–9 strip, spread across the full width directly above the image: the
- * hand and the eye stay in the same place, and each target is wide enough to
- * hit without aiming. Clickable for the mouse, but the keyboard is the point.
- */
-function ScoreStrip({
-  row,
-  onPick,
-  onStar,
-}: {
-  row?: LabelRow
-  onPick: (s: number) => void
-  onStar: () => void
-}) {
-  return (
-    <div className="flex shrink-0 items-stretch gap-2">
-      <div className="grid flex-1 grid-cols-10 gap-2">
-        {Array.from({ length: 10 }, (_, s) => (
-          <button
-            key={s}
-            disabled={!row}
-            onClick={() => onPick(s)}
-            title={`score ${s}`}
-            className={cn(
-              'h-9 rounded-md border text-[14px] tabular-nums transition-colors',
-              'disabled:opacity-40',
-              row?.score === s
-                ? 'border-accent bg-accent text-white'
-                : 'border-line bg-panel2 text-ink hover:border-line2',
-            )}
-          >
-            {s}
-          </button>
-        ))}
-      </div>
-      {row?.score != null ? (
-        <span
-          className={cn(
-            'flex w-[84px] items-center justify-center text-[12px] tabular-nums',
-            scoreTone(row.score),
-          )}
-        >
-          scored {row.score}
-        </span>
-      ) : (
-        <span className="w-[84px]" />
-      )}
-      <button
-        className={cn('sa-btn w-[104px] !py-0 text-[13px]', row?.fav && 'sa-btn-sel')}
-        disabled={!row}
-        onClick={onStar}
-        title="star (s) — keeps the existing taste loop fed"
-      >
-        {row?.fav ? '★ starred' : '☆ star'}
-      </button>
-    </div>
-  )
-}
 
 export function LabelPage() {
   const label = useUI((s) => s.label)
@@ -220,7 +155,13 @@ export function LabelPage() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">
-      <ScoreStrip row={row} onPick={score} onStar={star} />
+      <ScoreStrip
+        score={row?.score ?? null}
+        fav={!!row?.fav}
+        onPick={score}
+        onStar={star}
+        disabled={!row}
+      />
       <TagStrip
         tags={row?.tags ?? []}
         vocabulary={vocab?.tags ?? []}

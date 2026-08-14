@@ -30,7 +30,7 @@ import {
   useSetDist,
 } from '../../api/queries'
 import type { BackendId, FitCandidate, FitOrder, FitQueryParams, FitScored } from '../../api/types'
-import { cn, imgSrc } from '../../lib/utils'
+import { backendOf, cn, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
 import { FitFilters } from './FitFilters'
 import { SavedFits } from './SavedFits'
@@ -149,6 +149,25 @@ export function FitPage() {
   const rows = useMemo(() => data?.rows ?? [], [data])
   const byRel = useMemo(() => new Map(rows.map((r) => [r.rel, r])), [rows])
   const picked = useMemo(() => new Set(sel), [sel])
+
+  /**
+   * The selection, split by the model that made each image.
+   *
+   * A fit is PER BACKEND -- sd15 conditioning is (77, 768) and sdxl's is
+   * (77, 2048) plus a pooled vector, so one distribution cannot span both. The
+   * server refuses a mixed selection, but by then you have already built it;
+   * this is the same fact shown while you are choosing.
+   */
+  const byBackend = useMemo(() => {
+    const m = new Map<string, string[]>()
+    for (const rel of sel) {
+      const b = backendOf(rel) ?? 'unknown'
+      m.set(b, [...(m.get(b) ?? []), rel])
+    }
+    return m
+  }, [sel])
+  const mixed = byBackend.size > 1
+  const keepOnly = (b: string) => removeSel(sel.filter((r) => (backendOf(r) ?? 'unknown') !== b))
   const shownMatching = rows.map((r) => r.rel)
   const allMatchingPicked = shownMatching.length > 0 && shownMatching.every((r) => picked.has(r))
 
@@ -276,21 +295,63 @@ export function FitPage() {
           />
           <button
             className={cn('sa-btn', conflict ? 'border-err text-danger' : 'sa-btn-sel')}
-            disabled={busy || tooFew}
+            disabled={busy || tooFew || mixed}
             onClick={() => submit(conflict)}
             title={
-              tooFew
-                ? `select at least ${MIN_SAMPLES} images`
-                : 'fit a distribution to these latents (no GPU — a few seconds)'
+              mixed
+                ? 'the selection mixes models — a distribution is per backend'
+                : tooFew
+                  ? `select at least ${MIN_SAMPLES} images`
+                  : 'fit a distribution to these latents (no GPU — a few seconds)'
             }
           >
             {fitting != null
               ? `fitting… #${fitting}`
-              : conflict
-                ? '↻ Overwrite that fit?'
-                : `🧬 Fit latent distribution on ${sel.length} selected sample${sel.length === 1 ? '' : 's'}`}
+              : mixed
+                ? '🧬 one model at a time'
+                : conflict
+                  ? '↻ Overwrite that fit?'
+                  : `🧬 Fit latent distribution on ${sel.length} selected sample${sel.length === 1 ? '' : 's'}`}
           </button>
         </div>
+
+        {sel.length ? (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px]">
+            <span className="text-dim">selection:</span>
+            {[...byBackend.entries()].map(([b, rels]) => (
+              <span
+                key={b}
+                className={cn(
+                  'rounded-full border px-2 py-px',
+                  mixed ? 'border-err text-danger' : 'border-line2 text-ink',
+                )}
+                title={`${rels.length} image${rels.length === 1 ? '' : 's'} from ${b}`}
+              >
+                {b} × {rels.length}
+              </span>
+            ))}
+            {mixed
+              ? [...byBackend.keys()].map((b) => (
+                  <button
+                    key={b}
+                    className="sa-btn sa-btn-sm"
+                    onClick={() => keepOnly(b)}
+                    title={`drop everything that isn't ${b} from the selection`}
+                  >
+                    keep only {b}
+                  </button>
+                ))
+              : null}
+          </div>
+        ) : null}
+
+        {mixed ? (
+          <p className="sa-hint text-err">
+            a fit is per model: sd15 conditioning is (77, 768) where sdxl's is
+            (77, 2048) plus a pooled vector, so one distribution cannot span both.
+            Keep one model above — or use the Backend filter to browse them apart.
+          </p>
+        ) : null}
 
         <p className="sa-hint">
           {tooFew ? (
@@ -341,20 +402,55 @@ export function FitPage() {
         </p>
       ) : (
         <>
-          <div
-            className="grid gap-2"
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))' }}
-          >
-            {gallery.map((rel) => (
-              <Tile
-                key={rel}
-                rel={rel}
-                row={byRel.get(rel)}
-                picked={picked.has(rel)}
-                onToggle={() => toggleSel(rel)}
-              />
-            ))}
-          </div>
+          {view === 'selected' ? (
+            // Grouped by model, because that is the axis along which the
+            // selection is either usable or not.
+            [...byBackend.entries()].map(([b, rels]) => (
+              <div key={b} className="mb-3">
+                <div className="mb-1.5 flex items-center gap-2 text-[12px] text-dim">
+                  <span className="text-ink">{b}</span>
+                  <span>
+                    {rels.length} image{rels.length === 1 ? '' : 's'}
+                  </span>
+                  {mixed ? (
+                    <button className="sa-btn sa-btn-sm" onClick={() => keepOnly(b)}>
+                      keep only this
+                    </button>
+                  ) : null}
+                  <span className="h-px flex-1 bg-line" />
+                </div>
+                <div
+                  className="grid gap-2"
+                  style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))' }}
+                >
+                  {rels.map((rel) => (
+                    <Tile
+                      key={rel}
+                      rel={rel}
+                      row={byRel.get(rel)}
+                      picked={picked.has(rel)}
+                      onToggle={() => toggleSel(rel)}
+                    />
+                  ))}
+                </div>
+              </div>
+            ))
+          ) : (
+            <div
+              className="grid gap-2"
+              style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(112px, 1fr))' }}
+            >
+              {gallery.map((rel) => (
+                <Tile
+                  key={rel}
+                  rel={rel}
+                  row={byRel.get(rel)}
+                  picked={picked.has(rel)}
+                  onToggle={() => toggleSel(rel)}
+                />
+              ))}
+            </div>
+          )}
           {view === 'matching' && (data?.total ?? 0) > rows.length ? (
             <p className="text-center text-[12px] text-dim">
               showing the first {rows.length} of {data?.total} matches — “select all”

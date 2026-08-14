@@ -1,11 +1,9 @@
-import { useExplore, useFavorite, useRefine } from '../../api/queries'
-import type { ImageItem } from '../../api/types'
-import { cn, fmtSize, imgSrc } from '../../lib/utils'
+import { useAnimate, useExplore, useFavorite, useRefine } from '../../api/queries'
+import type { ImageItem, MotionLora } from '../../api/types'
+import { cn, fmtSize, imgSrc, numOr } from '../../lib/utils'
 import { useUI } from '../../store'
+import { ANIM_DENOISE, ANIM_MAX_FRAMES, WAN_FRAMES } from '../animate/AnimateBar'
 import { HIRES_DENOISE, HIRES_FACTOR, refinePromptFor } from '../refine/RefineBar'
-
-const numOr = (v: string | undefined, dflt: number) =>
-  (v ?? '').trim() === '' ? dflt : Number(v)
 
 /**
  * One gallery tile: the image, its metrics, and the per-image actions
@@ -35,6 +33,7 @@ export function Card({
   const favorite = useFavorite()
   const refine = useRefine()
   const explore = useExplore()
+  const animate = useAnimate()
 
   const isAnarchy = im.name.startsWith('anarchy_')
   const n = numOr(tools.exN, 6)
@@ -62,6 +61,43 @@ export function Card({
       prompt: refinePromptFor(tools),
     })
   }
+
+  // AnimateDiff rides the SD1.5 UNet, so it needs an sd15/sd2 source (an
+  // upscale of one qualifies — the server follows the refine chain back to the
+  // conditioning). Wan only reads pixels, so anything goes.
+  const wan = tools.anEngine === 'wan'
+  const animatable = wan || /anarchy_(sd15|sd2)_/.test(im.name)
+
+  const doAnimate = () =>
+    animate.mutate(
+      wan
+        ? {
+            src: im.rel,
+            engine: 'wan',
+            wan_model: (tools.wnModel || '2.2-a14b') as '2.2-a14b' | '2.1-14b',
+            frames: numOr(tools.wnFrames, WAN_FRAMES),
+            // blank = the engine's own default (6 with Lightning, 30 without)
+            steps: (tools.wnSteps ?? '').trim() === '' ? null : Number(tools.wnSteps),
+            lightning: tools.wnLightning === '1',
+            size: (tools.wnSize ?? '').trim() === '' ? null : Number(tools.wnSize),
+            quant: (tools.wnQuant || 'nf4') as 'nf4' | 'fp8',
+            guidance: numOr(tools.wnGuidance, 1),
+            prompt: (tools.wnPrompt ?? '').trim() || null,
+            seed: (tools.wnSeed ?? '').trim() === '' ? null : Number(tools.wnSeed),
+            smooth_fps: numOr(tools.anSmooth, 0),
+          }
+        : {
+            src: im.rel,
+            engine: 'animatediff',
+            strength: tools.anSource === 'cond' ? 0 : numOr(tools.anDenoise, ANIM_DENOISE),
+            frames: numOr(tools.anFrames, ANIM_MAX_FRAMES),
+            smooth_fps: numOr(tools.anSmooth, 0),
+            motion_lora: (tools.anLora || 'none') as MotionLora,
+            prompt: (tools.anPrompt ?? '').trim() || null,
+            // Pixels mode truncates the denoise schedule; FreeInit needs all of it.
+            free_init: tools.anSource === 'cond' ? numOr(tools.anFreeInit, 0) : 0,
+          },
+    )
 
   const doExplore = () =>
     explore.mutate({
@@ -131,8 +167,16 @@ export function Card({
           </div>
         ) : null}
         <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+          {im.label != null ? (
+            <span
+              className="rounded border border-line2 px-1 tabular-nums text-ink"
+              title="your label (0–9) — open the image to change it"
+            >
+              {im.label}
+            </span>
+          ) : null}
           {im.score != null ? (
-            <span className="text-score" title="aesthetic score">
+            <span className="text-score" title="LAION aesthetic score (not your label)">
               {im.score.toFixed(2)}
             </span>
           ) : null}
@@ -179,6 +223,20 @@ export function Card({
               >
                 🚶
               </button>
+              {animatable ? (
+                <button
+                  className="sa-btn sa-btn-sm"
+                  title={
+                    wan
+                      ? 'animate with Wan 2.1 (minutes) — result lands in 🎞 Films'
+                      : 'animate with AnimateDiff (~20s) — result lands in 🎞 Films'
+                  }
+                  disabled={animate.isPending}
+                  onClick={doAnimate}
+                >
+                  🎥
+                </button>
+              ) : null}
               <button
                 className={cn('sa-btn sa-btn-sm', inTimeline > 0 && 'border-run text-run')}
                 title="add as a keyframe to the 🎬 Timeline"

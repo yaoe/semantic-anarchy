@@ -9,8 +9,11 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tansta
 
 import { api } from './client'
 import type {
+  AnimateRequest,
   BackendId,
   DistKind,
+  ImageMeta,
+  Images,
   EvolveRequest,
   ExploreRequest,
   FilmRequest,
@@ -209,6 +212,84 @@ export function useSetTags(key: LabelQueryParams) {
       // The gallery shows tag chips too, but it is a different (and much
       // heavier) query — let it pick them up on its own poll rather than
       // refetching 10k rows for one chip.
+    },
+  })
+}
+
+/**
+ * Score an image from the GALLERY (the lightbox), as opposed to the label
+ * queue. Same endpoint, different cache to keep in step: the gallery's rows
+ * carry `label`, and /api/meta carries `label_score` for whatever the lightbox
+ * has pinned — both are patched in place so the judgement shows instantly
+ * without refetching ten thousand rows.
+ */
+export function useScoreImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, score }: { rel: string; score: number }) => api.label(rel, score),
+    onMutate: async ({ rel, score }) => {
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, items]) => [
+                k,
+                items.map((it) => (it.rel === rel ? { ...it, label: score } : it)),
+              ]),
+            ) as Images)
+          : old,
+      )
+      qc.setQueryData<ImageMeta>(qk.meta(rel), (old) =>
+        old ? { ...old, label_score: score } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.labelStats })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/** Tag an image from the gallery. Sends the whole set, like `useSetTags`. */
+export function useTagImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, tags }: { rel: string; tags: string[] }) => api.setTags(rel, tags),
+    onMutate: async ({ rel, tags }) => {
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, items]) => [
+                k,
+                items.map((it) => (it.rel === rel ? { ...it, tags } : it)),
+              ]),
+            ) as Images)
+          : old,
+      )
+      qc.setQueryData<ImageMeta>(qk.meta(rel), (old) =>
+        old ? { ...old, label_tags: tags } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.tags })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/**
+ * Animate one image (AnimateDiff). Queued like every other GPU action, so it
+ * takes its turn behind whatever is running rather than fighting it for VRAM.
+ * The result lands in outputs/films/, which is why this refreshes the film list
+ * rather than the gallery.
+ */
+export function useAnimate() {
+  const qc = useQueryClient()
+  const watch = useJobWatcher()
+  return useMutation({
+    mutationFn: (body: AnimateRequest) => api.animate(body),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: qk.state })
+      watch(r.job_id, () => qc.invalidateQueries({ queryKey: qk.films }))
     },
   })
 }

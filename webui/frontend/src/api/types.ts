@@ -37,7 +37,10 @@ export interface ImageItem {
   mtime: number
   size: number
   fav: boolean
+  /** The LAION aesthetic model's guess — NOT your label (see `label`). */
   score: number | null
+  /** Your own 0–9 call from labels.jsonl, or null when unjudged. */
+  label?: number | null
   dist: number | null
   nov: number | null
   res: number | null
@@ -405,6 +408,42 @@ export interface FitQueryParams extends Partial<Record<FacetDim, string>> {
   limit?: number
 }
 
+/** Camera moves AnimateDiff can layer on the motion module. */
+export type MotionLora =
+  | 'none' | 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right'
+  | 'tilt-up' | 'tilt-down' | 'roll-cw' | 'roll-ccw'
+
+export type AnimateEngine = 'animatediff' | 'wan'
+
+/** POST /api/animate — one image, brought to life. */
+export interface AnimateRequest {
+  src: string
+  engine?: AnimateEngine
+  /** 0 = animate the CONDITIONING; >0 = img2img the PIXELS at this denoise. */
+  strength?: number | null
+  frames?: number
+  fps?: number
+  smooth_fps?: number
+  motion_lora?: MotionLora
+  max_side?: number
+  /** AnimateDiff: text instead of the image's own conditioning. */
+  prompt_from?: 'none' | 'pez' | 'native'
+  free_init?: number
+  /** wan only */
+  wan_model?: '2.2-a14b' | '2.1-14b'
+  steps?: number | null
+  guidance?: number | null
+  prompt?: string | null
+  /** wan: step-distillation LoRA — 6 steps instead of 30. */
+  lightning?: boolean
+  /** wan: render size; matching the source's own size removes the resample. */
+  size?: number | null
+  /** wan: 'nf4' (4-bit) or 'fp8' (8-bit, the reference precision, slower). */
+  quant?: 'nf4' | 'fp8'
+  /** Omit for a fresh random seed per clip; pin to reproduce or A/B. */
+  seed?: number | null
+}
+
 /** One saved fit under outputs/dist_fits (GET /api/fit/list). */
 export interface SavedFit {
   name: string
@@ -617,6 +656,10 @@ export interface WipeResult {
  * named; the index signature keeps the rest addressable for the param dump.
  */
 export interface ImageMeta {
+  /** The human judgement, merged in by /api/meta so the lightbox can show and
+   *  change it even for an image that is not in the current gallery view. */
+  label_score?: number | null
+  label_tags?: string[]
   kind?: string
   mode?: string
   parent?: string

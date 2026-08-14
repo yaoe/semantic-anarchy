@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 
-import { useJobState, useRefreshOnJobFinish } from './api/queries'
+import { useCancel, useJobState, useRefreshOnJobFinish } from './api/queries'
 import type { TabKey } from './api/types'
 import { Gallery } from './features/gallery/Gallery'
 import { Filters } from './features/gallery/Filters'
@@ -11,6 +11,7 @@ import { JobLog } from './features/jobs/JobLog'
 import { LabelLink } from './features/labeling/LabelLink'
 import { StatusDot } from './features/jobs/StatusDot'
 import { ExploreBar } from './features/refine/ExploreBar'
+import { AnimateBar } from './features/animate/AnimateBar'
 import { RefineBar } from './features/refine/RefineBar'
 import { AnalyzeBar } from './features/taste/AnalyzeBar'
 import { FitLink } from './features/fit/FitLink'
@@ -42,6 +43,7 @@ export default function App() {
   const job = jobs.find((j) => j.id === selectedJob)
 
   const running = busy ? jobs.find((j) => j.id === state?.running) : undefined
+  const cancel = useCancel()
 
   return (
     <div className="flex h-full flex-col">
@@ -81,6 +83,19 @@ export default function App() {
                   {fmtDuration(running.started, running.ended)}
                 </span>
               ) : null}
+              {/* The queue is one job at a time, so "stop the running one" is
+                  the only stop anyone means. It lives up here rather than only
+                  in the sidebar list because a Wan clip is a seven-minute
+                  commitment and you decide to abandon it while looking at the
+                  gallery, not at the job cards. */}
+              <button
+                className="sa-btn sa-btn-sm shrink-0 border-err !py-0 text-danger"
+                disabled={cancel.isPending}
+                title={`stop job #${state?.running} (SIGTERM, then SIGKILL if it ignores it)`}
+                onClick={() => state?.running != null && cancel.mutate(state.running)}
+              >
+                ⏹ Stop
+              </button>
             </>
           ) : (
             'idle'
@@ -138,6 +153,8 @@ export default function App() {
           {ACTIONABLE.includes(tab) ? (
             <div className="sa-panel flex shrink-0 flex-wrap items-end gap-2.5 px-3 py-2.5">
               <RefineBar />
+              <div className="self-stretch border-l border-line" />
+              <AnimateBar />
               <div className="self-stretch border-l border-line" />
               <ExploreBar />
             </div>

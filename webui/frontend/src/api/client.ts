@@ -4,6 +4,7 @@
  * to show.
  */
 import type {
+  AnimateRequest,
   BackendId,
   Config,
   DistConfig,
@@ -176,6 +177,8 @@ export const api = {
   // ---- mutations on the library ----
   favorite: (rel: string, on: boolean) =>
     post<{ ok: boolean; fav: boolean; count: number }>('/api/favorite', { rel, on }),
+  animate: (body: AnimateRequest) =>
+    post<{ job_id: number; label: string; name: string }>('/api/animate', body),
   wipe: () => post<WipeResult>('/api/wipe'),
   deleteFilm: (dir: string) => post<{ deleted: string }>('/api/films/delete', { dir }),
 }

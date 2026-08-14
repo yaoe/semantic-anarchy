@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
 import time
@@ -35,6 +34,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from semantic_anarchy.video import pick_h264_encoder  # noqa: E402
 from semantic_anarchy.io_utils import (  # noqa: E402
     IMAGE_EXTS, image_ext, save_image,
 )
@@ -77,45 +77,6 @@ FAITHFUL_PROMPT = (
     "there; if the original is a photograph, render or digital image, keep it "
     "exactly that. Only render the existing image crisper, with finer, native "
     "detail true to its original medium.")
-
-
-def pick_h264_encoder(crf: int) -> tuple[str, list[str]]:
-    """Find an ffmpeg that can actually write H.264, and the flags to do it.
-
-    ``libx264`` is the target, but a conda ffmpeg early on PATH is often built
-    ``--disable-gpl`` and has no x264 at all -- so probe every ffmpeg we can
-    reach and fall back to another H.264 encoder (openh264 / NVENC) rather than
-    dying after a full render. ``SA_FFMPEG`` pins a specific binary.
-    """
-    import os
-
-    cands = [os.environ.get("SA_FFMPEG"), shutil.which("ffmpeg"),
-             "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-    seen, fallback = set(), None
-    for c in cands:
-        if not c or c in seen or not Path(c).is_file():
-            continue
-        seen.add(c)
-        try:
-            enc = subprocess.run([c, "-hide_banner", "-encoders"],
-                                 capture_output=True, text=True, timeout=30).stdout
-        except Exception:                                      # noqa: BLE001
-            continue
-        if "libx264" in enc:
-            return c, ["-c:v", "libx264", "-preset", "slow", "-crf", str(crf)]
-        if fallback is None and "libopenh264" in enc:
-            # No CRF mode in openh264; ~12 Mbit keeps 512-1024px frames clean.
-            fallback = (c, ["-c:v", "libopenh264", "-b:v", "12M"])
-        if fallback is None and "h264_nvenc" in enc:
-            fallback = (c, ["-c:v", "h264_nvenc", "-cq", str(crf)])
-    if fallback:
-        print(f"[film] no libx264 build found; encoding H.264 with "
-              f"{fallback[1][1]} ({fallback[0]})", flush=True)
-        return fallback
-    raise SystemExit(
-        "[film] no ffmpeg with an H.264 encoder found (tried "
-        f"{', '.join(sorted(seen)) or 'nothing on PATH'}). Install ffmpeg with "
-        "libx264, or point SA_FFMPEG at one that has it.")
 
 
 def detect_backend(png: Path, meta: dict) -> str:
@@ -239,7 +200,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     # Resolve the encoder BEFORE the model load, not after 200 rendered frames.
-    ffmpeg, codec_args = pick_h264_encoder(args.crf)
+    ffmpeg, codec_args = pick_h264_encoder(args.crf, "film")
 
     # Resolve refines -> originals (the conditioning lives on the original).
     pngs = [resolve_original(OUT / rel) for rel in args.images]

@@ -1157,6 +1157,196 @@ class RefineRequest(BaseModel):
     interp: str = "lanczos"           # hires: resampling filter for the enlarge
 
 
+#: The two animators. AnimateDiff rides the SD1.5 UNet (fast, 2s, keeps the
+#: source's own resolution); Wan is a video transformer in .venv-flux (minutes,
+#: up to ~5s, renders at its own 480p pixel budget).
+ANIMATE_ENGINES = ("animatediff", "wan")
+#: Wan's temporal VAE compresses time 4:1, so a frame count must be 4k+1.
+WAN_MAX_FRAMES = 81
+#: Wan renders at 16fps. Writing its frames at AnimateDiff's 8 halves the speed.
+WAN_NATIVE_FPS = 16
+#: The Wan checkpoints on this box, as an allow-list (never a free-text repo id).
+#: 2.2's A14B is a mixture-of-experts: two 14B transformers, one for the high-
+#: noise half of the schedule and one for the low, switched at `boundary_ratio`.
+#: 2.1's 14B is a single transformer, older, and renders at a 480p budget.
+WAN_MODELS = {
+    "2.2-a14b": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    "2.1-14b": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+}
+#: Camera moves AnimateDiff can layer on the motion module (mirrors
+#: scripts/animate.py MOTION_LORAS — user input never reaches argv unchecked).
+MOTION_LORAS = ("none", "zoom-in", "zoom-out", "pan-left", "pan-right",
+                "tilt-up", "tilt-down", "roll-cw", "roll-ccw")
+#: The motion module's trained window. Past it the clip degenerates into noise,
+#: so the ceiling is enforced here as well as in the script.
+ANIMATE_MAX_FRAMES = 16
+
+
+class AnimateRequest(BaseModel):
+    src: str
+    engine: str = "animatediff"       # animatediff | wan
+    #: 0 / None = animate the image's own CONDITIONING (the sd15 world it came
+    #: from, re-rendered in motion). > 0 = img2img the actual PIXELS at this
+    #: denoise, which is how a flux-enhanced upscale keeps its enhancement.
+    strength: Optional[float] = 0.6
+    frames: int = ANIMATE_MAX_FRAMES
+    #: None = each engine's native rate: 8 for AnimateDiff's motion module,
+    #: 16 for Wan. A Wan clip written at 8 plays at half speed.
+    fps: Optional[int] = None
+    smooth_fps: int = 0               # 0 = no interpolated companion file
+    motion_lora: str = "none"
+    max_side: int = 768
+    #: AnimateDiff: text instead of the image's own conditioning. The temporal
+    #: layers were trained on text and off-grid conditioning gives them little
+    #: to enact, which is why a promptless clip can come out barely moving.
+    prompt_from: str = "none"         # none | pez | native (the discovered one)
+    free_init: int = 0                # FreeInit iterations; 0 = off, 3 = typical
+    # --- wan only -------------------------------------------------------
+    steps: Optional[int] = None       # wan: denoising steps (default 30)
+    guidance: Optional[float] = None  # wan: CFG (default 5.0)
+    wan_model: str = "2.2-a14b"       # key into WAN_MODELS
+    #: Step-distillation LoRA: 6 steps instead of 30, ~3x faster, and measurably
+    #: closer to the source. On by default because it is strictly better here.
+    lightning: bool = True
+    #: Render size. None follows Wan's own rule (square -> 640); matching the
+    #: source's size removes the resample, which is the single biggest lever on
+    #: how much frame 1 looks like your picture.
+    size: Optional[int] = None
+    #: nf4 (4-bit, fits everything) | fp8 (8-bit, the reference implementation's
+    #: precision; swaps the inactive MoE expert to host RAM to fit 24GB)
+    quant: str = "nf4"
+    prompt: Optional[str] = None      # wan: "" / None = promptless
+    #: Omit for a fresh random seed per clip (recorded in film.json). Pin it only
+    #: to reproduce a clip or to A/B a knob against an identical noise draw.
+    seed: Optional[int] = None
+
+
+@app.post("/api/animate")
+def api_animate(req: AnimateRequest) -> JSONResponse:
+    """Queue an AnimateDiff clip for one image (scripts/animate.py)."""
+    src = _resolve_output_image(req.src)
+    if req.engine not in ANIMATE_ENGINES:
+        raise HTTPException(400, f"bad engine {req.engine!r}")
+    if req.engine == "wan":
+        return _queue_wan(req, src)
+    if req.motion_lora not in MOTION_LORAS:
+        raise HTTPException(400, f"bad motion_lora {req.motion_lora!r}")
+    if not (1 <= req.frames <= ANIMATE_MAX_FRAMES):
+        raise HTTPException(
+            400, f"frames must be 1-{ANIMATE_MAX_FRAMES} (the motion module's "
+                 "trained window; past it the clip degenerates into noise)")
+    fps = req.fps or 8
+    if not (1 <= fps <= 60) or not (0 <= req.smooth_fps <= 120):
+        raise HTTPException(400, "bad fps")
+    if req.strength is not None and req.strength and not (0.0 < req.strength <= 1.0):
+        raise HTTPException(400, "strength must be in (0, 1]")
+    if not (64 <= req.max_side <= 1536):
+        raise HTTPException(400, "max_side must be 64-1536")
+
+    # The conditioning may live several `refined_from` hops back; resolving it
+    # here is the pre-flight, so an untraceable source 400s instead of loading a
+    # model first and dying.
+    origin = _explorable_source(src)
+    if not any(f"anarchy_{b}_" in origin.name for b in ("sd15", "sd2")):
+        raise HTTPException(
+            400, "AnimateDiff rides the SD1.5 UNet, so only sd15/sd2 images (or "
+                 "upscales of them) can drive it")
+
+    if req.prompt_from not in ("none", "pez", "native"):
+        raise HTTPException(400, f"bad prompt_from {req.prompt_from!r}")
+    if not (0 <= req.free_init <= 8):
+        raise HTTPException(400, "free_init must be 0-8 iterations")
+
+    name = _unique_film_name(f"{src.stem}_anim")
+    argv = [PYTHON, "-u", "scripts/animate.py", "--src", str(src), "--name", name,
+            "--frames", str(req.frames), "--fps", str(fps),
+            "--max-side", str(req.max_side)]
+    if req.seed is not None:
+        argv += ["--seed", str(int(req.seed))]
+    if req.prompt:
+        argv += ["--prompt", req.prompt]
+    elif req.prompt_from != "none":
+        argv += ["--prompt-from", req.prompt_from]
+    if req.free_init:
+        argv += ["--free-init", "--free-init-iters", str(req.free_init)]
+    if req.strength:
+        argv += ["--strength", str(req.strength)]
+    if req.smooth_fps:
+        argv += ["--smooth-fps", str(req.smooth_fps)]
+    if req.motion_lora != "none":
+        argv += ["--motion-lora", req.motion_lora]
+    label = (f"animate · {src.name} · {req.frames}f"
+             + (f" · s{req.strength}" if req.strength else " · conditioning")
+             + (" · prompted" if (req.prompt or req.prompt_from != "none") else "")
+             + (f" · free-init×{req.free_init}" if req.free_init else "")
+             + (f" · {req.motion_lora}" if req.motion_lora != "none" else ""))
+    job = RUNNER.submit("animate", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "name": name})
+
+
+def _queue_wan(req: AnimateRequest, src: Path) -> JSONResponse:
+    """Queue a Wan I2V clip (scripts/animate_wan.py, in .venv-flux).
+
+    Unlike AnimateDiff this needs no conditioning at all -- it looks at the
+    pixels -- so any generated image qualifies, including an sdxl render or a
+    FLUX upscale that carries no replayable latents.
+    """
+    if req.wan_model not in WAN_MODELS:
+        raise HTTPException(400, f"unknown wan model {req.wan_model!r}")
+    if not (5 <= req.frames <= WAN_MAX_FRAMES):
+        raise HTTPException(400, f"frames must be 5-{WAN_MAX_FRAMES} (snapped to 4k+1)")
+    if req.steps is not None and not (4 <= req.steps <= 80):
+        raise HTTPException(400, "steps must be 4-80")
+    if req.guidance is not None and not (0.0 <= req.guidance <= 20.0):
+        raise HTTPException(400, "guidance must be 0-20")
+    if req.size is not None and not (256 <= req.size <= 1024):
+        raise HTTPException(400, "size must be 256-1024")
+    if req.quant not in ("nf4", "fp8", "8bit", "auto", "off"):
+        raise HTTPException(400, f"bad quant {req.quant!r}")
+    fps = req.fps or WAN_NATIVE_FPS
+    if not (1 <= fps <= 60) or not (0 <= req.smooth_fps <= 120):
+        raise HTTPException(400, "bad fps")
+
+    name = _unique_film_name(f"{src.stem}_wan")
+    argv = [FLUX_PYTHON, "-u", "scripts/animate_wan.py", "--src", str(src),
+            "--name", name, "--frames", str(req.frames), "--fps", str(fps),
+            "--model", WAN_MODELS[req.wan_model]]
+    if req.steps is not None:
+        argv += ["--steps", str(int(req.steps))]
+    if req.guidance is not None:
+        argv += ["--guidance", str(float(req.guidance))]
+    if req.size is not None:
+        argv += ["--size", str(int(req.size))]
+    if not req.lightning:
+        argv += ["--no-lightning"]
+    argv += ["--quant", req.quant]
+    if req.smooth_fps:
+        argv += ["--smooth-fps", str(req.smooth_fps)]
+    if req.seed is not None:
+        argv += ["--seed", str(int(req.seed))]
+    if req.prompt:
+        argv += ["--prompt", req.prompt]
+    label = (f"wan{req.wan_model} · {src.name} · {req.frames}f"
+             + (" · lightning" if req.lightning else "")
+             + (f" · {req.size}px" if req.size else "")
+             + (f" · {req.quant}" if req.quant != "nf4" else "")
+             + (f" · g{req.guidance}" if req.guidance is not None else "")
+             + ("" if not req.prompt else " · prompted"))
+    job = RUNNER.submit("animate", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "name": name})
+
+
+def _unique_film_name(stem: str) -> str:
+    """A films/ directory name nobody is using — re-animating never clobbers."""
+    root = OUTPUTS / "films"
+    if not (root / stem).exists():
+        return stem
+    i = 2
+    while (root / f"{stem}_{i}").exists():
+        i += 1
+    return f"{stem}_{i}"
+
+
 @app.post("/api/refine")
 def api_refine(req: RefineRequest) -> JSONResponse:
     # Resolve + sandbox the source to an image under outputs/.
@@ -1572,6 +1762,10 @@ def api_images() -> JSONResponse:
     novelty = _load_json("novelty.json")
     resonance = _load_json("resonance.json")
     tag_map = current_tags()
+    # NOT the same number as `score`: that one is the LAION aesthetic model's
+    # guess, this is your own 0-9 call from labels.jsonl. They disagree often
+    # enough that showing them in the same slot would be a lie.
+    human = labeled_scores()
     buckets: dict[str, list] = {k: [] for k, _ in GALLERY_BUCKETS}
     buckets["favorites"] = []
     buckets["top"] = []
@@ -1600,6 +1794,7 @@ def api_images() -> JSONResponse:
                         "nov": novelty.get(rel),
                         "res": resonance.get(rel),
                         "tags": tag_map.get(rel),
+                        "label": human.get(rel),
                     }
                     buckets[key].append(item)
                     by_rel[rel] = item
@@ -2142,6 +2337,13 @@ def api_meta(path: str) -> JSONResponse:
                         meta[k] = m[k]
                 meta["native_from"] = p.name
                 break
+    # The human judgement, carried alongside the machine's params so the
+    # lightbox can score and tag whatever it is showing -- including a parent
+    # image reached by a link, which may not be in the current gallery view at
+    # all and therefore has no row to read the current state off.
+    rel = target.relative_to(base).as_posix()
+    meta["label_score"] = labeled_scores().get(rel)
+    meta["label_tags"] = current_tags().get(rel, [])
     return JSONResponse(meta)
 
 

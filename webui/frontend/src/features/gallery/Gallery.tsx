@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { useImages } from '../../api/queries'
-import type { GalleryKey, ImageItem, TabKey } from '../../api/types'
+import { UNSET, type GalleryKey, type ImageItem, type TabKey } from '../../api/types'
 import { FitPage } from '../fit/FitPage'
 import { FilmList } from '../timeline/FilmList'
 import { Timeline } from '../timeline/Timeline'
@@ -18,6 +18,22 @@ const EMPTY_MSG: Partial<Record<TabKey, string>> = {
   favorites: 'no favorites yet — click the ☆ on any image to add it.',
   top: 'nothing scored yet — click “Score all ▶” to rank by aesthetic.',
   frontier: 'no analysis yet — click “🎯 Analyze” to compute novelty + resonance.',
+}
+
+/**
+ * Narrow a bucket to one aesthetic universe. '' keeps everything; `UNSET` keeps
+ * the images that have not been sorted into one yet — the useful inverse when
+ * you are working through a backlog.
+ *
+ * Client-side, like the sort: /api/images already carries each row's tags, so
+ * filtering here costs one pass over an array that is in memory anyway and
+ * needs no round trip.
+ */
+function filterByTag(list: ImageItem[], tag: string): ImageItem[] {
+  if (!tag) return list
+  if (tag === UNSET) return list.filter((im) => !im.tags?.length)
+  const want = tag.toLocaleLowerCase()
+  return list.filter((im) => im.tags?.some((t) => t.toLocaleLowerCase() === want))
 }
 
 /** Client-side reorder of a bucket. 'new' is the server's own mtime order. */
@@ -52,10 +68,19 @@ const isGrid = (t: TabKey): t is GalleryKey => !CUSTOM_TABS.includes(t)
 export function Gallery({ busy }: { busy: boolean }) {
   const tab = useUI((s) => s.tab)
   const sortBy = useUI((s) => s.sortBy)
+  const tagFilter = useUI((s) => s.tagFilter)
   const { data: images, isLoading } = useImages(busy)
 
-  const list = isGrid(tab) ? (images?.[tab] ?? []) : []
-  const view = useMemo(() => sortItems(list, sortBy), [list, sortBy])
+  // Memoized so the `[]` fallback isn't a fresh array on every render, which
+  // would re-run the filter+sort below for nothing.
+  const list = useMemo(
+    () => (isGrid(tab) ? (images?.[tab] ?? []) : []),
+    [images, tab],
+  )
+  const view = useMemo(
+    () => sortItems(filterByTag(list, tagFilter), sortBy),
+    [list, tagFilter, sortBy],
+  )
 
   const parentRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
@@ -84,11 +109,11 @@ export function Gallery({ busy }: { busy: boolean }) {
   // Column count and bucket changes invalidate every cached row measurement.
   useEffect(() => {
     virtualizer.measure()
-  }, [cols, tab, sortBy, virtualizer])
+  }, [cols, tab, sortBy, tagFilter, virtualizer])
 
   useEffect(() => {
     if (parentRef.current) parentRef.current.scrollTop = 0
-  }, [tab, sortBy])
+  }, [tab, sortBy, tagFilter])
 
   const rows = virtualizer.getVirtualItems()
 
@@ -104,7 +129,11 @@ export function Gallery({ busy }: { busy: boolean }) {
         <div className="p-8 text-center text-dim">loading gallery…</div>
       ) : !view.length ? (
         <div className="p-8 text-center text-dim">
-          {EMPTY_MSG[tab] ?? `no ${tab} artifacts yet — run something.`}
+          {tagFilter && list.length
+            ? tagFilter === UNSET
+              ? 'every image here is already sorted into a universe.'
+              : `nothing in this tab wears “${tagFilter}”.`
+            : (EMPTY_MSG[tab] ?? `no ${tab} artifacts yet — run something.`)}
         </div>
       ) : (
         <>
@@ -146,6 +175,12 @@ export function Gallery({ busy }: { busy: boolean }) {
           </div>
           <div className="py-3.5 text-center text-[12px] text-dim">
             {view.length} image{view.length === 1 ? '' : 's'}
+            {tagFilter ? (
+              <span className="text-tag">
+                {' '}
+                · {tagFilter === UNSET ? 'untagged' : tagFilter} of {list.length}
+              </span>
+            ) : null}
           </div>
         </>
       )}
