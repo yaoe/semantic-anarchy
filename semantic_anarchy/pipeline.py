@@ -1153,7 +1153,7 @@ class Krea2Model:
         pe = torch.from_numpy(embeddings).to(dtype=torch.bfloat16)
         mask = torch.ones((1, s), dtype=torch.bool)
 
-        use_cfg = guidance_scale > 1.0
+        use_cfg = guidance_scale > 0  # Krea convention: cond + g*(cond - uncond)
         if use_cfg:
             npe, nmask = self._uncond_embeds()
 
