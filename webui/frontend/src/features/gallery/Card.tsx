@@ -1,4 +1,11 @@
-import { useAnimate, useDeleteImage, useExplore, useFavorite, useRefine } from '../../api/queries'
+import {
+  useAnimate,
+  useDeleteImage,
+  useExplore,
+  useFavorite,
+  useRefine,
+  useRestoreConditions,
+} from '../../api/queries'
 import type { ImageItem, MotionLora } from '../../api/types'
 import {
   AnimateIcon,
@@ -7,6 +14,7 @@ import {
   ExploreIcon,
   FitAddIcon,
   FitSelectedIcon,
+  RestoreIcon,
   StarIcon,
   TimelineIcon,
   UpscaleIcon,
@@ -53,6 +61,7 @@ export function Card({
   const explore = useExplore()
   const animate = useAnimate()
   const del = useDeleteImage()
+  const restore = useRestoreConditions()
 
   const isAnarchy = im.name.startsWith('anarchy_')
   const n = numOr(tools.exN, 6)
@@ -146,6 +155,7 @@ export function Card({
     (refine.isError && (refine.error as Error).message) ||
     (explore.isError && (explore.error as Error).message) ||
     (del.isError && (del.error as Error).message) ||
+    (restore.isError && (restore.error as Error).message) ||
     null
 
   return (
@@ -243,6 +253,14 @@ export function Card({
 
         {isAnarchy ? (
           <>
+            <button
+              className={ACTION}
+              title="reset the sidebar to the conditions that generated this image"
+              disabled={restore.isPending}
+              onClick={() => restore.mutate(im.rel)}
+            >
+              <RestoreIcon size={ICON} />
+            </button>
             <button
               className={ACTION}
               title="explore: render variations around this image"

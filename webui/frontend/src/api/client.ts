@@ -37,6 +37,7 @@ import type {
   PrefsPayload,
   RefineRequest,
   RunRequest,
+  RestoreResult,
   RunResponse,
   SavedFit,
   StateSnapshot,
@@ -134,6 +135,9 @@ export const api = {
     post<DistRow>('/api/dist', body),
   encodeDist: (body: { backend: string; path: string; model?: string | null }) =>
     post<RunResponse & { out: string }>('/api/dist/encode', body),
+
+  /** Selects the image's checkpoint + distribution, and returns its knobs. */
+  restore: (rel: string) => post<RestoreResult>('/api/restore', { rel }),
 
   // ---- fit a distribution from picked images ----
   fitCandidates: (o: FitQueryParams) =>

@@ -19,6 +19,7 @@ import { FitLink } from './features/fit/FitLink'
 import { ScoreBar } from './features/taste/ScoreBar'
 import { WipeDialog } from './features/taste/WipeDialog'
 import { ParamPanel } from './params/ParamPanel'
+import { RestoreNote } from './params/RestoreNote'
 import { RunButton } from './params/RunButton'
 import { basename, cn, fmtDuration } from './lib/utils'
 import { useUI } from './store'
@@ -116,6 +117,7 @@ export default function App() {
             )}
           >
             <RunButton />
+            <RestoreNote />
           </div>
           {/* overflow-x-clip: `overflow-y-auto` alone computes overflow-x to
               auto, so any stray wide child would add a sideways scrollbar. The

@@ -655,6 +655,14 @@ export interface WipeResult {
  * The `.json` sidecar of a generated image. Only the keys the UI reads are
  * named; the index signature keeps the rest addressable for the param dump.
  */
+/** POST /api/restore — see params/fromSidecar.ts for the form half. */
+export interface RestoreResult {
+  source: string
+  params: Record<string, unknown>
+  sdxl_model: string | null
+  warnings: string[]
+}
+
 export interface ImageMeta {
   /** The human judgement, merged in by /api/meta so the lightbox can show and
    *  change it even for an image that is not in the current gallery view. */

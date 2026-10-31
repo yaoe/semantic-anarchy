@@ -138,3 +138,31 @@ that could disagree.
 Because the sidecar records what was *sent*, this also cleans up the label
 corpus: a knob vector regressed against a score no longer contains columns that
 were inert for that run.
+
+## Going the other way: an image back into the sidebar
+
+The sliders icon on a gallery card and "use these settings" in the fullscreen view
+reset the sidebar to what made that image. Two halves, because the pickers are
+server state and the form is client state:
+
+- `POST /api/restore` (`webui/app.py`, "Restore" section) walks
+  `refined_from`/`parent` back to the sidecar that recorded the sampling and
+  re-selects the checkpoint and distribution. Whatever no longer exists is kept
+  as-is and returned as a warning; it never fails the rest.
+- `params/fromSidecar.ts` turns that sidecar into form values — the inverse of
+  `buildRunRequest`. `params/RestoreNote.tsx` shows the outcome under the Run button.
+
+Decisions worth keeping:
+
+- **The seed is cleared, not restored.** An image can't be re-made from its seed:
+  `resolve_lengths` and `sample` share one rng and draw arrays sized by `n`, and `n`
+  isn't in the sidecar. The `.npz` holds the exact tensor; explore and upscale use it.
+- **`n` and the experiment id stay** — they describe the next batch, not this image.
+- **An unrecorded knob goes inert, not "left as it was"**, or a leftover ρ would
+  shape a batch claiming to match the image. `length_mode` null means `off`, not the
+  schema's `corpus` default; corpus-mode `length` is one image's draw, so it isn't copied.
+- **Split absorbs a recorded temperature** into `temp_on`/`temp_off`, since the
+  sidebar sends a hidden temperature as the default (the equivalence above).
+- **An explore child** takes sampler knobs from its generating ancestor and render
+  knobs from itself, with a warning: the sidebar can't express the step. `evolve`
+  sidecars record no distribution, so that picker stays put with a warning.

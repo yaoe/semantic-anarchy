@@ -28,6 +28,7 @@ import type {
   RunRequest,
   RunResponse,
 } from './types'
+import { paramsFromSidecar } from '../params/fromSidecar'
 import { useUI } from '../store'
 
 export const qk = {
@@ -399,6 +400,26 @@ export function useSetModel() {
       qc.invalidateQueries({ queryKey: qk.config })
       // A corpus is fitted PER checkpoint, so a new checkpoint means a
       // different fit — possibly one that hasn't been encoded yet.
+      qc.invalidateQueries({ queryKey: ['dist'] })
+      qc.invalidateQueries({ queryKey: ['fs'] })
+    },
+  })
+}
+
+/** Reset the whole sidebar (checkpoint and distribution too) to what made `rel`. */
+export function useRestoreConditions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (rel: string) => api.restore(rel),
+    onSuccess: (res, rel) => {
+      const { patch, warnings } = paramsFromSidecar(res.params, res.sdxl_model)
+      useUI.getState().restoreParams(patch, {
+        rel,
+        source: res.source,
+        warnings: [...res.warnings, ...warnings],
+      })
+      qc.invalidateQueries({ queryKey: qk.model })
+      qc.invalidateQueries({ queryKey: qk.config })
       qc.invalidateQueries({ queryKey: ['dist'] })
       qc.invalidateQueries({ queryKey: ['fs'] })
     },

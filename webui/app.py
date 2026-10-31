@@ -2984,6 +2984,166 @@ def api_dist_encode(req: DistEncodeRequest) -> JSONResponse:
 
 
 # --------------------------------------------------------------------------- #
+# Restore: put the sidebar back to what made an image
+# --------------------------------------------------------------------------- #
+# The form half (sidecar -> sidebar values) is frontend/src/params/fromSidecar.ts.
+# What lives here is what only the server can do: find the sidecar that actually
+# recorded the sampling (an upscale's records the upscale), and turn a recorded
+# checkpoint + --dist base back into the picker choices they came from.
+#: Sidecars that say how conditioning was made, as opposed to what was done to it.
+RESTORE_KINDS = ("generate", "explore", "evolve")
+#: What an explore child rendered with itself, whatever its ancestor used.
+EXPLORE_OWN_KEYS = ("model", "dist", "steps", "guidance", "scheduler", "neg_mode",
+                    "negative")
+RESTORE_MAX_HOPS = 16   # a corrupt sidecar must not be able to loop forever
+
+
+def _generation_chain(start: Path) -> list:
+    """``[(image, sidecar), ...]`` from an image back through what it came from."""
+    chain, seen, p = [], set(), start
+    while p is not None and p not in seen and len(chain) < RESTORE_MAX_HOPS:
+        seen.add(p)
+        try:
+            meta = json.loads(p.with_suffix(".json").read_text())
+        except (OSError, ValueError):
+            break
+        chain.append((p, meta))
+        if meta.get("kind") in ("generate", "evolve"):
+            break
+        parent = meta.get("refined_from") or meta.get("parent")
+        try:
+            p = _resolve_output_image(parent) if parent else None
+        except HTTPException:     # the ancestor was deleted; keep what we have
+            p = None
+    return chain
+
+
+def _restore_source(rel: str) -> tuple[Path, dict, list]:
+    """The conditions behind an image: ``(sampled image, params, warnings)``."""
+    start = _resolve_output_image(rel)
+    chain = _generation_chain(start)
+    usable = [(p, m) for p, m in chain if m.get("kind") in RESTORE_KINDS]
+    if not usable:
+        raise HTTPException(400, f"{start.name} records no sampling conditions "
+                                 f"(no sidecar from a generate, explore or evolve run)")
+    source, params = usable[-1][0], dict(usable[-1][1])
+    warnings = []
+    nearest = usable[0][1]
+    if nearest.get("kind") == "explore":
+        # Sampling knobs come from the generating ancestor; the sidebar has no way
+        # to spell the neighbourhood step on top of them, so say that out loud.
+        params.update({k: nearest[k] for k in EXPLORE_OWN_KEYS if k in nearest})
+        if params.get("kind") == "explore":
+            warnings.append("its generating ancestor is gone, so the sampler knobs "
+                            "are at their defaults")
+        else:
+            warnings.append(f"this is a {nearest.get('mode') or 'explore'} step from "
+                            f"{source.name} — restored that image's sampler knobs; "
+                            f"the step itself can't be set in the sidebar")
+    # Older sidecars recorded no size; the pixels are ground truth.
+    if not (params.get("width") and params.get("height")):
+        size = _image_size(source)
+        if size:
+            params["height"], params["width"] = size
+    return source, params, warnings
+
+
+def _restore_model(backend: str, recorded: Optional[str]) -> tuple:
+    """Re-select a recorded checkpoint: ``(sdxl dropdown key, warning)``."""
+    key = None
+    if not recorded:
+        return None, "no checkpoint recorded — kept the current one"
+    with _config_lock:
+        picked = load_model_config()
+        if recorded == "(default)" or recorded == MODEL_DEFAULTS[backend]:
+            picked.pop(backend, None)
+        elif backend == "sdxl" and recorded in SDXL_MODELS.values():
+            picked.pop(backend, None)
+        else:
+            try:
+                picked[backend] = str(validate_model_path(recorded))
+            except HTTPException:
+                return None, f"checkpoint {Path(recorded).name} is gone — kept the current one"
+        save_model_config(picked)
+    if backend == "sdxl":
+        key = next((k for k, v in SDXL_MODELS.items() if v == recorded), None)
+    return key, None
+
+
+def _dist_choice_for_base(backend: str, recorded: str,
+                          model_key: Optional[str]) -> tuple[str, Optional[str]]:
+    """Invert :func:`dist_base_for`: the picker choice a ``--dist`` base came from."""
+    base = Path(_abs_base(recorded)).resolve()
+    if base == Path(_abs_base(BASE_DIST)).resolve():
+        return "base", None
+    if base == Path(_abs_base(EVOLVED_DIST)).resolve():
+        return "evolved", None
+    # A corpus keeps its fit beside itself as <corpus>__<ckpt-slug>. Prefer naming
+    # the corpus: that is how it was picked, and it labels the sidebar properly.
+    if "__" in base.name:
+        corpus = base.with_name(base.name.rsplit("__", 1)[0] + dist_paths.PROMPTS_EXT)
+        if corpus.is_file():
+            mined = dist_base_for(backend, "prompts", str(corpus), model_key)
+            if Path(_abs_base(mined)).resolve() == base:
+                return "prompts", str(corpus)
+    return "file", str(dist_paths.dist_files(base, backend)[0])
+
+
+def _restore_dist(backend: str, recorded: Optional[str],
+                  model_key: Optional[str]) -> Optional[str]:
+    """Re-select a recorded distribution. Returns a warning if it can't be."""
+    if not recorded:
+        return "no distribution recorded — kept the current one"
+    name = Path(recorded).name
+    try:
+        kind, path = _dist_choice_for_base(backend, recorded, model_key)
+        if kind in ("prompts", "file"):
+            path = str(resolve_dist_file(path, kind))
+        ready = describe_dist(backend, kind, path, model_key)["ready"]
+    except HTTPException:
+        ready = False
+    if not ready:
+        return f"distribution {name} is no longer available — kept the current one"
+    with _config_lock:
+        cfg = load_dist_config()
+        cfg[backend] = {"kind": kind, "path": path}
+        save_dist_config(cfg)
+    return None
+
+
+class RestoreRequest(BaseModel):
+    rel: str
+
+
+@app.post("/api/restore")
+def api_restore(req: RestoreRequest) -> JSONResponse:
+    """Select the checkpoint + distribution behind an image, and return its knobs.
+
+    The pickers are server state, so this writes them; the knobs go back to the
+    client to pour into the form. Anything that no longer exists is reported and
+    left as it was rather than failing the rest: a deleted checkpoint shouldn't
+    cost you the sampler settings.
+    """
+    source, params, warnings = _restore_source(req.rel)
+    backend = params.get("backend") or _fit_backend_of(
+        source.relative_to(OUTPUTS.resolve()).as_posix())
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"{source.name}: unknown backend {backend!r}")
+    params["backend"] = backend
+    key, warn = _restore_model(backend, params.get("model"))
+    warnings += [warn] if warn else []
+    # Before the distribution: a prompt corpus resolves per active checkpoint.
+    warn = _restore_dist(backend, params.get("dist"), key)
+    warnings += [warn] if warn else []
+    return JSONResponse({
+        "source": source.relative_to(OUTPUTS.resolve()).as_posix(),
+        "params": params,
+        "sdxl_model": key,
+        "warnings": warnings,
+    })
+
+
+# --------------------------------------------------------------------------- #
 # Selection fits — a distribution fitted to the latents of images you picked
 # --------------------------------------------------------------------------- #
 # The other half of the base-distribution story. A mined fit answers "what does

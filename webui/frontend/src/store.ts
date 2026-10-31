@@ -146,10 +146,21 @@ export const FIT_FILTER_KEYS = [
   'since', 'until', 'starred', 'scored', 'minScore', 'maxScore',
 ] as const
 
+export interface RestoreNote {
+  /** The image you clicked, and the one whose sidecar recorded the sampling. */
+  rel: string
+  source: string
+  warnings: string[]
+}
+
 interface UIState {
   params: Values
   setParam: (id: string, value: string) => void
   resetParams: () => void
+  /** Sidebar reset to an image's conditions; the note says what could not be. */
+  restoreParams: (patch: Values, note: RestoreNote) => void
+  restoreNote: RestoreNote | null
+  clearRestoreNote: () => void
 
   tools: Record<string, string>
   setTool: (id: string, value: string) => void
@@ -254,6 +265,11 @@ export const useUI = create<UIState>()(
           return { params }
         }),
       resetParams: () => set({ params: { ...DEFAULT_VALUES } }),
+      // Not via setParam: its backend/aspect recompute would wipe the restored size.
+      restoreParams: (patch, restoreNote) =>
+        set((s) => ({ params: { ...s.params, ...patch }, restoreNote })),
+      restoreNote: null,
+      clearRestoreNote: () => set({ restoreNote: null }),
 
       tools: { ...DEFAULT_TOOLS },
       setTool: (id, value) => set((s) => ({ tools: { ...s.tools, [id]: value } })),

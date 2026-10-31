@@ -10,6 +10,7 @@ export {
   Merge as BreedIcon,
   Orbit as ExploreIcon,
   Play as AnimateIcon,
+  SlidersHorizontal as RestoreIcon,
   SquareCheck as FitSelectedIcon,
   SquarePlus as FitAddIcon,
   Star as StarIcon,

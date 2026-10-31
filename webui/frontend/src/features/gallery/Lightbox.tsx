@@ -11,12 +11,13 @@ import {
   useInvert,
   useJobWatcher,
   useMeta,
+  useRestoreConditions,
   useScoreImage,
   useTagImage,
   useTags,
 } from '../../api/queries'
 import type { ImageItem, ImageMeta, MotionLora } from '../../api/types'
-import { AnimateIcon, DeleteIcon, TimelineIcon } from '../../components/ui/actionIcons'
+import { AnimateIcon, DeleteIcon, RestoreIcon, TimelineIcon } from '../../components/ui/actionIcons'
 import { imgSrc, numOr } from '../../lib/utils'
 import { ANIM_DENOISE, ANIM_MAX_FRAMES, WAN_FRAMES } from '../animate/AnimateBar'
 import { useUI } from '../../store'
@@ -157,6 +158,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   const animate = useAnimate()
   const favorite = useFavorite()
   const del = useDeleteImage()
+  const restore = useRestoreConditions()
   const scoreImage = useScoreImage()
   const tagImage = useTagImage()
   const tagInputRef = useRef<HTMLInputElement>(null)
@@ -399,6 +401,18 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
             {/* discovered hard prompts (PEZ / native inversion) + timeline */}
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              {rel && /anarchy_/.test(rel) ? (
+                <button
+                  className="sa-btn sa-btn-sm"
+                  title="reset the sidebar to the conditions that generated this image, then close this view"
+                  disabled={restore.isPending}
+                  // Closed on success: the sidebar it just changed is behind this overlay.
+                  onClick={() => restore.mutate(rel, { onSuccess: close })}
+                >
+                  <RestoreIcon size={12} className="mr-1 inline" />
+                  use these settings
+                </button>
+              ) : null}
               {rel && (wanEngine ? /anarchy_/.test(rel) : /anarchy_(sd15|sd2)_/.test(rel)) ? (
                 <button
                   className="sa-btn sa-btn-sm"
@@ -487,6 +501,9 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
             {del.isError ? (
               <div className="text-err">{(del.error as Error).message}</div>
+            ) : null}
+            {restore.isError ? (
+              <div className="text-err">{(restore.error as Error).message}</div>
             ) : null}
             {invert.isError ? (
               <div className="text-err">{(invert.error as Error).message}</div>
