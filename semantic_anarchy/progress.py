@@ -43,7 +43,8 @@ class Progress:
 
     def __init__(self, total: int, label: str = "working", unit: str = "item",
                  prefix: str = "", interval: float = 1.5, width: int = 24,
-                 stream=None, clock=time.monotonic) -> None:
+                 stream=None, clock=time.monotonic,
+                 draw_first: bool = True) -> None:
         self.total = max(0, int(total))
         self.label = label
         self.unit = unit
@@ -54,7 +55,10 @@ class Progress:
         self._clock = clock
         self.done = 0
         self._start = clock()
-        self._last_emit = None      # None = nothing shown yet
+        # None = nothing shown yet, so the first update draws. draw_first=False
+        # starts the throttle now instead: work faster than one interval prints
+        # only its 100% line.
+        self._last_emit = None if draw_first else self._start
         self._closed = False
 
     # ------------------------------------------------------------------ text
@@ -68,7 +72,9 @@ class Progress:
             f"{self.done}/{self.total}",
         ]
         if rate > 0:
-            parts.append(f"{rate:.1f} {self.unit}/s")
+            # Below 1/s the rate reads better inverted: 0.1 step/s hides 7s vs 9s.
+            parts.append(f"{rate:.1f} {self.unit}/s" if rate >= 1
+                         else f"{1 / rate:.1f}s/{self.unit}")
             if self.done < self.total:
                 parts.append(f"eta {fmt_duration((self.total - self.done) / rate)}")
         if self.done >= self.total:
@@ -129,3 +135,27 @@ class Progress:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def step_callback(index: int, n: int, steps: int, interval: float = 10.0,
+                  stream=None, clock=time.monotonic):
+    """A diffusers ``callback_on_step_end`` that reports denoising steps.
+
+    Build one per image, right before the pipe call: the rate clock starts here,
+    so the first step's duration counts. The real step count comes from the
+    pipeline's ``num_timesteps`` once it is running, because img2img only runs
+    ``strength`` of ``steps``.
+    """
+    progress = Progress(steps, label=f"image {index + 1}/{n}", unit="step",
+                        prefix="[gen]", interval=interval, stream=stream,
+                        clock=clock, draw_first=False)
+
+    def on_step_end(pipe, step, timestep, callback_kwargs):
+        progress.total = getattr(pipe, "num_timesteps", None) or progress.total
+        progress.update(step + 1)
+        if progress.done >= progress.total:
+            progress.close()
+        # diffusers pops latents etc. back out of this, so it must be returned.
+        return callback_kwargs
+
+    return on_step_end

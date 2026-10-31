@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQueryClient } from '@tanstack/react-query'
 
@@ -77,26 +77,46 @@ function buildCli(m: ImageMeta): string {
 }
 
 export function Lightbox({ items }: { items: ImageItem[] }) {
-  const index = useUI((s) => s.lightboxIndex)
+  const cursor = useUI((s) => s.lightboxRel)
+  const openLightbox = useUI((s) => s.openLightbox)
   const close = useUI((s) => s.closeLightbox)
-  const move = useUI((s) => s.moveLightbox)
-  const open = index >= 0
+  const open = cursor !== null
+
+  // Where the open image sits in the view RIGHT NOW. The view reorders under us
+  // (new renders land at the front), so the position is looked up, never stored.
+  const found = useMemo(
+    () => (cursor === null ? -1 : items.findIndex((im) => im.rel === cursor)),
+    [items, cursor],
+  )
+
+  // An image can leave the view while open (deleted, or tagged out of the tag
+  // filter). Show whatever took its place: remember where it last was.
+  const lastAt = useRef(0)
+  if (found >= 0) lastAt.current = found
+  const at = found >= 0 ? found : Math.min(lastAt.current, items.length - 1)
+  const item = items[at] as ImageItem | undefined
 
   // A parent link can point at an image outside the current view; when it does
   // we pin that rel until the user navigates again.
   const [pinned, setPinned] = useState<string | null>(null)
-  useEffect(() => setPinned(null), [index])
+  useEffect(() => setPinned(null), [cursor])
 
-  // Deleting the last image of the view leaves the cursor past the end: step
-  // back to the new last image, or close if that was the only one.
-  const openLightbox = useUI((s) => s.openLightbox)
+  // Move the cursor onto the replacement, or close if nothing is left.
+  const replacement = found < 0 ? item?.rel : undefined
   useEffect(() => {
-    if (index < items.length) return
-    if (items.length > 0) openLightbox(items.length - 1)
+    if (!open || found >= 0) return
+    if (replacement) openLightbox(replacement)
     else close()
-  }, [index, items.length, openLightbox, close])
+  }, [open, found, replacement, openLightbox, close])
 
-  const item = items[index] as ImageItem | undefined
+  const move = useCallback(
+    (delta: number) => {
+      const next = items[at + delta]
+      if (next) openLightbox(next.rel)
+    },
+    [items, at, openLightbox],
+  )
+
   const rel = pinned ?? item?.rel ?? null
   const src = pinned
     ? `/img?path=${encodeURIComponent(pinned)}`
@@ -167,6 +187,8 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   const tagRef = useRef(applyTags)
   const tagsRef = useRef(labelTags)
   const vocabRef = useRef(vocab?.tags)
+  const moveRef = useRef(move)
+  moveRef.current = move
   scoreRef.current = pickScore
   starRef.current = toggleStar
   tagRef.current = applyTags
@@ -199,10 +221,10 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
       if (e.shiftKey) return
       if (e.key === 'ArrowLeft') {
         e.preventDefault()
-        move(-1, items.length)
+        moveRef.current(-1)
       } else if (e.key === 'ArrowRight') {
         e.preventDefault()
-        move(1, items.length)
+        moveRef.current(1)
       } else if (e.key >= '0' && e.key <= '9') {
         e.preventDefault()
         scoreRef.current(Number(e.key))
@@ -216,7 +238,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, items.length, move])
+  }, [open])
 
   const wanEngine = tools.anEngine === 'wan'
   const doAnimate = () => {
@@ -295,7 +317,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
             className="fixed left-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
                        bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink"
             title="previous (←)"
-            onClick={() => move(-1, items.length)}
+            onClick={() => move(-1)}
           >
             ‹
           </button>
@@ -303,7 +325,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
             className="fixed right-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
                        bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink"
             title="next (→)"
-            onClick={() => move(1, items.length)}
+            onClick={() => move(1)}
           >
             ›
           </button>

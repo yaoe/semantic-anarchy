@@ -62,6 +62,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_backend_args(parser)
     add_experiment_args(parser)
+    parser.add_argument("--dist", type=Path, default=Path("outputs/dist"),
+                        help="distribution base the radius/distance are measured against")
     parser.add_argument("--mode", default="neighborhood",
                         choices=["neighborhood", "breed", "walk"])
     parser.add_argument("--direction", default="outward",
@@ -99,7 +101,7 @@ def main(argv=None) -> int:
         seed = int(np.random.SeedSequence().entropy) % (2**31)
     rng = np.random.default_rng(seed)
     experiment = record_experiment(args, seed=seed, n=args.n,
-                                   dist=dist_prefix(args, "outputs/dist"))
+                                   dist=dist_prefix(args, str(args.dist)))
 
     print(f"[explore] mode={args.mode} backend={args.backend} src={args.src.name}"
           + (f" b={args.b.name}" if args.b else "")
@@ -114,7 +116,7 @@ def main(argv=None) -> int:
         from semantic_anarchy.pipeline import set_scheduler
         set_scheduler(backend.model.pipe, args.scheduler)
 
-    dists = backend.load_dists(dist_prefix(args, "outputs/dist"))
+    dists = backend.load_dists(dist_prefix(args, str(args.dist)))
     anchor = _load_anchor(args.src)
     anchor_dist = backend.distance(dists, anchor)
     print(f"[explore] anchor distance from corpus center: {anchor_dist:.2f}")
@@ -148,6 +150,7 @@ def main(argv=None) -> int:
             "kind": "explore", "experiment": experiment,
             "mode": args.mode, "backend": args.backend,
             "model": args.ckpt or args.model or "(default)",
+            "dist": str(args.dist),
             "parent": args.src.name,
             "parent_b": (args.b.name if args.b else None),
             "radius": (args.radius if args.mode == "neighborhood" else None),

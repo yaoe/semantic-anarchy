@@ -159,11 +159,10 @@ export function Gallery({ busy }: { busy: boolean }) {
                       gap: `${GAP}px`,
                     }}
                   >
-                    {rowItems.map((im, i) => (
+                    {rowItems.map((im) => (
                       <Card
                         key={im.rel}
                         im={im}
-                        index={start + i}
                         sheet={sheet}
                         showNovRes={tab === 'frontier'}
                       />

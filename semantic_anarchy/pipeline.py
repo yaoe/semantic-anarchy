@@ -22,6 +22,8 @@ from typing import Iterable, Optional
 
 import numpy as np
 
+from .progress import step_callback
+
 
 #: The house SD1.5 negative prompt, used as the CFG negative branch for every
 #: sd15 sampling step (generate, hires-fix, film, explore).
@@ -592,6 +594,7 @@ class SDModel:
                     image=init, strength=init_strength,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale, generator=generator,
+                    callback_on_step_end=step_callback(i, n, num_inference_steps),
                 )
             else:
                 kwargs = dict(
@@ -600,6 +603,7 @@ class SDModel:
                     num_inference_steps=num_inference_steps,
                     guidance_scale=guidance_scale,
                     height=height, width=width, generator=generator,
+                    callback_on_step_end=step_callback(i, n, num_inference_steps),
                 )
                 if ip_images:
                     kwargs["ip_adapter_image"] = ip_images[i % len(ip_images)].convert("RGB")
@@ -871,6 +875,7 @@ class SDXLModel:
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 generator=generator,
+                callback_on_step_end=step_callback(i, n, num_inference_steps),
             )
             if use_cfg:
                 kwargs["negative_prompt_embeds"] = npe_t[i : i + 1]
@@ -1080,7 +1085,8 @@ class Flux2Model:
             kwargs = dict(prompt_embeds=pe[i:i + 1].to(self.device),
                           num_inference_steps=num_inference_steps,
                           guidance_scale=guidance_scale,
-                          height=height, width=width, generator=generator)
+                          height=height, width=width, generator=generator,
+                          callback_on_step_end=step_callback(i, n, num_inference_steps))
             if init_images:
                 # klein's native image conditioning (kontext-style reference)
                 kwargs["image"] = [init_images[i % len(init_images)].convert("RGB")]
@@ -1187,7 +1193,8 @@ class Krea2Model:
                           prompt_embeds_mask=mask.to(self.device),
                           num_inference_steps=num_inference_steps,
                           guidance_scale=guidance_scale,
-                          height=height, width=width, generator=generator)
+                          height=height, width=width, generator=generator,
+                          callback_on_step_end=step_callback(i, n, num_inference_steps))
             if use_cfg:
                 kwargs["negative_prompt_embeds"] = npe.to(self.device)
                 if nmask is not None:

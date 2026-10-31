@@ -557,7 +557,7 @@ export function useWipePreview(enabled: boolean) {
 
 /**
  * Delete one image from disk. The row leaves the cached gallery straight away,
- * because the lightbox is indexed into it and shouldn't show a dead image while
+ * because the lightbox navigates through it and shouldn't show a dead image while
  * the refetch runs. Saved selections forget it too: a stale timeline keyframe
  * would otherwise fail the film it's in.
  */

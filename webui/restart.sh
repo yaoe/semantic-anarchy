@@ -11,7 +11,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOST="${SA_HOST:-100.74.77.125}"
+# Same defaults as run.sh: this machine's Tailscale IP, the repo's own .venv.
+HOST="${SA_HOST:-$(tailscale ip -4 2>/dev/null | head -1 || true)}"
+HOST="${HOST:-127.0.0.1}"
 PORT="${SA_PORT:-8800}"
 
 running=$(curl -s -m3 "http://$HOST:$PORT/api/state" 2>/dev/null \
@@ -20,13 +22,17 @@ if [ "$running" != "None" ] && [ "${1:-}" != "--force" ]; then
   echo "REFUSING: job $running is running (use --force to override)"; exit 1
 fi
 
-pkill -f "webui/app.py" 2>/dev/null || true
-sleep 1
-
 cd "$REPO"
-export SA_PYTHON="${SA_PYTHON:-/home/dream/Desktop/AI/sdxl-travel-ablation/.venv/bin/python}"
+export SA_PYTHON="${SA_PYTHON:-$REPO/.venv/bin/python}"
+if [ ! -x "$SA_PYTHON" ]; then
+  echo "no python at $SA_PYTHON (set SA_PYTHON)"; exit 1
+fi
+export SA_SD15_CKPT="${SA_SD15_CKPT:-$HOME/models/v1-5-pruned-emaonly.safetensors}"
+export SA_SD2_CKPT="${SA_SD2_CKPT:-$HOME/models/v2-1_768-ema-pruned.safetensors}"
 export SA_FLUX2_MODEL="${SA_FLUX2_MODEL:-black-forest-labs/FLUX.2-klein-9B}"
 export SA_HOST="$HOST" SA_PORT="$PORT"
+pkill -f "webui/app.py" 2>/dev/null || true
+sleep 1
 setsid nohup "$SA_PYTHON" webui/app.py > /tmp/sa_webui.log 2>&1 < /dev/null &
 sleep 2
 if curl -s -m5 -o /dev/null -w "%{http_code}" "http://$HOST:$PORT/" | grep -q 200; then

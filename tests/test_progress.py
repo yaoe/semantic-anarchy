@@ -6,7 +6,7 @@ log line, so an unthrottled bar would bury a mine job's real output.
 
 import io
 
-from semantic_anarchy.progress import Progress, bar, fmt_duration
+from semantic_anarchy.progress import Progress, bar, fmt_duration, step_callback
 
 
 class FakeClock:
@@ -126,3 +126,52 @@ def test_context_manager_closes_without_faking_completion():
         p.update(2)
     last = out.getvalue().splitlines()[-1]
     assert "2/4" in last and "100%" not in last
+
+
+def test_slow_rates_are_shown_as_seconds_per_unit():
+    clock = FakeClock()
+    p, out = _pipe(35, clock, interval=0, unit="step")
+    clock.tick(14.0)
+    p.update(2)
+    assert "7.0s/step" in out.getvalue()
+
+
+class FakePipe:
+    def __init__(self, num_timesteps=None):
+        if num_timesteps is not None:
+            self.num_timesteps = num_timesteps
+
+
+def _run_steps(pipe, count, seconds_per_step, steps=None, **kw):
+    clock = FakeClock()
+    out = io.StringIO()
+    cb = step_callback(1, 4, steps or count, stream=out, clock=clock, **kw)
+    for step in range(count):
+        clock.tick(seconds_per_step)
+        latents = {"latents": object()}
+        assert cb(pipe, step, 999 - step, latents) is latents  # diffusers needs it back
+    return out.getvalue().splitlines()
+
+
+def test_step_callback_reports_slow_renders_as_it_goes():
+    lines = _run_steps(FakePipe(35), 35, 7.0, interval=10.0)
+    assert len(lines) > 10
+    assert "[gen] image 2/4" in lines[0] and "7.0s/step" in lines[0] and "eta" in lines[0]
+    assert "100%" in lines[-1] and "35/35" in lines[-1]
+
+
+def test_step_callback_prints_one_line_for_a_fast_image():
+    """A big sd15 batch must not gain several log lines per image."""
+    lines = _run_steps(FakePipe(30), 30, 0.05, interval=10.0)
+    assert len(lines) == 1 and "100%" in lines[0]
+
+
+def test_step_callback_uses_the_pipelines_real_step_count():
+    """img2img runs only `strength` of the steps it was asked for."""
+    lines = _run_steps(FakePipe(9), 9, 1.0, steps=30, interval=10.0)
+    assert "9/9" in lines[-1] and "100%" in lines[-1]
+
+
+def test_step_callback_falls_back_to_requested_steps():
+    lines = _run_steps(FakePipe(), 5, 1.0, interval=10.0)
+    assert "5/5" in lines[-1]

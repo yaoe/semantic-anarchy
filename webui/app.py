@@ -1480,7 +1480,10 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
             backend = b
             break
     model = _model_flags(RunRequest(action="explore", backend=backend))
+    # Measure the radius against whatever corpus is selected, like every other
+    # sampling action, not always the repo's own outputs/dist.
     argv = [python_for(backend), "-u", "scripts/explore.py", "--backend", backend, *model,
+            "--dist", resolve_dist_base(backend),
             "--mode", req.mode, "--src", str(src),
             "--n", str(int(req.n)), "--scheduler", "ddim"]
     if req.mode == "breed":

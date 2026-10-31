@@ -204,11 +204,14 @@ interface UIState {
   tagFilter: string
   setTagFilter: (t: string) => void
 
-  /** -1 = closed. Indexes into the gallery's current (sorted) view. */
-  lightboxIndex: number
-  openLightbox: (i: number) => void
+  /**
+   * The image open full screen, null = closed. Its identity rather than its
+   * position: renders landing mid-batch shift every position in the view, and
+   * that must not change which image is on screen.
+   */
+  lightboxRel: string | null
+  openLightbox: (rel: string) => void
   closeLightbox: () => void
-  moveLightbox: (delta: number, length: number) => void
 
   /** rel-path of the first-clicked 🧬 breed parent, or null. */
   breedParent: string | null
@@ -344,16 +347,9 @@ export const useUI = create<UIState>()(
       tagFilter: '',
       setTagFilter: (tagFilter) => set({ tagFilter }),
 
-      lightboxIndex: -1,
-      openLightbox: (i) => set({ lightboxIndex: i }),
-      closeLightbox: () => set({ lightboxIndex: -1 }),
-      moveLightbox: (delta, length) =>
-        set((s) => {
-          if (s.lightboxIndex < 0 || length === 0) return s
-          const next = s.lightboxIndex + delta
-          if (next < 0 || next >= length) return s
-          return { lightboxIndex: next }
-        }),
+      lightboxRel: null,
+      openLightbox: (lightboxRel) => set({ lightboxRel }),
+      closeLightbox: () => set({ lightboxRel: null }),
 
       breedParent: null,
       setBreedParent: (breedParent) => set({ breedParent }),

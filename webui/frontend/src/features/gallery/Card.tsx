@@ -32,12 +32,10 @@ const ACTION =
  */
 export function Card({
   im,
-  index,
   showNovRes,
   sheet = false,
 }: {
   im: ImageItem
-  index: number
   showNovRes?: boolean
   sheet?: boolean
 }) {
@@ -154,7 +152,7 @@ export function Card({
     <div className="sa-panel group relative flex h-full flex-col overflow-hidden">
       <button
         className="block w-full cursor-zoom-in bg-black p-0"
-        onClick={() => openLightbox(index)}
+        onClick={() => openLightbox(im.rel)}
       >
         <img
           loading="lazy"
