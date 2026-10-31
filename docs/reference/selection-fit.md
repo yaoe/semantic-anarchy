@@ -83,7 +83,7 @@ fit endpoint adds the two dimensions you select *by* once you have labeled — t
 star and the label-score band. The chosen images live in the client
 (`fitSel` in `store.ts`, persisted), not on the server: a filtered set you then
 prune by eye is the normal case, so the selection cannot be a re-derivable
-function of the filters. The ⊕ button on any gallery card adds to that same
+function of the filters. The + box button on any gallery card adds to that same
 list, which is what makes "these six, plus everything I starred yesterday" a
 thing you can express.
 

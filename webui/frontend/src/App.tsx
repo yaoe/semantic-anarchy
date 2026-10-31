@@ -10,6 +10,7 @@ import { ModelPicker } from './features/model/ModelPicker'
 import { JobLog } from './features/jobs/JobLog'
 import { LabelLink } from './features/labeling/LabelLink'
 import { StatusDot } from './features/jobs/StatusDot'
+import { BreedIcon } from './components/ui/actionIcons'
 import { ExploreBar } from './features/refine/ExploreBar'
 import { AnimateBar } from './features/animate/AnimateBar'
 import { RefineBar } from './features/refine/RefineBar'
@@ -19,7 +20,7 @@ import { ScoreBar } from './features/taste/ScoreBar'
 import { WipeDialog } from './features/taste/WipeDialog'
 import { ParamPanel } from './params/ParamPanel'
 import { RunButton } from './params/RunButton'
-import { cn, fmtDuration } from './lib/utils'
+import { basename, cn, fmtDuration } from './lib/utils'
 import { useUI } from './store'
 
 /** Tabs whose items carry conditioning, so the refine/explore bar applies. */
@@ -30,6 +31,9 @@ export default function App() {
   const selectedJob = useUI((s) => s.selectedJob)
   const setSelectedJob = useUI((s) => s.setSelectedJob)
   const tab = useUI((s) => s.tab)
+  const toolsOpen = useUI((s) => s.tools.settingsOpen === '1')
+  const setTool = useUI((s) => s.setTool)
+  const breedParent = useUI((s) => s.breedParent)
 
   const jobs = state?.jobs ?? []
   const busy = state?.running != null
@@ -49,15 +53,12 @@ export default function App() {
     <div className="flex h-full flex-col">
       <header
         className={cn(
-          'relative flex shrink-0 items-baseline gap-3.5 border-b px-5 py-3.5',
+          'relative flex shrink-0 items-center gap-3.5 border-b px-3 py-1',
           'transition-colors duration-500',
           busy ? 'border-run/40 bg-run/[0.08]' : 'border-line',
         )}
       >
-        <h1 className="m-0 text-[17px] tracking-[0.3px]">Semantic&nbsp;Anarchy</h1>
-        <span className="text-[12px] text-dim">
-          promptless explorer · {window.location.host}
-        </span>
+        <h1 className="m-0 text-[14px] tracking-[0.3px]">Semantic&nbsp;Anarchy</h1>
         <a
           href="/legacy"
           className="text-[11px] text-dim underline decoration-dotted hover:text-ink"
@@ -135,7 +136,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col gap-3 p-4 px-5">
+        <main className="flex min-h-0 flex-col gap-1.5 p-1.5">
           <JobLog job={job} />
 
           <Filters
@@ -146,11 +147,21 @@ export default function App() {
                 <AnalyzeBar />
                 <ScoreBar />
                 <WipeDialog />
+                {ACTIONABLE.includes(tab) ? (
+                  <button
+                    className={cn('sa-btn sa-btn-sm', toolsOpen && 'sa-btn-sel')}
+                    aria-expanded={toolsOpen}
+                    title="settings the per-image explore, walk, animate, breed and upscale buttons use"
+                    onClick={() => setTool('settingsOpen', toolsOpen ? '' : '1')}
+                  >
+                    ⚙ Settings
+                  </button>
+                ) : null}
               </>
             }
           />
 
-          {ACTIONABLE.includes(tab) ? (
+          {ACTIONABLE.includes(tab) && toolsOpen ? (
             <div className="sa-panel flex shrink-0 flex-wrap items-end gap-2.5 px-3 py-2.5">
               <RefineBar />
               <div className="self-stretch border-l border-line" />
@@ -158,6 +169,16 @@ export default function App() {
               <div className="self-stretch border-l border-line" />
               <ExploreBar />
             </div>
+          ) : null}
+
+          {/* A half-finished breed has to stay explained with the settings folded:
+              the next 🧬 click on any image would otherwise be a surprise. */}
+          {ACTIONABLE.includes(tab) && !toolsOpen && breedParent ? (
+            <span className="sa-hint shrink-0">
+              <BreedIcon size={12} className="inline" /> parent A = <b className="text-ink">{basename(breedParent)}</b> — click
+              <BreedIcon size={12} className="inline" /> on a
+              second image (same backend) to breed, or click it again to cancel.
+            </span>
           ) : null}
 
           <Gallery busy={busy} />

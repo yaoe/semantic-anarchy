@@ -12,7 +12,7 @@
  * you add or drop individual images by eye — a filtered set you then prune is
  * the normal case, so the selection is kept as its own list rather than being
  * recomputed from the filters. It persists across reloads and across tabs (the
- * ⊕ on any gallery card adds to this same list).
+ * + box on any gallery card adds to this same list).
  *
  * What comes out is an ordinary distribution file, so every sampler, temperature
  * and correction works on it unchanged — see `semantic_anarchy/selection_fit.py`
@@ -395,7 +395,7 @@ export function FitPage() {
       {!gallery.length ? (
         <p className="p-6 text-center text-[13px] text-dim">
           {view === 'selected'
-            ? 'nothing selected yet — pick images from the grid, or hit ⊕ on any gallery card.'
+            ? 'nothing selected yet — pick images from the grid, or hit the + box on any gallery card.'
             : isFetching
               ? 'loading…'
               : 'nothing matches these filters.'}

@@ -2399,6 +2399,40 @@ def _wipe_candidates():
     return out
 
 
+_purge_lock = threading.Lock()
+
+
+def _purge_image_caches(gone: set) -> None:
+    """Forget deleted images in the derived per-image caches.
+
+    Not just tidiness: resonance.py never re-embeds a name it already knows, so a
+    stale entry would give the next image to reuse that name a dead image's CLIP
+    vector, and would keep counting as a gallery neighbor in the novelty maths.
+    """
+    with _purge_lock:   # several 🗑 clicks can be in flight at once
+        for cache in ("novelty.json", "resonance.json", "scores.json"):
+            cp = OUTPUTS / cache
+            if cp.is_file():
+                try:
+                    d = json.loads(cp.read_text())
+                    cp.write_text(json.dumps(
+                        {k: v for k, v in d.items() if k not in gone}))
+                except Exception:
+                    pass
+        emb = OUTPUTS / "clip_embeds.npz"
+        if emb.is_file():
+            try:
+                import numpy as np
+                z = np.load(emb)
+                names, vecs = list(z["names"]), z["vecs"]
+                keep = [i for i, nm in enumerate(names) if str(nm) not in gone]
+                if len(keep) < len(names):
+                    np.savez_compressed(emb, names=np.array([str(names[i]) for i in keep]),
+                                        vecs=vecs[keep])
+            except Exception:
+                pass
+
+
 @app.get("/api/wipe/preview")
 def api_wipe_preview() -> JSONResponse:
     return JSONResponse({"count": len(_wipe_candidates())})
@@ -2416,27 +2450,51 @@ def api_wipe() -> JSONResponse:
             if p.is_file():
                 p.unlink()
                 n_files += 1
-    for cache in ("novelty.json", "resonance.json", "scores.json"):
-        cp = OUTPUTS / cache
-        if cp.is_file():
-            try:
-                d = json.loads(cp.read_text())
-                cp.write_text(json.dumps(
-                    {k: v for k, v in d.items() if k not in gone}))
-            except Exception:
-                pass
-    emb = OUTPUTS / "clip_embeds.npz"
-    if emb.is_file():
-        try:
-            import numpy as np
-            z = np.load(emb)
-            names, vecs = list(z["names"]), z["vecs"]
-            keep = [i for i, nm in enumerate(names) if str(nm) not in gone]
-            np.savez_compressed(emb, names=np.array([str(names[i]) for i in keep]),
-                                vecs=vecs[keep])
-        except Exception:
-            pass
+    _purge_image_caches(gone)
     return JSONResponse({"deleted": len(doomed), "files": n_files})
+
+
+class DeleteImageRequest(BaseModel):
+    rel: str
+
+
+@app.post("/api/image/delete")
+def api_image_delete(req: DeleteImageRequest) -> JSONResponse:
+    """Remove one gallery image and its sidecars from disk, with no undo.
+
+    The stem is the identity, so every extension of it goes. Deliberately strict
+    where _resolve_output_image is forgiving: its fallback to generated/ could
+    delete a same-named image the caller never pointed at. Deleting something
+    already gone succeeds, so a double-click can't surface an error.
+
+    labels.jsonl is left alone: a score is the one record that can't be re-made,
+    and it carries its own snapshot of the knobs for experiment_report.py. Tags are
+    cleared because the vocabulary is derived from what images wear, so a universe
+    has to retire when its last image is deleted.
+    """
+    base = OUTPUTS.resolve()
+    target = (base / req.rel).resolve()
+    prefixes = tuple(prefix for _, prefix in GALLERY_BUCKETS)
+    if (base not in target.parents
+            or target.suffix.lower() not in IMAGE_EXTS
+            or not target.name.startswith(prefixes)):
+        raise HTTPException(404, "not a gallery image")
+    n_files = 0
+    for ext in IMAGE_EXTS + (".json", ".npz"):
+        p = target.with_suffix(ext)
+        if p.is_file():
+            p.unlink(missing_ok=True)
+            n_files += 1
+    gone = {target.with_suffix(e).relative_to(base).as_posix() for e in IMAGE_EXTS}
+    with _favs_lock:
+        favs = load_favs()
+        if favs & gone:
+            save_favs(favs - gone)
+    tagged = current_tags()
+    for rel in gone & tagged.keys():
+        tagset.append_record(tagset.make_record(rel, []), TAGS_FILE)
+    _purge_image_caches(gone)
+    return JSONResponse({"deleted": req.rel, "files": n_files})
 
 
 # --------------------------------------------------------------------------- #

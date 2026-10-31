@@ -1,5 +1,5 @@
 /**
- * Settings for the 🎥 Animate action on gallery cards (POST /api/animate).
+ * Settings for the Animate action on gallery cards (POST /api/animate).
  * Nothing here submits — the card does, reading these values from the store,
  * exactly like `RefineBar`.
  *

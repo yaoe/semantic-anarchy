@@ -181,4 +181,6 @@ export const api = {
     post<{ job_id: number; label: string; name: string }>('/api/animate', body),
   wipe: () => post<WipeResult>('/api/wipe'),
   deleteFilm: (dir: string) => post<{ deleted: string }>('/api/films/delete', { dir }),
+  deleteImage: (rel: string) =>
+    post<{ deleted: string; files: number }>('/api/image/delete', { rel }),
 }

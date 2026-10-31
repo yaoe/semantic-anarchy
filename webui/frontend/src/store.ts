@@ -33,7 +33,7 @@ export const DEFAULT_TOOLS: Record<string, string> = {
   exRadius: '',
   exN: '',
   wkStep: '',
-  // 🎥 Animate (AnimateDiff). 'pixels' starts from the image you can see, which
+  // Animate (AnimateDiff). 'pixels' starts from the image you can see, which
   // is what keeps a flux upscale's enhancement; 'cond' re-renders the off-grid
   // coordinate itself in motion.
   anEngine: 'animatediff',
@@ -213,6 +213,9 @@ interface UIState {
   /** rel-path of the first-clicked 🧬 breed parent, or null. */
   breedParent: string | null
   setBreedParent: (rel: string | null) => void
+
+  /** A deleted image leaves every saved selection that could still point at it. */
+  forgetImage: (rel: string) => void
 }
 
 /**
@@ -300,6 +303,13 @@ export const useUI = create<UIState>()(
           return { fitSel: s.fitSel.filter((r) => !drop.has(r)) }
         }),
       clearFitSel: () => set({ fitSel: [] }),
+
+      forgetImage: (rel) =>
+        set((s) => ({
+          timeline: s.timeline.filter((r) => r !== rel),
+          fitSel: s.fitSel.filter((r) => r !== rel),
+          breedParent: s.breedParent === rel ? null : s.breedParent,
+        })),
 
       label: { ...DEFAULT_LABEL },
       // Any change to WHICH queue is being walked rewinds the cursor — the

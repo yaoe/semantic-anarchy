@@ -13,7 +13,6 @@ import type {
   BackendId,
   DistKind,
   ImageMeta,
-  Images,
   EvolveRequest,
   ExploreRequest,
   FilmRequest,
@@ -22,6 +21,7 @@ import type {
   GenPromptRequest,
   InvertRequest,
   LabelQueryParams,
+  Images,
   LabelQueue,
   PickMode,
   RefineRequest,
@@ -552,6 +552,39 @@ export function useWipePreview(enabled: boolean) {
     queryFn: api.wipePreview,
     enabled,
     refetchInterval: 30000,
+  })
+}
+
+/**
+ * Delete one image from disk. The row leaves the cached gallery straight away,
+ * because the lightbox is indexed into it and shouldn't show a dead image while
+ * the refetch runs. Saved selections forget it too: a stale timeline keyframe
+ * would otherwise fail the film it's in.
+ */
+export function useDeleteImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (rel: string) => api.deleteImage(rel),
+    onSuccess: (_, rel) => {
+      useUI.getState().forgetImage(rel)
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, v]) => [k, v.filter((im) => im.rel !== rel)]),
+            ) as Images)
+          : old,
+      )
+      for (const queryKey of [
+        qk.images,
+        qk.tasteband,
+        qk.tags,
+        qk.labelFacets,
+        qk.wipePreview,
+        ['fitCandidates'],
+      ]) {
+        qc.invalidateQueries({ queryKey })
+      }
+    },
   })
 }
 

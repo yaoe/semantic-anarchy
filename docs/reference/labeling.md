@@ -214,3 +214,9 @@ fifty are.
 | report card | `scripts/experiment_report.py` |
 | the dataset | `labels/labels.jsonl` |
 | what we learned | `docs/TODO/02_experiment_ledger.md` |
+
+## Deleting an image
+
+The gallery's delete button (`POST /api/image/delete` in `webui/app.py`) removes every extension of the stem plus its `.json`/`.npz`, and drops it from favorites, the score/novelty/resonance caches and `clip_embeds.npz`. It appends an empty record to `tags.jsonl`, because the universe vocabulary is derived from what images wear. It never touches `labels.jsonl`: each label carries its own snapshot of the knobs, so it stays a complete data point after the pixels are gone.
+
+**Trap:** `unique_image_path` treats a deleted name as free, so re-running the same seed reuses the rel-path and the new image inherits the old image's label. Upscales of a deleted image also lose the conditioning source they walk back to via `refined_from`.

@@ -11,10 +11,10 @@ import { useUI, type SortKey } from '../../store'
 const TABS = [
   { value: 'generated', label: 'Generated' },
   { value: 'frontier', label: '🎯 Frontier', title: 'Pareto front of novelty × your resonance' },
-  { value: 'top', label: '🏆 Top rated' },
+  { value: 'top', label: '🏆 Top', title: 'top rated by aesthetic score' },
   { value: 'favorites', label: '★ Favorites' },
-  { value: 'temperature', label: 'Temp sweeps' },
-  { value: 'sampler', label: 'Sampler sweeps' },
+  { value: 'temperature', label: 'Temp', title: 'temperature sweeps' },
+  { value: 'sampler', label: 'Sampler', title: 'sampler sweeps' },
   { value: 'marginals', label: 'Marginals' },
   { value: 'timeline', label: '🎬 Timeline', title: 'keyframes to travel through' },
   { value: 'films', label: '🎞 Films' },
@@ -77,7 +77,7 @@ export function Filters({ actions }: { actions?: ReactNode }) {
           options={tagOptions}
           ariaLabel="filter by aesthetic universe"
           title="filter by aesthetic universe (🏷 tags)"
-          className="ml-auto !w-[190px] !py-[5px] !text-[12px]"
+          className="ml-auto !w-[140px] !py-[5px] !text-[12px]"
         />
       ) : null}
       {!UNSORTED.includes(tab) ? (
@@ -88,7 +88,7 @@ export function Filters({ actions }: { actions?: ReactNode }) {
           ariaLabel="gallery order"
           title="gallery order"
           className={cn(
-            '!w-[150px] !py-[5px] !text-[12px]',
+            '!w-[120px] !py-[5px] !text-[12px]',
             tagOptions.length > 1 ? '' : 'ml-auto',
           )}
         />

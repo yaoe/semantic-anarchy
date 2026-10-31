@@ -25,7 +25,7 @@ export function JobLog({ job }: { job: JobSummary | undefined }) {
 
   return (
     <section className="shrink-0">
-      <div className="mb-2 flex items-baseline gap-3">
+      <div className="flex items-baseline gap-3">
         <button
           type="button"
           onClick={toggle}
@@ -58,7 +58,7 @@ export function JobLog({ job }: { job: JobSummary | undefined }) {
             const el = e.currentTarget
             stick.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 30
           }}
-          className="m-0 h-[240px] overflow-auto rounded-lg border border-line bg-logbg p-3
+          className="m-0 mt-1 h-[140px] overflow-auto rounded-lg border border-line bg-logbg p-2
                      font-mono text-[12px] leading-[1.5] whitespace-pre-wrap text-[#cfd3dc]"
         >
           {job == null

@@ -5,6 +5,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import {
   qk,
   useAnimate,
+  useDeleteImage,
   useFavorite,
   useGenPrompt,
   useInvert,
@@ -15,6 +16,7 @@ import {
   useTags,
 } from '../../api/queries'
 import type { ImageItem, ImageMeta, MotionLora } from '../../api/types'
+import { AnimateIcon, DeleteIcon, TimelineIcon } from '../../components/ui/actionIcons'
 import { imgSrc, numOr } from '../../lib/utils'
 import { ANIM_DENOISE, ANIM_MAX_FRAMES, WAN_FRAMES } from '../animate/AnimateBar'
 import { useUI } from '../../store'
@@ -85,6 +87,15 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   const [pinned, setPinned] = useState<string | null>(null)
   useEffect(() => setPinned(null), [index])
 
+  // Deleting the last image of the view leaves the cursor past the end: step
+  // back to the new last image, or close if that was the only one.
+  const openLightbox = useUI((s) => s.openLightbox)
+  useEffect(() => {
+    if (index < items.length) return
+    if (items.length > 0) openLightbox(items.length - 1)
+    else close()
+  }, [index, items.length, openLightbox, close])
+
   const item = items[index] as ImageItem | undefined
   const rel = pinned ?? item?.rel ?? null
   const src = pinned
@@ -125,6 +136,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   const tools = useUI((s) => s.tools)
   const animate = useAnimate()
   const favorite = useFavorite()
+  const del = useDeleteImage()
   const scoreImage = useScoreImage()
   const tagImage = useTagImage()
   const tagInputRef = useRef<HTMLInputElement>(null)
@@ -376,7 +388,8 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
                   disabled={animate.isPending}
                   onClick={doAnimate}
                 >
-                  🎥 animate{wanEngine ? ' (Wan)' : ''}
+                  <AnimateIcon size={12} className="mr-1 inline" />
+                  animate{wanEngine ? ' (Wan)' : ''}
                 </button>
               ) : null}
               {rel && /anarchy_/.test(rel) ? (
@@ -385,7 +398,19 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
                   title="add as a keyframe to the 🎬 Timeline"
                   onClick={() => addKeyframe(rel)}
                 >
-                  🎬 add to timeline{inTimeline > 0 ? ` (${inTimeline})` : ''}
+                  <TimelineIcon size={12} className="mr-1 inline" />
+                  add to timeline{inTimeline > 0 ? ` (${inTimeline})` : ''}
+                </button>
+              ) : null}
+              {rel ? (
+                <button
+                  className="sa-btn sa-btn-sm hover:border-err hover:text-err"
+                  title="delete image + latents from disk (no undo)"
+                  disabled={del.isPending}
+                  onClick={() => del.mutate(rel, { onSuccess: () => setPinned(null) })}
+                >
+                  <DeleteIcon size={12} className="mr-1 inline" />
+                  delete
                 </button>
               ) : null}
 
@@ -438,6 +463,9 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
               ) : null}
             </div>
 
+            {del.isError ? (
+              <div className="text-err">{(del.error as Error).message}</div>
+            ) : null}
             {invert.isError ? (
               <div className="text-err">{(invert.error as Error).message}</div>
             ) : null}

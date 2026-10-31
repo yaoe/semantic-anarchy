@@ -7,7 +7,7 @@ export const HIRES_FACTOR = 2.0
 export const HIRES_DENOISE = 0.3
 
 /**
- * Settings for the ⤴ Upscale action on gallery cards (POST /api/refine).
+ * Settings for the Upscale action on gallery cards (POST /api/refine).
  * Nothing here submits — the card does, reading these values from the store.
  *
  * Three engines, and each one hides the knobs the others own:

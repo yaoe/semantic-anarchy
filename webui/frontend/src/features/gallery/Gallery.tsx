@@ -12,7 +12,7 @@ import { Lightbox } from './Lightbox'
 
 const SHEET_TABS: TabKey[] = ['temperature', 'sampler', 'marginals']
 const MIN_COL = 220
-const GAP = 12
+const GAP = 6
 
 const EMPTY_MSG: Partial<Record<TabKey, string>> = {
   favorites: 'no favorites yet — click the ☆ on any image to add it.',
@@ -102,7 +102,7 @@ export function Gallery({ busy }: { busy: boolean }) {
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => (sheet ? 720 : Math.round(colW + 60)),
+    estimateSize: () => (sheet ? 720 : Math.round(colW + 30)),
     overscan: 3,
   })
 
@@ -153,7 +153,7 @@ export function Gallery({ busy }: { busy: boolean }) {
                   style={{ transform: `translateY(${row.start}px)` }}
                 >
                   <div
-                    className="grid pb-3"
+                    className="grid pb-1.5"
                     style={{
                       gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
                       gap: `${GAP}px`,
@@ -173,7 +173,7 @@ export function Gallery({ busy }: { busy: boolean }) {
               )
             })}
           </div>
-          <div className="py-3.5 text-center text-[12px] text-dim">
+          <div className="py-1.5 text-center text-[12px] text-dim">
             {view.length} image{view.length === 1 ? '' : 's'}
             {tagFilter ? (
               <span className="text-tag">
