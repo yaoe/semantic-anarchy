@@ -40,11 +40,20 @@ sampler bit-for-bit.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+#: Past this many coordinates per sample (flow-model Qwen conditioning) ``fit``
+#: stops making full-size working copies of the corpus and reads it in chunks.
+WIDE_FEATURES = 200_000
+
+#: Float32 size of one chunk in that wide path. Two are alive at once while
+#: filling the Gram matrix, so this is the working memory above the input itself.
+WIDE_CHUNK_BYTES = 2 << 30
 
 #: How many leading PCA axes keep an empirical (sorted-coefficient) CDF at fit
 #: time, for ``sample(empirical_head=...)``. Costs ``N`` floats per axis -- the
@@ -230,6 +239,119 @@ class EmbeddingDistribution:
 
     # ------------------------------------------------------------------ fit ---
     @classmethod
+    def _fit_wide(cls, embeddings, per_token, std_floor, n_components, max_corpus,
+                  log=None) -> "EmbeddingDistribution":
+        """:meth:`fit` for flow-model conditioning, without a full-size copy.
+
+        The same statistics and the same Gram-trick PCA, but ``embeddings`` is
+        only ever read, ``WIDE_CHUNK_BYTES`` at a time: each chunk is cast to
+        float32 (CPU BLAS has no fp16) and centered, and is gone again once its
+        Gram blocks are written. The peak is the input + two chunks + the (k, D)
+        basis, whatever the corpus size. Accumulators stay float64: they are
+        only D or (N, N) long, and it is what keeps a sum of 4k rows honest.
+        """
+        log = log or (lambda _msg: None)
+        n, feature_shape = embeddings.shape[0], embeddings.shape[1:]
+        d_flat = int(np.prod(feature_shape))
+        step = max(1, WIDE_CHUNK_BYTES // (4 * d_flat))
+        chunks = [(i, min(i + step, n)) for i in range(0, n, step)]
+
+        def rows(i0, i1):
+            return embeddings[i0:i1].reshape(i1 - i0, -1).astype(np.float32)
+
+        # ---- per-coordinate moments, streamed --------------------------------
+        t0 = time.monotonic()
+        total, squares = np.zeros(d_flat), np.zeros(d_flat)
+        for i0, i1 in chunks:
+            x = rows(i0, i1)
+            total += x.sum(axis=0, dtype=np.float64)
+            squares += np.einsum("ij,ij->j", x, x, dtype=np.float64)
+        del x
+        mean, second = total / n, squares / n
+        if per_token:
+            std = np.sqrt(np.maximum(second - mean * mean, 0.0)).reshape(feature_shape)
+            mean = mean.reshape(feature_shape)
+        else:
+            # Pool across the token axis: every position shares one Gaussian.
+            mean_f = mean.reshape(feature_shape).mean(axis=0)
+            second_f = second.reshape(feature_shape).mean(axis=0)
+            std_f = np.sqrt(np.maximum(second_f - mean_f * mean_f, 0.0))
+            mean = np.broadcast_to(mean_f, feature_shape).copy()
+            std = np.broadcast_to(std_f, feature_shape).copy()
+        std = np.maximum(std, std_floor)
+        log(f"moments done in {time.monotonic() - t0:.0f}s "
+            f"({len(chunks)} chunks of {step} rows)")
+
+        # ---- Gram matrix, one block pair at a time ---------------------------
+        center = mean.reshape(1, -1).astype(np.float32)
+        whiten = (1.0 / _floor_std(std) ** 2).reshape(-1)    # for corpus_distance
+
+        def centered(i0, i1):
+            x = rows(i0, i1)
+            x -= center
+            return x
+
+        t0 = time.monotonic()
+        g = np.zeros((n, n))
+        total_var = 0.0
+        corpus_distance = np.empty(n, dtype=np.float64)
+        pairs_total, pairs_done = len(chunks) * (len(chunks) + 1) // 2, 0
+        for a, (i0, i1) in enumerate(chunks):
+            xa = centered(i0, i1)
+            total_var += float(np.einsum("ij,ij->", xa, xa, dtype=np.float64))
+            corpus_distance[i0:i1] = np.sqrt(
+                np.einsum("ij,ij,j->i", xa, xa, whiten, dtype=np.float64) / d_flat)
+            g[i0:i1, i0:i1] = xa @ xa.T
+            for j0, j1 in chunks[:a]:
+                block = xa @ centered(j0, j1).T
+                g[i0:i1, j0:j1] = block
+                g[j0:j1, i0:i1] = block.T
+            pairs_done += a + 1
+            elapsed = time.monotonic() - t0
+            log(f"gram {pairs_done}/{pairs_total} block pairs · {elapsed:.0f}s · "
+                f"eta {elapsed * (pairs_total - pairs_done) / pairs_done:.0f}s")
+        del xa
+        total_var /= n - 1
+
+        # ---- the top k axes --------------------------------------------------
+        t0 = time.monotonic()
+        k = max(1, n - 1 if n_components is None else min(int(n_components), n - 1))
+        evals, evecs = np.linalg.eigh(g)
+        del g
+        order = np.argsort(evals)[::-1][:k]
+        s = np.sqrt(np.maximum(evals[order], 1e-12))
+        u = evecs[:, order]
+        log(f"eigendecomposition done in {time.monotonic() - t0:.0f}s")
+
+        t0 = time.monotonic()
+        pca_components = np.zeros((k, d_flat), dtype=np.float32)
+        for i0, i1 in chunks:
+            pca_components += u[i0:i1].T.astype(np.float32) @ centered(i0, i1)
+        pca_components /= s[:, None].astype(np.float32)
+        pca_head = np.sort(u[:, :HEAD_AXES] * np.sqrt(n - 1), axis=0).astype(np.float32)
+        log(f"{k} PCA axes projected in {time.monotonic() - t0:.0f}s")
+
+        if n <= max_corpus:
+            corpus = embeddings
+        else:
+            idx = np.random.default_rng(0).choice(n, size=max_corpus, replace=False)
+            corpus = embeddings[idx]
+
+        return cls(
+            mean=mean.astype(np.float32),
+            std=std.astype(np.float32),
+            feature_shape=tuple(int(d) for d in feature_shape),
+            per_token=per_token,
+            n_samples=int(n),
+            pca_components=pca_components,
+            pca_std=(s / np.sqrt(n - 1)).astype(np.float32),
+            total_var=total_var,
+            corpus_embeddings=corpus.astype(np.float32),
+            pca_head=pca_head,
+            corpus_distance=corpus_distance.astype(np.float32),
+        )
+
+    @classmethod
     def fit(
         cls,
         embeddings: np.ndarray,
@@ -238,6 +360,7 @@ class EmbeddingDistribution:
         n_components: Optional[int] = None,
         max_corpus: int = 256,
         lengths: Optional[np.ndarray] = None,
+        log=None,
     ) -> "EmbeddingDistribution":
         """Fit independent Gaussians (and low-rank PCA structure) to embeddings.
 
@@ -272,12 +395,21 @@ class EmbeddingDistribution:
             ``sample(lengths=...)`` conditions on. Ignored for tensors with no
             token axis (sdxl's ``pooled``) and for the very wide flow-model
             conditioning, where the extra four full-size arrays don't pay.
+        log:
+            Optional ``log(message)`` for progress. Only the wide path reports:
+            it is the one slow enough to look hung without it.
         """
-        # Huge feature dims (flow-model Qwen conditioning: ~1M coords) cannot
-        # afford float64 copies or a direct SVD on a 30GB-RAM box -- stay in
-        # float32 there. (Which PCA *algorithm* to use is a separate question,
-        # decided by the sample/feature ratio below -- don't conflate the two.)
-        wide = int(np.prod(np.asarray(embeddings).shape[1:])) > 200_000
+        # Huge feature dims (flow-model Qwen conditioning: ~2M coords) cannot
+        # afford ANY full-size working copy on a 30GB-RAM box: 4k krea2 prompts
+        # are 15GiB as fp16 and 30GiB per float32 copy. They fit in chunks over
+        # the array as handed in. (Which PCA *algorithm* to use is a separate
+        # question, decided by the sample/feature ratio below -- don't conflate
+        # the two.)
+        embeddings = np.asarray(embeddings)
+        wide = int(np.prod(embeddings.shape[1:])) > WIDE_FEATURES
+        if wide and 1 < embeddings.shape[0] <= int(np.prod(embeddings.shape[1:])):
+            return cls._fit_wide(embeddings, per_token, std_floor, n_components,
+                                 min(max_corpus, 32), log)
         embeddings = np.asarray(embeddings, dtype=np.float32 if wide else np.float64)
         if embeddings.ndim < 2:
             raise ValueError("embeddings must be (N, *feature_shape)")

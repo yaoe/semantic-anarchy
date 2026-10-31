@@ -47,7 +47,9 @@ def plot_marginals(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    embeddings = np.asarray(embeddings, dtype=np.float64)
+    # Only the plotted coordinates get cast: a float64 copy of a 4k-prompt krea2
+    # corpus would be 61GiB, for four histograms.
+    embeddings = np.asarray(embeddings)
     feature_shape = embeddings.shape[1:]
     rng = rng or np.random.default_rng(0)
 
@@ -60,7 +62,7 @@ def plot_marginals(
 
     for ax, coord in zip(axes[0], coords):
         idx = (slice(None),) + tuple(coord)
-        values = embeddings[idx]
+        values = np.asarray(embeddings[idx], dtype=np.float64)
         mu, sigma = float(values.mean()), float(values.std())
 
         if style == "rug":

@@ -93,7 +93,7 @@ class Backend:
     # ---- distribution math (torch-free) ------------------------------------
     def fit(self, named, per_token: bool = True,
             n_components: Optional[int] = None,
-            lengths: Optional[np.ndarray] = None) -> dict:
+            lengths: Optional[np.ndarray] = None, log=None) -> dict:
         """Fit one :class:`EmbeddingDistribution` per named tensor.
 
         ``lengths`` (per-prompt EOS position, from :meth:`token_lengths`) adds the
@@ -103,7 +103,7 @@ class Backend:
         return {
             k: EmbeddingDistribution.fit(np.asarray(v), per_token=per_token,
                                          n_components=n_components,
-                                         lengths=lengths)
+                                         lengths=lengths, log=log)
             for k, v in named.items()
         }
 

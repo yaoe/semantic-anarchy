@@ -167,6 +167,28 @@ def _encode_batches(prompts, batch_size: int, fn, on_batch=None) -> list:
     return out
 
 
+def _encode_stacked(prompts, batch_size: int, fn, on_batch=None) -> np.ndarray:
+    """:func:`_encode_batches`, written straight into one ``(N, ...)`` array.
+
+    For the flow models, whose corpus is tens of GiB: collecting batches and
+    concatenating holds two copies of it at the moment the two meet.
+    """
+    prompts = list(prompts)
+    batch_size = max(1, int(batch_size))
+    out = None
+    with quiet_truncation_warnings():
+        for i in range(0, len(prompts), batch_size):
+            arr = fn(prompts[i : i + batch_size])
+            if out is None:
+                out = np.empty((len(prompts), *arr.shape[1:]), dtype=arr.dtype)
+            out[i : i + batch_size] = arr
+            if on_batch is not None:
+                on_batch(min(i + batch_size, len(prompts)))
+    if out is None:
+        raise ValueError("no prompts to encode")
+    return out
+
+
 def _stream(images: list, index: int, image, on_image) -> None:
     """Record a finished image and hand it straight to the caller.
 
@@ -1030,9 +1052,9 @@ class Flux2Model:
                     max_sequence_length=self.MAX_SEQ)
             if isinstance(pe, (tuple, list)):
                 pe = pe[0]
-            return pe.detach().to(torch.float32).cpu().numpy()
+            return pe.detach().to(torch.float16).cpu().numpy()
 
-        return np.concatenate(_encode_batches(prompts, batch_size, one, on_batch), axis=0)
+        return _encode_stacked(prompts, batch_size, one, on_batch)
 
     # ----------------------------------------------------------- decoding ---
     def generate_from_embeddings(self, embeddings, negative_embedding=None,
@@ -1122,7 +1144,7 @@ class Krea2Model:
             pe = enc[0] if isinstance(enc, (tuple, list)) else enc
             return pe.detach().to(torch.float16).cpu().numpy()
 
-        return np.concatenate(_encode_batches(prompts, batch_size, one, on_batch), axis=0)
+        return _encode_stacked(prompts, batch_size, one, on_batch)
 
     def _uncond_embeds(self):
         import torch

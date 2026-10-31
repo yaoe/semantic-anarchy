@@ -18,6 +18,7 @@ Needs the FULL tier (torch + diffusers). Run::
 from __future__ import annotations
 
 import argparse
+import resource
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,17 @@ from semantic_anarchy.progress import Progress
 #: so most of that is stored noise. Override with --components; --components 0
 #: keeps every axis (the old behaviour).
 MAX_COMPONENTS = 512
+
+
+def memory_note() -> str:
+    """Current and peak RSS. A flow-model fit lives or dies on this number."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20    # kB -> GiB
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        now = pages * resource.getpagesize() / 2**30
+    except (OSError, IndexError, ValueError):
+        return f"peak RSS {peak:.1f}GiB"
+    return f"RSS {now:.1f}GiB, peak {peak:.1f}GiB"
 
 
 def main(argv=None) -> int:
@@ -80,7 +92,9 @@ def main(argv=None) -> int:
         named = backend.encode(prompts, batch_size=args.batch_size,
                                on_batch=bar.update)
     for k, v in named.items():
-        print(f"[mine]   tensor {k!r}: {np.asarray(v).shape}")
+        print(f"[mine]   tensor {k!r}: {np.asarray(v).shape}, "
+              f"{np.asarray(v).dtype}, {np.asarray(v).nbytes / 2**30:.1f}GiB")
+    print(f"[mine] encoded: {memory_note()}")
 
     # The length dimension: where each prompt's EOS falls. Tokenizer-only (no
     # GPU), but it has to happen while the model is still loaded, so it goes
@@ -117,11 +131,12 @@ def main(argv=None) -> int:
     comps = None if comps is not None and comps <= 0 else comps
     print(f"[mine] fitting distribution(s) over {len(prompts)} samples "
           f"(PCA, {comps if comps else 'all'} components; "
-          f"no progress signal, sit tight) ...")
+          f"{memory_note()}) ...")
     t0 = time.monotonic()
     dists = backend.fit(named, per_token=args.per_token, n_components=comps,
-                        lengths=lengths)
-    print(f"[mine] fit done in {time.monotonic() - t0:.1f}s")
+                        lengths=lengths,
+                        log=lambda msg: print(f"[mine]   fit: {msg} · {memory_note()}"))
+    print(f"[mine] fit done in {time.monotonic() - t0:.1f}s · {memory_note()}")
     first_dist = dists[list(dists)[0]]
     floor = first_dist.noise_floor_axes()
     if floor:
