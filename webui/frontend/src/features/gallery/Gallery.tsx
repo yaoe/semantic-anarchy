@@ -92,12 +92,71 @@ export function Gallery({ busy }: { busy: boolean }) {
 
   useEffect(() => {
     if (parentRef.current) parentRef.current.scrollTop = 0
+    setFresh(0)
   }, [tab, sortBy])
+
+  // Keep the view still when the bucket changes under it. Starring refetches
+  // the gallery, and with sort=new every image made since the last fetch lands
+  // at the top at once, pushing rows down; the lightbox cursor is an index, so
+  // it would slide onto another image too. Anchor both on the item they show.
+  const prevRef = useRef<{ view: ImageItem[]; tab: TabKey; sortBy: SortKey; cols: number } | null>(null)
+  const [fresh, setFresh] = useState(0) // new items parked above the anchor
+  useLayoutEffect(() => {
+    const prev = prevRef.current
+    prevRef.current = { view, tab, sortBy, cols }
+    const el = parentRef.current
+    if (!prev || !el || prev.view === view || !prev.view.length || !view.length) return
+    if (prev.tab !== tab || prev.sortBy !== sortBy || prev.cols !== cols) return
+
+    // Lightbox: follow the open image to its new index.
+    const ui = useUI.getState()
+    if (ui.lightboxIndex >= 0) {
+      const rel = prev.view[ui.lightboxIndex]?.rel
+      const ni = rel ? view.findIndex((v) => v.rel === rel) : -1
+      if (ni >= 0 && ni !== ui.lightboxIndex) ui.openLightbox(ni)
+    }
+
+    // Grid: the first row that is still on screen is the anchor. Row sizes are
+    // cached per row *index*, and a prepend only adds rows at the end of the
+    // index space, so measurements[r].start is still the pre-change start.
+    const top = el.scrollTop
+    const ms = virtualizer.measurementsCache
+    const anchorRow = ms.find((m) => m.end > top)
+    if (!anchorRow) return
+    const oldIdx = anchorRow.index * prev.cols
+    const rel = prev.view[oldIdx]?.rel
+    const newIdx = rel ? view.findIndex((v) => v.rel === rel) : -1
+    if (newIdx < 0) return
+    const newRow = Math.floor(newIdx / cols)
+    if (newRow === anchorRow.index) return
+    const start = ms[newRow]?.start ?? anchorRow.start + (newRow - anchorRow.index) * anchorRow.size
+    el.scrollTop = start + (top - anchorRow.start)
+    if (newIdx > oldIdx) setFresh((f) => f + newIdx - oldIdx)
+  }, [view, tab, sortBy, cols, virtualizer])
+
+  const toTop = () => {
+    parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+    setFresh(0)
+  }
 
   const rows = virtualizer.getVirtualItems()
 
   return (
-    <div ref={parentRef} className="min-h-0 flex-1 overflow-auto pr-1">
+    <div
+      ref={parentRef}
+      className="relative min-h-0 flex-1 overflow-auto pr-1"
+      onScroll={(e) => {
+        if (fresh && e.currentTarget.scrollTop < 8) setFresh(0)
+      }}
+    >
+      {fresh > 0 && isGrid(tab) ? (
+        // Zero-height sticky rail: floats over the grid without shifting it.
+        <div className="sticky top-2 z-10 flex h-0 justify-center overflow-visible">
+          <button type="button" className="sa-btn sa-btn-sm shadow-lg" onClick={toTop}>
+            ↑ {fresh} new
+          </button>
+        </div>
+      ) : null}
       {tab === 'map' ? (
         // The map fills the pane and brings its own lightbox (over map nodes).
         <Suspense fallback={<div className="p-8 text-center text-dim">loading map…</div>}>
