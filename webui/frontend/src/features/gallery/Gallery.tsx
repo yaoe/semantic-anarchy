@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { useImages } from '../../api/queries'
@@ -8,6 +8,11 @@ import { Timeline } from '../timeline/Timeline'
 import { useUI, type SortKey } from '../../store'
 import { Card } from './Card'
 import { Lightbox } from './Lightbox'
+
+// three.js is ~600 kB -- only fetched when the 🌌 tab is first opened.
+const LatentMap = lazy(() =>
+  import('../latentmap/LatentMap').then((m) => ({ default: m.LatentMap })),
+)
 
 const SHEET_TABS: TabKey[] = ['temperature', 'sampler', 'marginals']
 const MIN_COL = 220
@@ -40,7 +45,7 @@ function sortItems(list: ImageItem[], sortBy: SortKey): ImageItem[] {
 }
 
 /** Tabs that render their own thing instead of the virtualized image grid. */
-const CUSTOM_TABS: TabKey[] = ['films', 'timeline']
+const CUSTOM_TABS: TabKey[] = ['films', 'timeline', 'map']
 const isGrid = (t: TabKey): t is GalleryKey => !CUSTOM_TABS.includes(t)
 
 /**
@@ -93,7 +98,12 @@ export function Gallery({ busy }: { busy: boolean }) {
 
   return (
     <div ref={parentRef} className="min-h-0 flex-1 overflow-auto pr-1">
-      {tab === 'timeline' ? (
+      {tab === 'map' ? (
+        // The map fills the pane and brings its own lightbox (over map nodes).
+        <Suspense fallback={<div className="p-8 text-center text-dim">loading map…</div>}>
+          <LatentMap busy={busy} />
+        </Suspense>
+      ) : tab === 'timeline' ? (
         <Timeline />
       ) : tab === 'films' ? (
         <FilmList />
@@ -146,7 +156,7 @@ export function Gallery({ busy }: { busy: boolean }) {
           </div>
         </>
       )}
-      <Lightbox items={view} />
+      {tab !== 'map' ? <Lightbox items={view} /> : null}
     </div>
   )
 }

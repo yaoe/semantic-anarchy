@@ -17,6 +17,7 @@ import type {
   Images,
   InvertRequest,
   KeyframeRow,
+  LatentMap,
   ModelConfig,
   ModelRow,
   NativePickResult,
@@ -67,6 +68,8 @@ export const api = {
   state: () => req<StateSnapshot>('/api/state'),
   images: () => req<Images>('/api/images'),
   films: () => req<Film[]>('/api/films'),
+  latentMap: (backend: BackendId) =>
+    req<LatentMap>(`/api/latent-map?backend=${encodeURIComponent(backend)}`),
   tasteband: () => req<TasteBand>('/api/tasteband'),
   wipePreview: () => req<WipePreview>('/api/wipe/preview'),
   meta: (path: string) =>

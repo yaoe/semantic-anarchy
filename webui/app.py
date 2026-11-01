@@ -1157,6 +1157,45 @@ async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
     )
 
 
+_map_lock = threading.Lock()
+
+
+def _map_signature() -> str:
+    """Changes whenever any ``.npz`` under outputs/ does -- image sidecars and
+    the fitted distributions alike."""
+    n, newest = 0, 0.0
+    if OUTPUTS.is_dir():
+        for p in OUTPUTS.rglob("*.npz"):
+            n += 1
+            newest = max(newest, p.stat().st_mtime)
+    return f"{n}:{newest:.3f}"
+
+
+@app.get("/api/latent-map")
+def api_latent_map(backend: str = "sd15") -> FileResponse:
+    """🌌 Map data: every explored image projected onto PCA axes (built by
+    scripts/latent_map.py -- NumPy only, so it runs here, not in the GPU queue)."""
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    out = OUTPUTS / f"latent_map_{backend}.json"
+    sig_file = out.with_suffix(".sig")
+    with _map_lock:
+        sig = _map_signature()
+        fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
+        if not fresh:
+            proc = subprocess.run(
+                [PYTHON, str(REPO / "scripts" / "latent_map.py"),
+                 "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
+                 "--prompts", str(REPO / "prompts_1000.txt")],
+                cwd=str(REPO), capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout).strip().splitlines()
+                raise HTTPException(404 if proc.returncode == 3 else 500,
+                                    msg[-1] if msg else "latent map build failed")
+            sig_file.write_text(sig)
+    return FileResponse(out, media_type="application/json")
+
+
 @app.get("/api/images")
 def api_images() -> JSONResponse:
     favs = load_favs()

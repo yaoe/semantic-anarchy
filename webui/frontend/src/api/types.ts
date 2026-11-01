@@ -53,7 +53,7 @@ export type GalleryKey =
   | 'marginals'
 
 /** Gallery tabs = server buckets + the client-side films/timeline views. */
-export type TabKey = GalleryKey | 'films' | 'timeline'
+export type TabKey = GalleryKey | 'films' | 'timeline' | 'map'
 
 export type Images = Record<GalleryKey, ImageItem[]>
 
@@ -329,4 +329,46 @@ export interface ImageMeta {
   native_sim?: number
   native_from?: string
   [key: string]: unknown
+}
+
+/* ----------------------------------------------------------- latent map --- */
+
+/** One explored image in /api/latent-map (scripts/latent_map.py). */
+export interface MapNode {
+  rel: string
+  name: string
+  /** png mtime (s) */
+  t: number
+  kind: string | null
+  mode: string | null
+  sampler: string | null
+  temperature: number | null
+  distance: number | null
+  /** share of the deviation outside the corpus PCA span, 0..1 */
+  off: number
+  /** corpus-frame z-scores, one per exported axis */
+  c: number[]
+  /** explored-frame coordinates (unit std per axis) */
+  e: number[]
+}
+
+export interface MapEdge {
+  a: number
+  b: number
+  kind: 'parent' | 'breed' | 'walk'
+}
+
+export interface LatentMap {
+  backend: BackendId
+  tensor: string
+  dims: number
+  dist: string
+  built: number
+  axes: {
+    corpus: { share: number[]; extremes: { pos: string[]; neg: string[] }[] }
+    explored: { share: number[] }
+  }
+  nodes: MapNode[]
+  edges: MapEdge[]
+  corpus: { label: string; c: number[] }[]
 }
