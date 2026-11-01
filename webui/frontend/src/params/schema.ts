@@ -196,13 +196,14 @@ export const PARAM_SCHEMA: ParamField[] = [
     span: 2,
     hint: ({ values, config, servers }) => {
       const b = values.backend
+      // A remote box loads its own checkpoint: a local pick doesn't apply there.
+      const remote = b === 'sd15' ? sd15Remote(values, servers) : null
+      if (remote) return { text: `ComfyUI ${remote.key}: SD1.5 checkpoint on that box (512²)` }
       // A checkpoint hand-picked in the ModelPicker replaces whatever the env
       // vars point at, so the "missing checkpoint" warnings no longer apply.
       if (config?.picked_models?.[b as keyof typeof config.picked_models])
         return { text: 'using the checkpoint picked below' }
       if (b === 'sd15') {
-        const remote = sd15Remote(values, servers)
-        if (remote) return { text: `ComfyUI ${remote.key}: SD1.5 checkpoint on that box (512²)` }
         return config?.sd15_ckpt && !config.sd15_ckpt_exists
           ? { text: `SD1.5 checkpoint missing: ${config.sd15_ckpt}`, tone: 'warn' }
           : { text: 'single-file ckpt → --ckpt (512²)' }

@@ -84,6 +84,10 @@ class Backend:
 
     name: str = "base"
     tensor_names: tuple[str, ...] = ()
+    #: What renders the images; recorded in every sidecar. Images from another
+    #: executor (ComfyUI draws its own noise, its "default" sampler isn't PNDM)
+    #: can't be replayed pixel-exactly by the in-process pipeline.
+    executor: str = "diffusers"
 
     # ---- distribution math (torch-free) ------------------------------------
     def fit(self, named, per_token: bool = True,
@@ -263,6 +267,7 @@ class ComfySD15Backend(SD15Backend):
     checkpoint name as Comfy lists it (``SA_COMFY_SD15_CKPT``)."""
 
     DEFAULT_CKPT = "SD1.5/v1-5-pruned-emaonly.ckpt"
+    executor = "comfy"
 
     def __init__(self, client, ckpt: str):
         self.model = None
@@ -454,12 +459,15 @@ class Krea2Backend(SD15Backend):
             height=height, width=width, seed=seed)
 
 
-def make_backend(name: str, model_id=None, ckpt=None, device=None) -> Backend:
+def make_backend(name: str, model_id=None, ckpt=None, device=None,
+                 remote_ok: bool = True) -> Backend:
     """Load the backend named ``sd15`` or ``sdxl`` (touches torch/diffusers).
 
-    With ``SA_COMFY_URL`` set, sd15 runs on that ComfyUI instead."""
+    With ``SA_COMFY_URL`` set, sd15 runs on that ComfyUI instead -- unless the
+    caller needs the in-process pipeline (img2img refine, upscale, films,
+    prompted generation) and passes ``remote_ok=False``."""
     from .comfy import comfy_url
-    if name == "sd15" and comfy_url():
+    if name == "sd15" and remote_ok and comfy_url():
         return ComfySD15Backend.load(comfy_url(), ckpt=ckpt)
     if name == "sd15":
         return SD15Backend.load(model_id=model_id, ckpt=ckpt, device=device)

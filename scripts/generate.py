@@ -147,6 +147,7 @@ def main(argv=None) -> int:
         import json
         meta = {
             "kind": "generate", "backend": args.backend,
+            "executor": backend.executor,
             "model": args.ckpt or args.model or "(default)",
             "sampler": args.sampler, "temperature": args.temperature,
             "coherence": args.coherence if args.sampler == "blend" else None,

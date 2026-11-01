@@ -113,6 +113,7 @@ def main(argv=None) -> int:
         np.savez(path.with_suffix(".npz"), **one)
         meta = {
             "kind": "evolve", "backend": args.backend,
+            "executor": backend.executor,
             "model": args.ckpt or args.model or "(default)",
             "elites": len(anchors), "base_blend": args.base_blend,
             "sampler": args.sampler_override, "temperature": args.temperature,

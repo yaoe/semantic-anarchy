@@ -95,7 +95,7 @@ def main(argv=None) -> int:
           f"strength={args.strength} guidance={guidance} scheduler={scheduler} "
           f"cond={'reused (same latents)' if cond is not None else 'empty-prompt (no sidecar)'}")
     print(f"[refine] loading {args.backend} model {args.ckpt or args.model or '(default)'} ...")
-    backend = load_backend(args)
+    backend = load_backend(args, remote_ok=False)   # drives backend.model directly
 
     img = Image.open(src)
     if args.tiled:

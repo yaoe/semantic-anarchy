@@ -214,8 +214,15 @@ function useJobMutation<TVars, TData extends RunResponse = RunResponse>(
 
 export const useRun = () => useJobMutation((b: RunRequest) => api.run(b))
 export const useRefine = () => useJobMutation((b: RefineRequest) => api.refine(b))
-/** Gallery-side jobs follow the sidebar's "Run on" pick (sd15 only, server-side). */
-const pickedServer = () => useUI.getState().params.server || null
+/**
+ * Gallery-side jobs follow the sidebar's "Run on" pick -- but only while that
+ * field is on screen (sidebar on SD 1.5). A pick left behind under another
+ * backend must not silently route a card's job; null = the server's default.
+ */
+const pickedServer = () => {
+  const p = useUI.getState().params
+  return p.backend === 'sd15' && p.server ? p.server : null
+}
 export const useExplore = () =>
   useJobMutation((b: ExploreRequest) => api.explore({ server: pickedServer(), ...b }))
 export const useEvolve = () =>

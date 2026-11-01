@@ -77,11 +77,42 @@ def cond_to_b64(embed: np.ndarray, pooled: Optional[np.ndarray] = None) -> str:
     return base64.b64encode(pickle.dumps([[t, opts]])).decode("ascii")
 
 
-def b64_to_cond(data: str) -> tuple[np.ndarray, dict]:
-    """ConditioningToBase64 output -> ``(embed (tokens, hidden), options)``."""
-    import torch  # noqa: F401  (pickle resolves torch classes)
+def _load_storage_bytes(b: bytes):
+    """Safe stand-in for ``torch.storage._load_from_bytes``, which calls
+    ``torch.load(..., weights_only=False)`` -- i.e. a second, unrestricted
+    unpickle hidden inside the first."""
+    import torch
 
-    cond = pickle.loads(base64.b64decode(data))
+    return torch.load(io.BytesIO(b), weights_only=True)
+
+
+class _CondUnpickler(pickle.Unpickler):
+    """Admit only what a pickled torch conditioning needs. Anything else -- the
+    payload comes from a remote box -- is refused instead of executed."""
+
+    def find_class(self, module: str, name: str):
+        import collections
+
+        import torch
+
+        allowed = {
+            ("torch._utils", "_rebuild_tensor_v2"): torch._utils._rebuild_tensor_v2,
+            ("torch.storage", "_load_from_bytes"): _load_storage_bytes,
+            ("collections", "OrderedDict"): collections.OrderedDict,
+        }
+        try:
+            return allowed[(module, name)]
+        except KeyError:
+            raise pickle.UnpicklingError(
+                f"comfy: refusing {module}.{name} in a conditioning payload") from None
+
+
+def b64_to_cond(data: str) -> tuple[np.ndarray, dict]:
+    """ConditioningToBase64 output -> ``(embed (tokens, hidden), options)``.
+
+    Unpickled with an allow-list (:class:`_CondUnpickler`): a plain
+    ``pickle.loads`` would let any listed box run code on this machine."""
+    cond = _CondUnpickler(io.BytesIO(base64.b64decode(data))).load()
     t, opts = cond[0]
     return t[0].float().cpu().numpy(), opts
 
@@ -140,8 +171,13 @@ class ComfyClient:
             pass
         self._pending.discard(pid)
 
+    #: A prompt that is in neither the queue nor the history this long is gone
+    #: (the box restarted: its history lives in memory). History is written a
+    #: moment after a prompt leaves the queue, so this only needs to outlast that.
+    LOST_AFTER = 60.0
+
     def wait(self, pid: str, label: str = "comfy") -> dict:
-        last = None
+        last, gone_since = None, None
         while True:
             hist = self.get_json(f"/history/{pid}")
             if pid in hist:
@@ -163,6 +199,15 @@ class ComfyClient:
                 state = f"queued ({len(running) + len(pending)} job(s) on the box)"
             else:
                 state = "finishing"  # left the queue, history not written yet
+            if state == "finishing":
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since > self.LOST_AFTER:
+                    self._pending.discard(pid)
+                    raise ComfyError(f"{label}: prompt {pid[:8]} vanished from the box "
+                                     f"(neither queued nor in history for {self.LOST_AFTER:.0f}s"
+                                     " -- did ComfyUI restart?)")
+            else:
+                gone_since = None
             if state != last:
                 print(f"[{label}] {pid[:8]} {state}", flush=True)
                 last = state

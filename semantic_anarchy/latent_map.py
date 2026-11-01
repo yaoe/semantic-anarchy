@@ -74,23 +74,31 @@ def explained(dist: EmbeddingDistribution, dims: int) -> np.ndarray:
     return var / max(dist.total_var, 1e-12)
 
 
-def sketch_matrix(dist: EmbeddingDistribution, k: int = SKETCH_DIM, seed: int = 0) -> np.ndarray:
-    """Fixed Gaussian random projection ``(D, k)`` (Johnson-Lindenstrauss): keeps
-    pairwise distances of the z-scored embeddings to within a few percent."""
-    d = int(np.prod(dist.feature_shape))
-    rng = np.random.default_rng(seed)
-    return (rng.standard_normal((d, k)) / np.sqrt(k)).astype(np.float32)
+SKETCH_BLOCK = 65536   # feature columns per generated slab of the sketch matrix
 
 
-def sketch(dist: EmbeddingDistribution, x: np.ndarray, r: np.ndarray) -> np.ndarray:
+def sketch(dist: EmbeddingDistribution, x: np.ndarray, k: int = SKETCH_DIM,
+           seed: int = 0) -> np.ndarray:
     """z-scored (per-coordinate, like the distance gauge) then sketched: ``(n, k)``.
+
+    A fixed Gaussian random projection (Johnson-Lindenstrauss) keeps pairwise
+    distances to within a few percent. The ``(D, k)`` matrix is never held
+    whole: it is generated in seeded slabs of :data:`SKETCH_BLOCK` columns, so
+    every call sees the same matrix while peak memory stays ~``SKETCH_BLOCK*k``
+    floats -- for flow-model conditioning D is ~1M, i.e. a 1 GB matrix.
 
     Same sigma floor as :meth:`EmbeddingDistribution.distance`: coordinates the
     corpus never varies (CLIP's start token sits at the fit's 1e-4 floor) would
     otherwise turn a tiny nudge -- e.g. a hybrid SLERP -- into a 1e5 z-score
     that owns the whole explored frame."""
-    std = np.maximum(dist.std, 0.1 * float(np.mean(dist.std)))
-    return (_flat_dev(dist, x) / std.reshape(1, -1)) @ r
+    std = np.maximum(dist.std, 0.1 * float(np.mean(dist.std))).reshape(1, -1)
+    z = (_flat_dev(dist, x) / std).astype(np.float32)
+    out = np.zeros((len(z), k), dtype=np.float64)
+    for b, start in enumerate(range(0, z.shape[1], SKETCH_BLOCK)):
+        cols = z[:, start:start + SKETCH_BLOCK]
+        r = np.random.default_rng([seed, b]).standard_normal((cols.shape[1], k), dtype=np.float32)
+        out += cols @ r
+    return out / np.sqrt(k)
 
 
 def explored_frame(sketches: np.ndarray, dims: int) -> tuple[np.ndarray, np.ndarray]:

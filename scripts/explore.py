@@ -145,6 +145,7 @@ def main(argv=None) -> int:
         d = backend.distance(dists, one)
         meta = {
             "kind": "explore", "mode": args.mode, "backend": args.backend,
+            "executor": backend.executor,
             "model": args.ckpt or args.model or "(default)",
             "parent": args.src.name,
             "parent_b": (args.b.name if args.b else None),

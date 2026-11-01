@@ -228,6 +228,10 @@ def main(argv=None) -> int:
     pngs = [resolve_original(OUT / rel) for rel in args.images]
     metas = [json.loads(p.with_suffix(".json").read_text())
              if p.with_suffix(".json").is_file() else {} for p in pngs]
+    foreign = [p.name for p, m in zip(pngs, metas) if m.get("executor", "diffusers") != "diffusers"]
+    if foreign:
+        print(f"[film] note: {', '.join(foreign)} came from another executor (ComfyUI); the "
+              "film renders in-process, so those keyframes won't reproduce pixel-exactly", flush=True)
     backends = {detect_backend(p, m) for p, m in zip(pngs, metas)}
     if len(backends) > 1:
         raise SystemExit(f"[film] keyframes mix backends {sorted(backends)} -- "
@@ -300,7 +304,7 @@ def main(argv=None) -> int:
         else:
             model_id = ckpt_or_model
     print(f"[film] loading {backend} {ckpt_or_model or '(default)'} ...", flush=True)
-    be = make_backend(backend, model_id=model_id, ckpt=ckpt)
+    be = make_backend(backend, model_id=model_id, ckpt=ckpt, remote_ok=False)  # raw pipe
     pipe = be.model.pipe
     set_scheduler(pipe, scheduler)
     device = be.model.device

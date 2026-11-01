@@ -10,7 +10,7 @@ import numpy as np
 from semantic_anarchy import EmbeddingDistribution
 from semantic_anarchy.latent_map import (
     corpus_indices, explained, explored_frame, off_manifold, project, sketch,
-    sketch_matrix, unproject,
+    unproject,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -75,11 +75,24 @@ def test_sketch_ignores_nudges_on_constant_coordinates():
     x = x.copy()
     x[:, 0, :] = 1.0                                # one constant token row
     d = EmbeddingDistribution.fit(x, max_corpus=16)
-    r = sketch_matrix(d, k=64)
     nudged = d.mean.copy()
     nudged[0, :] += 1e-3                            # off the floor, imperceptibly
     real = unproject(d, [2.0])                      # a 2-sigma move along PC1
-    assert np.linalg.norm(sketch(d, nudged, r)) < 0.1 * np.linalg.norm(sketch(d, real, r))
+    assert np.linalg.norm(sketch(d, nudged, k=64)) < 0.1 * np.linalg.norm(sketch(d, real, k=64))
+
+
+def test_sketch_is_deterministic_and_keeps_distances_across_slabs(monkeypatch):
+    """Same input -> same sketch every call, and generating the matrix in many
+    small slabs still preserves distances (Johnson-Lindenstrauss)."""
+    import semantic_anarchy.latent_map as lm
+    d, x = _dist()
+    monkeypatch.setattr(lm, "SKETCH_BLOCK", 7)          # 60 features -> 9 slabs
+    a = sketch(d, x[:6], k=512)
+    np.testing.assert_array_equal(a, sketch(d, x[:6], k=512))
+    std = np.maximum(d.std, 0.1 * float(np.mean(d.std))).reshape(-1)
+    z = (x[:6].reshape(6, -1) - d.mean.reshape(-1)) / std
+    ratio = np.linalg.norm(a[0] - a[1]) / np.linalg.norm(z[0] - z[1])
+    assert 0.8 < ratio < 1.2
 
 
 def test_corpus_indices_replays_fit_subset():

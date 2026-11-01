@@ -517,6 +517,7 @@ class Job:
     cancel_requested: bool = False   # set by cancel(); decides the final status
     lane: str = LOCAL_SERVER         # which queue: "local" GPU or a ComfyUI server key
     env: dict = field(default_factory=dict)  # per-job env overrides (None = unset)
+    exclusive: bool = False          # runs alone across ALL lanes (writes shared state)
     _proc: Optional[subprocess.Popen] = None
 
 
@@ -526,14 +527,23 @@ class Runner:
     ``local`` is this machine's GPU and takes every job that runs in-process.
     Each ComfyUI server is a lane of its own, so sd15 jobs on B and C run in
     parallel with each other and with local work, while no single box ever
-    gets two of our jobs at once."""
+    gets two of our jobs at once.
+
+    An ``exclusive`` job (mine / evolve: they rewrite the distribution files
+    every other lane reads) waits until no lane is running and holds the others
+    off until it ends. While one is waiting, no new job starts, so it cannot
+    be starved."""
 
     def __init__(self) -> None:
         self._queues: dict[str, "queue.Queue[Job]"] = {}
         self._jobs: dict[int, Job] = {}
         self._seq = 0
         self._lock = threading.Lock()
-        self._current: dict[str, Job] = {}
+        self._gate = threading.Condition(self._lock)
+        self._current: dict[str, Job] = {}   # guarded by _lock
+        self._running = 0                    # non-exclusive jobs running
+        self._exclusive = False              # an exclusive job is running
+        self._excl_waiting = 0               # exclusive jobs waiting to start
 
     def _queue_for(self, lane: str) -> "queue.Queue[Job]":
         with self._lock:
@@ -544,11 +554,12 @@ class Runner:
             return q
 
     def submit(self, action: str, label: str, argv: list[str],
-               lane: str = LOCAL_SERVER, env: Optional[dict] = None) -> Job:
+               lane: str = LOCAL_SERVER, env: Optional[dict] = None,
+               exclusive: bool = False) -> Job:
         with self._lock:
             self._seq += 1
             job = Job(id=self._seq, action=action, label=label, argv=argv,
-                      lane=lane, env=dict(env or {}))
+                      lane=lane, env=dict(env or {}), exclusive=exclusive)
             self._jobs[job.id] = job
         self._queue_for(lane).put(job)
         return job
@@ -571,10 +582,12 @@ class Runner:
         job = self._jobs.get(job_id)
         if not job:
             return False
-        if job.status == "queued":
-            job.status = "cancelled"
-            job.log.append("[webui] cancelled before it started")
-            return True
+        with self._gate:
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.log.append("[webui] cancelled before it started")
+                self._gate.notify_all()      # wake it if it waits at the gate
+                return True
         proc = job._proc
         if job.status == "running" and proc:
             job.cancel_requested = True
@@ -620,13 +633,47 @@ class Runner:
             ],
         }
 
+    def _acquire(self, job: Job) -> bool:
+        """Block until ``job`` may start; False if it was cancelled meanwhile."""
+        with self._gate:
+            if job.exclusive:
+                self._excl_waiting += 1
+                if self._running or self._exclusive:
+                    job.log.append("[webui] waiting for the other lanes to finish")
+                while (self._running or self._exclusive) and job.status != "cancelled":
+                    self._gate.wait()
+                self._excl_waiting -= 1
+            else:
+                if self._exclusive or self._excl_waiting:
+                    job.log.append("[webui] waiting for an exclusive job (mine/evolve)")
+                while (self._exclusive or self._excl_waiting) and job.status != "cancelled":
+                    self._gate.wait()
+            if job.status == "cancelled":
+                self._gate.notify_all()
+                return False
+            if job.exclusive:
+                self._exclusive = True
+            else:
+                self._running += 1
+            return True
+
+    def _release(self, lane: str, job: Job) -> None:
+        with self._gate:
+            self._current.pop(lane, None)
+            if job.exclusive:
+                self._exclusive = False
+            else:
+                self._running -= 1
+            self._gate.notify_all()
+
     def _loop(self, lane: str, q: "queue.Queue[Job]") -> None:
         while True:
             job = q.get()
-            if job.status == "cancelled":
+            if job.status == "cancelled" or not self._acquire(job):
                 continue
-            self._current[lane] = job
-            job.status = "running"
+            with self._lock:
+                self._current[lane] = job
+                job.status = "running"
             job.started = time.time()
             env = dict(os.environ, PYTHONUNBUFFERED="1")
             for k, v in job.env.items():
@@ -658,7 +705,7 @@ class Runner:
             finally:
                 job.ended = time.time()
                 job._proc = None
-                self._current.pop(lane, None)
+                self._release(lane, job)
 
 
 RUNNER = Runner()
@@ -895,7 +942,8 @@ def api_run(req: RunRequest) -> JSONResponse:
     label, argv = build_argv(req)
     if req.backend == "sd15":
         label += f" @ {lane}"
-    job = RUNNER.submit(req.action, label, argv, lane=lane, env=job_env(url))
+    job = RUNNER.submit(req.action, label, argv, lane=lane, env=job_env(url),
+                        exclusive=req.action == "mine")
     return JSONResponse({"job_id": job.id, "label": label, "lane": lane})
 
 
@@ -970,7 +1018,8 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         backend = "sd2"
     else:
         backend = "sd15"
-    model = _model_flags(RunRequest(action="refine", backend=backend))
+    # Every refine engine drives a local pipeline: never the ComfyUI lane.
+    model = _model_flags(RunRequest(action="refine", backend=backend, server=LOCAL_SERVER))
     if req.engine == "hires":
         # The conditioning may live one or more `refined_from` hops back (this is
         # also the pre-flight: an untraceable source 400s instead of burning a job).
@@ -980,14 +1029,14 @@ def api_refine(req: RefineRequest) -> JSONResponse:
             raise HTTPException(400, f"{obackend} latents can't be replayed; use the FLUX engine")
         if req.interp not in INTERPS:
             raise HTTPException(400, f"bad interp {req.interp!r}")
-        model = _model_flags(RunRequest(action="refine", backend=obackend))
+        model = _model_flags(RunRequest(action="refine", backend=obackend, server=LOCAL_SERVER))
         argv = [PYTHON, "-u", "scripts/upscale.py", "--backend", obackend, *model,
                 "--src", str(src), "--factor", str(req.scale),
                 "--denoise", str(req.strength), "--interp", req.interp]
         if req.steps is not None:
             argv += ["--steps", str(int(req.steps))]
         label = f"upscale · {obackend} · {src.name} · x{req.scale} · d{req.strength}"
-        job = RUNNER.submit("refine", label, argv)
+        job = RUNNER.submit("refine", label, argv, env=job_env(None))
         return JSONResponse({"job_id": job.id, "label": label})
     if req.engine == "flux":
         argv = [FLUX_PYTHON, "-u", "scripts/refine_flux.py", "--src", str(src),
@@ -997,7 +1046,7 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         if req.prompt:
             argv += ["--prompt", req.prompt]
         label = f"refine · flux-klein · {src.name} · x{req.scale}"
-        job = RUNNER.submit("refine", label, argv)
+        job = RUNNER.submit("refine", label, argv, env=job_env(None))
         return JSONResponse({"job_id": job.id, "label": label})
     if req.scheduler and req.scheduler not in SCHEDULERS:
         raise HTTPException(400, f"bad scheduler {req.scheduler!r}")
@@ -1011,7 +1060,7 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         argv += ["--tiled", "--overlap", str(int(req.overlap))]
     mode = "tiled" if req.tiled else "single"
     label = f"refine · {backend} · {src.name} · x{req.scale} · d{req.strength} · {mode}"
-    job = RUNNER.submit("refine", label, argv)
+    job = RUNNER.submit("refine", label, argv, env=job_env(None))
     return JSONResponse({"job_id": job.id, "label": label})
 
 
@@ -1156,7 +1205,7 @@ def api_evolve(req: EvolveRequest) -> JSONResponse:
     label = f"evolve★ · {backend} · T={req.temperature}"
     if backend == "sd15":
         label += f" @ {lane}"
-    job = RUNNER.submit("evolve", label, argv, lane=lane, env=job_env(url))
+    job = RUNNER.submit("evolve", label, argv, lane=lane, env=job_env(url), exclusive=True)
     return JSONResponse({"job_id": job.id, "label": label, "lane": lane})
 
 
@@ -1245,7 +1294,7 @@ def api_genprompt(req: GenPromptRequest) -> JSONResponse:
             argv += [flag, str(meta[k])]
     if meta.get("scheduler") and meta["scheduler"] != "default":
         argv += ["--scheduler", meta["scheduler"]]
-    job = RUNNER.submit("genprompt", f"from-prompt · {src.name}", argv)
+    job = RUNNER.submit("genprompt", f"from-prompt · {src.name}", argv, env=job_env(None))
     return JSONResponse({"job_id": job.id})
 
 
@@ -1383,11 +1432,14 @@ def api_latent_map(backend: str = "sd15") -> FileResponse:
         sig = _map_signature()
         fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
         if not fresh:
-            proc = subprocess.run(
-                [PYTHON, str(REPO / "scripts" / "latent_map.py"),
-                 "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
-                 "--prompts", str(REPO / "prompts_1000.txt")],
-                cwd=str(REPO), capture_output=True, text=True, timeout=300)
+            try:
+                proc = subprocess.run(
+                    [PYTHON, str(REPO / "scripts" / "latent_map.py"),
+                     "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
+                     "--prompts", str(REPO / "prompts_1000.txt")],
+                    cwd=str(REPO), capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                raise HTTPException(504, f"latent map for {backend} took over 300 s") from None
             if proc.returncode != 0:
                 msg = (proc.stderr or proc.stdout).strip().splitlines()
                 raise HTTPException(404 if proc.returncode == 3 else 500,
@@ -1808,7 +1860,7 @@ def api_film(req: FilmRequest) -> JSONResponse:
 
     label = (f"film · {name} · {len(rels)} keys × {req.frames_per} · "
              f"{frames}f @ {req.fps}fps · {req.interp}")
-    job = RUNNER.submit("film", label, argv)
+    job = RUNNER.submit("film", label, argv, env=job_env(None))
     return JSONResponse({"job_id": job.id, "label": label, "name": name,
                          "frames": frames})
 

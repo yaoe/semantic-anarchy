@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from semantic_anarchy.backend import dist_backend
 from semantic_anarchy.latent_map import (
     axis_extremes, corpus_indices, explained, explored_frame, off_manifold,
-    project, sketch, sketch_matrix,
+    project, sketch,
 )
 
 CHUNK = 256
@@ -143,7 +143,6 @@ def main(argv=None) -> int:
     print(f"[map] {args.backend}: {tensor}{shape}, {len(dist.pca_std)} corpus axes from {prefix}")
 
     nodes = find_nodes(args.outputs, args.backend, tensor, shape)
-    r = sketch_matrix(dist)
     coords, sk, off, kept = [], [], [], []
     for i in range(0, len(nodes), CHUNK):
         batch = [(j, load_tensor(nodes[j]["npz"], tensor, shape))
@@ -153,7 +152,7 @@ def main(argv=None) -> int:
             continue
         x = np.stack([b[1] for b in batch])
         coords.append(project(dist, x, dims))
-        sk.append(sketch(dist, x, r))
+        sk.append(sketch(dist, x))
         off.append(off_manifold(dist, x))
         kept += [b[0] for b in batch]
     nodes = [nodes[j] for j in kept]
