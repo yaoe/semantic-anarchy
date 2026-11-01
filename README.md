@@ -133,6 +133,18 @@ as a keyframe, drag the keyframes into the order you want, set fps / frames-per-
 / interpolation, and render — the mp4 plays inline in the 🎞 Films tab. Mixed
 backends or mixed resolutions are flagged there before you spend the GPU time.
 
+**Remote ComfyUI (sd15)** — mining and generation can run on any ComfyUI that has
+the [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) pack (its
+`ConditioningToBase64` / `Base64ToConditioning` nodes carry the tensors over HTTP).
+Mine through the same box you generate on, so the distribution lives in that
+box's encoder space:
+
+```bash
+export SA_COMFY_URL=http://127.0.0.1:8188           # your ComfyUI
+python scripts/mine_distribution.py --backend sd15 --prompts prompts_1000.txt --out outputs/dist
+python scripts/generate.py --backend sd15 --n 8
+```
+
 `prompts_1000.txt` is a wide, deterministic "good" corpus you can regenerate with
 `python gen_prompts.py`. Distributions are saved backend-namespaced (`sd15` keeps
 `outputs/dist`; `sdxl` writes `outputs/dist_sdxl__*`), so the two never clash.
@@ -146,6 +158,7 @@ semantic_anarchy/
   pipeline.py       SDModel (SD1.5) + SDXLModel (SDXL) — stock diffusers, lazy torch import
   cli_args.py       shared --backend argparse wiring + per-family defaults
   travel.py         keyframe films — slerp/lerp, easing, frame schedule (pure numpy)
+  comfy.py          remote ComfyUI executor for sd15 — stdlib HTTP, lazy torch
   viz.py · aesthetic.py · evolve.py · cli.py
 scripts/
   mine_distribution.py · generate.py · temperature_sweep.py · sampler_sweep.py

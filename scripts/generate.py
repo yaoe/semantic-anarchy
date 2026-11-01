@@ -66,8 +66,7 @@ def main(argv=None) -> int:
     print(f"[gen] loading {args.backend} model {args.ckpt or args.model or '(default)'} ...")
     backend = load_backend(args)
     if args.scheduler != "default":
-        from semantic_anarchy.pipeline import set_scheduler
-        set_scheduler(backend.model.pipe, args.scheduler)
+        backend.set_scheduler(args.scheduler)
         print(f"[gen] scheduler -> {args.scheduler}")
 
     prefix = dist_prefix(args, str(args.dist))

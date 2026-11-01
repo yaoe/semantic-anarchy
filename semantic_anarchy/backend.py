@@ -213,6 +213,11 @@ class Backend:
         }
 
     # ---- model-touching verbs (subclasses implement) -----------------------
+    def set_scheduler(self, name) -> None:                   # pragma: no cover
+        """Swap the diffusion sampler (``--scheduler``)."""
+        from .pipeline import set_scheduler
+        set_scheduler(self.model.pipe, name)
+
     def encode(self, prompts) -> dict:                       # pragma: no cover
         raise NotImplementedError
 
@@ -250,6 +255,81 @@ class SD15Backend(Backend):
             height=height, width=width, seed=seed,
             init_images=init_images, init_strength=init_strength,
             ip_images=ip_images, ip_scale=ip_scale)
+
+
+class ComfySD15Backend(SD15Backend):
+    """sd15 run on a remote ComfyUI (``SA_COMFY_URL``) instead of in-process
+    diffusers. Same tensor (``embeds`` (77, 768)), same verbs; ``ckpt`` is the
+    checkpoint name as Comfy lists it (``SA_COMFY_SD15_CKPT``)."""
+
+    DEFAULT_CKPT = "SD1.5/v1-5-pruned-emaonly.ckpt"
+
+    def __init__(self, client, ckpt: str):
+        self.model = None
+        self.client = client
+        self.ckpt = ckpt
+        self.scheduler = "default"
+
+    @classmethod
+    def load(cls, url, ckpt=None):
+        import os
+        from .comfy import ComfyClient, match_checkpoint
+        client = ComfyClient(url)
+        default = os.environ.get("SA_COMFY_SD15_CKPT") or cls.DEFAULT_CKPT
+        wanted = match_checkpoint(client.checkpoints(), default, hint=ckpt)
+        print(f"[comfy] sd15 on {url} -> {wanted}")
+        return cls(client, wanted)
+
+    def set_scheduler(self, name) -> None:
+        from .comfy import SAMPLERS
+        if name not in SAMPLERS:
+            raise ValueError(f"comfy: unknown scheduler {name!r}")
+        self.scheduler = name
+
+    def encode(self, prompts) -> dict:
+        from .comfy import ENCODE_CHUNK, b64_to_cond, encode_graph
+        prompts = list(prompts)
+        out, long_ = [], 0
+        for i in range(0, len(prompts), ENCODE_CHUNK):
+            chunk = prompts[i:i + ENCODE_CHUNK]
+            graph, nodes = encode_graph(self.ckpt, chunk)
+            res = self.client.run(graph, label=f"encode {i + len(chunk)}/{len(prompts)}")
+            for node in nodes:
+                emb, _ = b64_to_cond(res[node]["text"][0])
+                # Comfy encodes >77 tokens as extra 77-token windows; the first
+                # window is the truncated prompt, which is what diffusers gives.
+                long_ += emb.shape[0] > 77
+                out.append(emb[:77])
+        if long_:
+            print(f"[comfy] {long_} prompt(s) over 77 tokens truncated")
+        return {"embeds": np.stack(out).astype(np.float32)}
+
+    def generate(self, named, guidance=7.5, steps=30, seed=None,
+                 height=512, width=512, neg_mode="empty",
+                 init_images=None, init_strength=0.7,
+                 ip_images=None, ip_scale=0.7) -> list:
+        from .comfy import GENERATE_CHUNK, SAMPLERS, cond_to_b64, generate_graph
+        if init_images or ip_images:
+            raise NotImplementedError("comfy executor: init images / IP-Adapter not supported yet")
+        embeds = np.asarray(named["embeds"], dtype=np.float32)
+        if embeds.ndim == 2:
+            embeds = embeds[None]
+        if seed is None:
+            seed = int(np.random.SeedSequence().entropy) % (2**31)
+        negative = (cond_to_b64(np.zeros_like(embeds[0]))
+                    if neg_mode == "zeros" else None)
+        sampler, scheduler = SAMPLERS[self.scheduler]
+        images = []
+        for i in range(0, len(embeds), GENERATE_CHUNK):
+            chunk = embeds[i:i + GENERATE_CHUNK]
+            graph, nodes = generate_graph(
+                self.ckpt, [cond_to_b64(e) for e in chunk],
+                [seed + i + j for j in range(len(chunk))],
+                steps=steps, cfg=guidance, sampler=sampler, scheduler=scheduler,
+                width=width, height=height, negative_b64=negative)
+            res = self.client.run(graph, label=f"generate {i + len(chunk)}/{len(embeds)}")
+            images += [self.client.fetch_image(res[n]["images"][0]) for n in nodes]
+        return images
 
 
 class SD2Backend(SD15Backend):
@@ -375,7 +455,12 @@ class Krea2Backend(SD15Backend):
 
 
 def make_backend(name: str, model_id=None, ckpt=None, device=None) -> Backend:
-    """Load the backend named ``sd15`` or ``sdxl`` (touches torch/diffusers)."""
+    """Load the backend named ``sd15`` or ``sdxl`` (touches torch/diffusers).
+
+    With ``SA_COMFY_URL`` set, sd15 runs on that ComfyUI instead."""
+    from .comfy import comfy_url
+    if name == "sd15" and comfy_url():
+        return ComfySD15Backend.load(comfy_url(), ckpt=ckpt)
     if name == "sd15":
         return SD15Backend.load(model_id=model_id, ckpt=ckpt, device=device)
     if name == "sd2":
