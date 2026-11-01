@@ -280,7 +280,9 @@ export interface ExploreRequest {
   b?: string | null
   radius?: number
   mutate?: number
-  direction?: 'outward' | 'random' | 'axis'
+  direction?: 'outward' | 'random' | 'axis' | 'drift'
+  /** walk drift: heading change per frame, radians. */
+  turn?: number
   step?: number
   axis?: number | null
   n?: number

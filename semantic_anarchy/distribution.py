@@ -411,8 +411,12 @@ class EmbeddingDistribution:
         mode: str = "outward",
         rng: Optional[np.random.Generator] = None,
         axis: Optional[int] = None,
+        turn: float = 0.35,
     ) -> np.ndarray:
-        """March from ``anchor`` in ONE persistent direction; return the strip.
+        """March from ``anchor``; return the strip of ``steps`` frames.
+
+        Every mode but ``drift`` holds ONE persistent direction, so chained
+        walks come out as straight segments with corners between them.
 
         Modes:
         * ``outward`` -- along the anchor's own ray from the corpus center, i.e.
@@ -421,8 +425,33 @@ class EmbeddingDistribution:
           watching legibility strain as you leave the promptable region.
         * ``axis`` -- along principal axis ``axis`` (a *meaningful* direction).
         * ``random`` -- a persistent random on-manifold direction.
+        * ``drift`` -- starts like ``random`` (same first frame for the same
+          ``rng``), then after every frame rotates the heading by ``turn``
+          radians toward a fresh random direction orthogonal to it. The heading
+          keeps its length, so ``step`` means the same as in ``random``, and a
+          PCA-fitted heading stays inside the corpus span. A smooth, curving path.
         """
         anchor = np.asarray(anchor, dtype=np.float64)
+        if mode == "drift":
+            rng = rng or np.random.default_rng()
+
+            def draw() -> np.ndarray:
+                return (self._pca_dev(1, None, rng, None)[0]
+                        if self.pca_components is not None else
+                        self._diagonal_dev(1, None, rng)[0]).astype(np.float64)
+
+            d = draw()
+            norm = float(np.linalg.norm(d))
+            c, s_ = float(np.cos(turn)), float(np.sin(turn))
+            x, out = anchor, []
+            for _ in range(steps):
+                x = x + step * d
+                out.append(x)
+                n = draw()
+                n = n - (np.vdot(n, d) / max(np.vdot(d, d), 1e-24)) * d   # orthogonal
+                n *= norm / max(float(np.linalg.norm(n)), 1e-12)          # same length
+                d = c * d + s_ * n                                        # |d| preserved
+            return np.stack(out).astype(np.float32)
         if mode == "outward":
             dev = anchor - self.mean
             out = [self.mean + dev * (1.0 + step * (i + 1)) for i in range(steps)]

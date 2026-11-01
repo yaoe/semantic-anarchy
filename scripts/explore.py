@@ -63,8 +63,11 @@ def main(argv=None) -> int:
     parser.add_argument("--mode", default="neighborhood",
                         choices=["neighborhood", "breed", "walk"])
     parser.add_argument("--direction", default="outward",
-                        choices=["outward", "random", "axis"],
-                        help="walk: outward = straight toward the periphery")
+                        choices=["outward", "random", "axis", "drift"],
+                        help="walk: outward = straight toward the periphery; "
+                             "drift = random start, heading turns every frame")
+    parser.add_argument("--turn", type=float, default=0.35,
+                        help="walk --direction drift: heading change per frame, radians")
     parser.add_argument("--axis", type=int, default=None,
                         help="walk --direction axis: which principal axis")
     parser.add_argument("--step", type=float, default=0.15,
@@ -100,7 +103,8 @@ def main(argv=None) -> int:
     print(f"[explore] mode={args.mode} backend={args.backend} src={args.src.name}"
           + (f" b={args.b.name}" if args.b else "")
           + {"neighborhood": f" radius={args.radius}",
-             "walk": f" direction={args.direction} step={args.step}",
+             "walk": f" direction={args.direction} step={args.step}"
+                     + (f" turn={args.turn}" if args.direction == "drift" else ""),
              "breed": f" mutate={args.mutate}"}[args.mode]
           + f" n={args.n} seed={seed}")
 
@@ -118,7 +122,7 @@ def main(argv=None) -> int:
         named = backend.perturb(dists, anchor, n=args.n, radius=args.radius, rng=rng)
     elif args.mode == "walk":
         named = backend.walk(dists, anchor, steps=args.n, step=args.step,
-                             mode=args.direction, rng=rng, axis=args.axis)
+                             mode=args.direction, rng=rng, axis=args.axis, turn=args.turn)
     else:
         parent_b = _load_anchor(args.b)
         named = backend.breed(dists, anchor, parent_b, n=args.n,
@@ -148,6 +152,7 @@ def main(argv=None) -> int:
             "mutate": (args.mutate if args.mode == "breed" else None),
             "direction": (args.direction if args.mode == "walk" else None),
             "step": (args.step if args.mode == "walk" else None),
+            "turn": (args.turn if args.mode == "walk" and args.direction == "drift" else None),
             "walk_frame": (i + 1 if args.mode == "walk" else None),
             "steps": args.steps, "guidance": args.guidance,
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,

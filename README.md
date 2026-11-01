@@ -133,6 +133,17 @@ as a keyframe, drag the keyframes into the order you want, set fps / frames-per-
 / interpolation, and render — the mp4 plays inline in the 🎞 Films tab. Mixed
 backends or mixed resolutions are flagged there before you spend the GPU time.
 
+**Walks** — `explore.py --mode walk` steps away from an existing image. `outward`,
+`random` and `axis` each hold one heading, so the path is a straight line;
+`--direction drift --turn 0.35` starts like `random` but rotates the heading by
+`turn` radians every frame (step length unchanged, still inside the corpus PCA
+span), so long walks curve. `--turn 0` reproduces `random` exactly.
+
+```bash
+python scripts/explore.py --backend sd15 --mode walk --direction drift --turn 0.35 \
+    --step 0.08 --n 40 --src outputs/generated/anarchy_sd15_7_000.png
+```
+
 **🌌 Latent map** — every image with an `.npz` sidecar, placed in 3D: either on
 the corpus PCA axes (labelled with the corpus prompts at each extreme) or on the
 *explored* frame (a PCA of the gallery itself). Lineage from explore / breed /
@@ -211,7 +222,9 @@ Covers: fit recovers known mean/std; sampling shapes + temperature scaling; PCA
 extrapolation (no clipping); save/load round-trip; the backend abstraction
 (sd15/sdxl two-tensor fit/sample, sampler dispatch); evolution raising the mean
 score on an analytic objective; and the film trajectory math (interpolation
-endpoints, easing curves, frame schedule, noise window).
+endpoints, easing curves, frame schedule, noise window); walk geometry (outward
+growth, drift turn angle and span); the latent-map projections; and the ComfyUI
+executor's checkpoint matching and graph builders.
 
 ## License
 

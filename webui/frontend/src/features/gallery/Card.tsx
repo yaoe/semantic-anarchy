@@ -69,12 +69,14 @@ export function Card({
       n,
     })
 
+  const walkDir = (['outward', 'random', 'drift'] as const).find((d) => d === tools.wkDir) ?? 'outward'
   const doWalk = () =>
     explore.mutate({
       src: im.rel,
       mode: 'walk',
-      direction: 'outward',
+      direction: walkDir,
       step: numOr(tools.wkStep, 0.15),
+      ...(walkDir === 'drift' ? { turn: numOr(tools.wkTurn, 0.35) } : {}),
       n,
     })
 
@@ -155,7 +157,13 @@ export function Card({
               </button>
               <button
                 className="sa-btn sa-btn-sm"
-                title="walk outward toward the periphery from this point"
+                title={
+                  walkDir === 'drift'
+                    ? 'walk a curving path from this point (heading turns every frame)'
+                    : walkDir === 'random'
+                      ? 'walk a straight line in a random on-manifold direction'
+                      : 'walk outward toward the periphery from this point'
+                }
                 disabled={explore.isPending}
                 onClick={doWalk}
               >

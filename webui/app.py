@@ -1021,7 +1021,8 @@ class ExploreRequest(BaseModel):
     b: Optional[str] = None           # second parent (breed)
     radius: float = 0.3
     mutate: float = 0.15
-    direction: str = "outward"        # walk: outward | random | axis
+    direction: str = "outward"        # walk: outward | random | axis | drift
+    turn: float = 0.35                # walk drift: heading change per frame (radians)
     step: float = 0.15                # walk: per-frame step
     axis: Optional[int] = None        # walk: which principal axis
     n: int = 6
@@ -1072,8 +1073,10 @@ def _explorable_source(p: Path) -> Path:
 def api_explore(req: ExploreRequest) -> JSONResponse:
     if req.mode not in ("neighborhood", "breed", "walk"):
         raise HTTPException(400, f"bad mode {req.mode!r}")
-    if req.direction not in ("outward", "random", "axis"):
+    if req.direction not in ("outward", "random", "axis", "drift"):
         raise HTTPException(400, f"bad direction {req.direction!r}")
+    if not 0.0 <= req.turn <= 1.6:
+        raise HTTPException(400, "turn must be in [0, 1.6] radians")
     src = _explorable_source(_resolve_output_png(req.src))
     backend = "sd15"
     for b in ("flux2", "krea2", "sdxl", "sd2"):
@@ -1093,6 +1096,8 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         label = f"breed · {backend} · {src.name} × {b.name}"
     elif req.mode == "walk":
         argv += ["--direction", req.direction, "--step", str(req.step)]
+        if req.direction == "drift":
+            argv += ["--turn", str(float(req.turn))]
         if req.axis is not None:
             argv += ["--axis", str(int(req.axis))]
         label = f"walk · {backend} · {src.name} · {req.direction} ×{req.n}"
@@ -2672,7 +2677,7 @@ async function refineImage(name, btn) {
   setTimeout(() => { if (btn){ btn.disabled=false; btn.textContent="⤴ Upscale"; } }, 4000);
 }
 const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distance","radius","mutate",
-  "direction","step","walk_frame","target_distance","elites","base_blend","dist",
+  "direction","step","turn","walk_frame","target_distance","elites","base_blend","dist",
   "backend","model","sampler","temperature","coherence",
   "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
   "batch_seed","image_seed","index","refined_from","cond_from","engine","factor","denoise",

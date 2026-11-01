@@ -10,7 +10,7 @@ import { useUI } from '../../store'
 /** Field order of the param dump, copied from the legacy PARAM_ORDER. */
 const PARAM_ORDER = [
   'kind', 'mode', 'parent', 'parent_b', 'distance', 'anchor_distance', 'radius',
-  'mutate', 'direction', 'step', 'walk_frame', 'target_distance', 'elites',
+  'mutate', 'direction', 'step', 'turn', 'walk_frame', 'target_distance', 'elites',
   'base_blend', 'dist', 'backend', 'model', 'sampler', 'temperature', 'coherence',
   'components', 'comp_lo', 'equalize', 'truncation', 'steps', 'guidance',
   'scheduler', 'neg_mode', 'height', 'width', 'init_image', 'init_mode',

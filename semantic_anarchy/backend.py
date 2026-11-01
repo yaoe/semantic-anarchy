@@ -140,12 +140,12 @@ class Backend:
         return out
 
     def walk(self, dists, anchors, steps: int = 6, step: float = 0.15,
-             mode: str = "outward", rng=None, axis=None) -> dict:
-        """Persistent-direction walk from a per-tensor anchor dict (see
+             mode: str = "outward", rng=None, axis=None, turn: float = 0.35) -> dict:
+        """Walk from a per-tensor anchor dict (see
         :meth:`EmbeddingDistribution.walk`)."""
         rng = rng or np.random.default_rng()
         return {k: d.walk(anchors[k], steps=steps, step=step, mode=mode,
-                          rng=rng, axis=axis)
+                          rng=rng, axis=axis, turn=turn)
                 for k, d in dists.items()}
 
     def floor_distance(self, dists, named, floor: float) -> dict:

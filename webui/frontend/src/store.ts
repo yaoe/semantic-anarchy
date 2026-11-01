@@ -32,6 +32,8 @@ export const DEFAULT_TOOLS: Record<string, string> = {
   exRadius: '',
   exN: '',
   wkStep: '',
+  wkDir: 'outward',
+  wkTurn: '',
 }
 
 /**

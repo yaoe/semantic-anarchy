@@ -11,7 +11,7 @@ Promptless image generation ("Semantic Anarchy"): encode a corpus of prompts thr
 The repo uses a uv-managed Python 3.12 `.venv` (torch + diffusers + fastapi). Scripts are run as files, not as an installed package (each does `sys.path.insert(0, repo_root)`); there is no `pyproject.toml`.
 
 ```bash
-pytest -q                                   # full suite (36 tests, torch-free, ~9s)
+pytest -q                                   # full suite (74 tests, torch-free, ~9s)
 pytest tests/test_distribution.py -q        # one file
 pytest -q -k pca_samples_lie_in_subspace    # one test
 python scripts/demo_no_sd.py                # end-to-end demo on synthetic embeddings, no torch/GPU
@@ -60,7 +60,7 @@ Model weights are never committed. `outputs/`, `*.npz`, `*.safetensors`, `init_i
 | `blend` | sqrt-weighted mix of the two **covariances** | `coherence=0` ≡ diagonal, `1` ≡ pca, bit-exact at the endpoints |
 | `hybrid` | SLERP between two real corpus embeddings | needs `corpus_embeddings`; stays inside the hull |
 
-Also here: `distance()` (RMS z-score from the corpus center — the "how far off-grid" gauge, ~1.0 for a typical corpus sample, ~T for a temperature-T diagonal sample), `retarget()` (shell sampling: keep direction, pin radius), `neighborhood()`/`walk()` (local navigation), `refit_from_elites()` (evolutionary branches). `fit()` switches to float32 + a Gram-matrix PCA trick when the feature dim exceeds 200k (flow-model Qwen conditioning) — a direct SVD there needs tens of GB.
+Also here: `distance()` (RMS z-score from the corpus center — the "how far off-grid" gauge, ~1.0 for a typical corpus sample, ~T for a temperature-T diagonal sample), `retarget()` (shell sampling: keep direction, pin radius), `neighborhood()`/`walk()` (local navigation; every walk mode holds one heading except `drift`, which turns it by `turn` radians per frame so chains curve instead of zigzagging), `refit_from_elites()` (evolutionary branches). `fit()` switches to float32 + a Gram-matrix PCA trick when the feature dim exceeds 200k (flow-model Qwen conditioning) — a direct SVD there needs tens of GB.
 
 **`backend.py` — the model-agnostic seam.** A model is described purely by its *named conditioning tensors*, and every script drives four generic verbs: `encode → fit → sample → generate`. One `EmbeddingDistribution` is fitted per named tensor, and all tensors are sampled with the *same* knobs so the conditioning set stays coherent.
 
