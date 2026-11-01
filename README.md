@@ -156,6 +156,12 @@ python scripts/mine_distribution.py --backend sd15 --prompts prompts_1000.txt --
 python scripts/generate.py --backend sd15 --n 8
 ```
 
+In the dashboard, list your boxes once — `SA_COMFY_SERVERS="gpu1=https://…,gpu2=https://…"`
+or a gitignored `webui/comfy_servers.json` (`{"servers": {"gpu1": "https://…"}}`) —
+and pick one per job in the sidebar's **Run on** field. Each box gets its own job
+lane: one job at a time per box, boxes in parallel with each other and with local
+work. img2img / IP-Adapter, upscale and films still run in-process (diffusers).
+
 `prompts_1000.txt` is a wide, deterministic "good" corpus you can regenerate with
 `python gen_prompts.py`. Distributions are saved backend-namespaced (`sd15` keeps
 `outputs/dist`; `sdxl` writes `outputs/dist_sdxl__*`), so the two never clash.

@@ -24,6 +24,7 @@ import type {
   RefineRequest,
   RunRequest,
   RunResponse,
+  ServersResponse,
   StateSnapshot,
   TasteBand,
   WipePreview,
@@ -71,6 +72,7 @@ export const api = {
   latentMap: (backend: BackendId) =>
     req<LatentMap>(`/api/latent-map?backend=${encodeURIComponent(backend)}`),
   tasteband: () => req<TasteBand>('/api/tasteband'),
+  servers: () => req<ServersResponse>('/api/servers'),
   wipePreview: () => req<WipePreview>('/api/wipe/preview'),
   meta: (path: string) =>
     req<ImageMeta>(`/api/meta?path=${encodeURIComponent(path)}`),

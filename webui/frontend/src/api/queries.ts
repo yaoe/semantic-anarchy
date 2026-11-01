@@ -29,6 +29,7 @@ export const qk = {
   latentMap: (backend: BackendId, gen: number) => ['latentMap', backend, gen] as const,
   keyframes: (rels: string[]) => ['keyframes', rels.join('|')] as const,
   tasteband: ['tasteband'] as const,
+  servers: ['servers'] as const,
   wipePreview: ['wipePreview'] as const,
   meta: (rel: string) => ['meta', rel] as const,
   model: ['model'] as const,
@@ -43,6 +44,15 @@ export function useConfig() {
     queryKey: qk.config,
     queryFn: api.config,
     refetchInterval: 8000,
+  })
+}
+
+/** Where sd15 jobs can run, with a live probe of each ComfyUI box. */
+export function useServers() {
+  return useQuery({
+    queryKey: qk.servers,
+    queryFn: api.servers,
+    refetchInterval: 15000,
   })
 }
 
@@ -204,8 +214,12 @@ function useJobMutation<TVars, TData extends RunResponse = RunResponse>(
 
 export const useRun = () => useJobMutation((b: RunRequest) => api.run(b))
 export const useRefine = () => useJobMutation((b: RefineRequest) => api.refine(b))
-export const useExplore = () => useJobMutation((b: ExploreRequest) => api.explore(b))
-export const useEvolve = () => useJobMutation((b: EvolveRequest) => api.evolve(b))
+/** Gallery-side jobs follow the sidebar's "Run on" pick (sd15 only, server-side). */
+const pickedServer = () => useUI.getState().params.server || null
+export const useExplore = () =>
+  useJobMutation((b: ExploreRequest) => api.explore({ server: pickedServer(), ...b }))
+export const useEvolve = () =>
+  useJobMutation((b: EvolveRequest) => api.evolve({ server: pickedServer(), ...b }))
 export const useResonance = () => useJobMutation<void>(() => api.resonance())
 export const useScore = () => useJobMutation<void>(() => api.score())
 export const useInvert = () => useJobMutation((b: InvertRequest) => api.invert(b))
