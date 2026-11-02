@@ -26,8 +26,10 @@ export const qk = {
   state: ['state'] as const,
   images: ['images'] as const,
   films: ['films'] as const,
+  latentMap: (backend: BackendId, gen: number) => ['latentMap', backend, gen] as const,
   keyframes: (rels: string[]) => ['keyframes', rels.join('|')] as const,
   tasteband: ['tasteband'] as const,
+  servers: ['servers'] as const,
   wipePreview: ['wipePreview'] as const,
   meta: (rel: string) => ['meta', rel] as const,
   model: ['model'] as const,
@@ -42,6 +44,15 @@ export function useConfig() {
     queryKey: qk.config,
     queryFn: api.config,
     refetchInterval: 8000,
+  })
+}
+
+/** Where sd15 jobs can run, with a live probe of each ComfyUI box. */
+export function useServers() {
+  return useQuery({
+    queryKey: qk.servers,
+    queryFn: api.servers,
+    refetchInterval: 15000,
   })
 }
 
@@ -60,6 +71,21 @@ export function useImages(busy: boolean) {
     queryKey: qk.images,
     queryFn: api.images,
     refetchInterval: busy ? 6000 : false,
+  })
+}
+
+/**
+ * The 🌌 map. Keyed on the gallery's last refresh, so it rebuilds exactly when
+ * new images land (the server re-projects only if a sidecar changed).
+ */
+export function useLatentMap(backend: BackendId, enabled: boolean) {
+  const gen = useQueryClient().getQueryState(qk.images)?.dataUpdatedAt ?? 0
+  return useQuery({
+    queryKey: qk.latentMap(backend, gen),
+    queryFn: () => api.latentMap(backend),
+    enabled,
+    placeholderData: keepPreviousData,
+    retry: false,
   })
 }
 
@@ -188,8 +214,19 @@ function useJobMutation<TVars, TData extends RunResponse = RunResponse>(
 
 export const useRun = () => useJobMutation((b: RunRequest) => api.run(b))
 export const useRefine = () => useJobMutation((b: RefineRequest) => api.refine(b))
-export const useExplore = () => useJobMutation((b: ExploreRequest) => api.explore(b))
-export const useEvolve = () => useJobMutation((b: EvolveRequest) => api.evolve(b))
+/**
+ * Gallery-side jobs follow the sidebar's "Run on" pick -- but only while that
+ * field is on screen (sidebar on SD 1.5). A pick left behind under another
+ * backend must not silently route a card's job; null = the server's default.
+ */
+const pickedServer = () => {
+  const p = useUI.getState().params
+  return p.backend === 'sd15' && p.server ? p.server : null
+}
+export const useExplore = () =>
+  useJobMutation((b: ExploreRequest) => api.explore({ server: pickedServer(), ...b }))
+export const useEvolve = () =>
+  useJobMutation((b: EvolveRequest) => api.evolve({ server: pickedServer(), ...b }))
 export const useResonance = () => useJobMutation<void>(() => api.resonance())
 export const useScore = () => useJobMutation<void>(() => api.score())
 export const useInvert = () => useJobMutation((b: InvertRequest) => api.invert(b))

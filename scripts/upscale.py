@@ -119,6 +119,10 @@ def main(argv=None) -> int:
     scheduler = (args.scheduler if args.scheduler != "default"
                  else (ometa.get("scheduler") or "default"))
     seed = args.seed if args.seed is not None else ometa.get("image_seed")
+    if ometa.get("executor", "diffusers") != "diffusers":
+        print(f"[upscale] note: {origin.name} was rendered by {ometa['executor']}; this pass "
+              "replays it in-process, so noise and sampler differ -- expect drift, not a "
+              "faithful re-render", flush=True)
 
     denoise = clamp_denoise(steps, args.denoise)
     eff = denoise_steps(steps, denoise)
@@ -137,7 +141,7 @@ def main(argv=None) -> int:
           f"scheduler={scheduler}, seed={seed}", flush=True)
     print(f"[upscale] loading {backend_name} model "
           f"{args.ckpt or args.model or '(default)'} ...", flush=True)
-    backend = load_backend(args)
+    backend = load_backend(args, remote_ok=False)   # drives backend.model directly
 
     out_img = backend.model.refine_image(
         img, size=(tw, th), interp=args.interp, num_inference_steps=steps,

@@ -21,11 +21,39 @@ export interface JobSummary {
   ended: number | null
   lines: number
   cmd: string
+  /** Queue lane: "local" or a ComfyUI server key. */
+  lane?: string
 }
 
 export interface StateSnapshot {
   running: number | null
+  /** Every lane's running job (lanes run in parallel). */
+  running_ids?: number[]
   jobs: JobSummary[]
+}
+
+/** One row of GET /api/servers — where an sd15 job can run. */
+export interface ServerRow {
+  key: string
+  kind: 'local' | 'comfy'
+  url: string | null
+  label: string
+  /** comfy: reachable. local: always true. */
+  ok: boolean
+  /** comfy: SD1.5 checkpoint listed. local: null (unknown). */
+  sd15: boolean | null
+  /** comfy: queued + running on that box, anyone's. */
+  queue: number | null
+  /** comfy: a ComfyUI-Manager download is still in flight. */
+  downloading: boolean
+  error: string | null
+  /** Our own queued + running jobs on this lane. */
+  ours: number
+}
+
+export interface ServersResponse {
+  default: string
+  servers: ServerRow[]
 }
 
 /** One row of /api/images (any bucket). */
@@ -53,7 +81,7 @@ export type GalleryKey =
   | 'marginals'
 
 /** Gallery tabs = server buckets + the client-side films/timeline views. */
-export type TabKey = GalleryKey | 'films' | 'timeline'
+export type TabKey = GalleryKey | 'films' | 'timeline' | 'map'
 
 export type Images = Record<GalleryKey, ImageItem[]>
 
@@ -226,6 +254,8 @@ export interface RunRequest {
   init_strength?: number
   ip_scale?: number
   init_folder?: string | null
+  /** sd15: "local" or a /api/servers key. null = the server's default. */
+  server?: string | null
 }
 
 export interface RefineRequest {
@@ -250,12 +280,16 @@ export interface ExploreRequest {
   b?: string | null
   radius?: number
   mutate?: number
-  direction?: 'outward' | 'random' | 'axis'
+  direction?: 'outward' | 'random' | 'axis' | 'drift'
+  /** walk drift: heading change per frame, radians. */
+  turn?: number
   step?: number
   axis?: number | null
   n?: number
   steps?: number | null
   guidance?: number | null
+  /** sd15 run target (filled from the sidebar's "Run on"). */
+  server?: string | null
 }
 
 export interface EvolveRequest {
@@ -263,6 +297,8 @@ export interface EvolveRequest {
   n?: number
   temperature?: number
   base_blend?: number
+  /** sd15 run target (filled from the sidebar's "Run on"). */
+  server?: string | null
 }
 
 export interface InvertRequest {
@@ -329,4 +365,46 @@ export interface ImageMeta {
   native_sim?: number
   native_from?: string
   [key: string]: unknown
+}
+
+/* ----------------------------------------------------------- latent map --- */
+
+/** One explored image in /api/latent-map (scripts/latent_map.py). */
+export interface MapNode {
+  rel: string
+  name: string
+  /** png mtime (s) */
+  t: number
+  kind: string | null
+  mode: string | null
+  sampler: string | null
+  temperature: number | null
+  distance: number | null
+  /** share of the deviation outside the corpus PCA span, 0..1 */
+  off: number
+  /** corpus-frame z-scores, one per exported axis */
+  c: number[]
+  /** explored-frame coordinates (unit std per axis) */
+  e: number[]
+}
+
+export interface MapEdge {
+  a: number
+  b: number
+  kind: 'parent' | 'breed' | 'walk'
+}
+
+export interface LatentMap {
+  backend: BackendId
+  tensor: string
+  dims: number
+  dist: string
+  built: number
+  axes: {
+    corpus: { share: number[]; extremes: { pos: string[]; neg: string[] }[] }
+    explored: { share: number[] }
+  }
+  nodes: MapNode[]
+  edges: MapEdge[]
+  corpus: { label: string; c: number[] }[]
 }

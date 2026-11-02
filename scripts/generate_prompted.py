@@ -51,7 +51,7 @@ def main(argv=None) -> int:
 
     print(f"[gen-prompt] loading {args.backend} model "
           f"{args.ckpt or args.model or '(default)'} ...", flush=True)
-    backend = load_backend(args)
+    backend = load_backend(args, remote_ok=False)   # drives backend.model directly
     pipe = backend.model.pipe
     if args.scheduler != "default":
         from semantic_anarchy.pipeline import set_scheduler

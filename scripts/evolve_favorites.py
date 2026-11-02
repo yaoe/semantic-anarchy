@@ -73,8 +73,7 @@ def main(argv=None) -> int:
     print(f"[evolve] loading {args.backend} model {args.ckpt or args.model or '(default)'} ...")
     backend = load_backend(args)
     if args.scheduler != "default":
-        from semantic_anarchy.pipeline import set_scheduler
-        set_scheduler(backend.model.pipe, args.scheduler)
+        backend.set_scheduler(args.scheduler)
     dists = backend.load_dists(dist_prefix(args, "outputs/dist"))
 
     # Refit each named tensor around the elites; keep the corpus PCA axes so the
@@ -114,6 +113,7 @@ def main(argv=None) -> int:
         np.savez(path.with_suffix(".npz"), **one)
         meta = {
             "kind": "evolve", "backend": args.backend,
+            "executor": backend.executor,
             "model": args.ckpt or args.model or "(default)",
             "elites": len(anchors), "base_blend": args.base_blend,
             "sampler": args.sampler_override, "temperature": args.temperature,

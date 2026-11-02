@@ -32,6 +32,8 @@ export const DEFAULT_TOOLS: Record<string, string> = {
   exRadius: '',
   exN: '',
   wkStep: '',
+  wkDir: 'outward',
+  wkTurn: '',
 }
 
 /**
@@ -55,6 +57,25 @@ export const DEFAULT_FILM: Record<string, string> = {
   guidance: '',
 }
 
+/**
+ * 🌌 Map view knobs. `x`/`y`/`z` are axis indexes into the exported frame;
+ * the flags are '1' / '' like every other boolean form value.
+ */
+export const DEFAULT_MAP: Record<string, string> = {
+  frame: 'corpus',
+  x: '0',
+  y: '1',
+  z: '2',
+  slot: 'x',
+  color: 'origin',
+  blob: '1',
+  corpus: '1',
+  edges: '1',
+  path: '1',
+  squash: '1',
+  panel: '1',
+}
+
 interface UIState {
   params: Values
   setParam: (id: string, value: string) => void
@@ -73,6 +94,9 @@ interface UIState {
 
   film: Record<string, string>
   setFilm: (id: string, value: string) => void
+
+  map: Record<string, string>
+  setMap: (patch: Record<string, string>) => void
 
   selectedJob: number | null
   setSelectedJob: (id: number | null) => void
@@ -111,6 +135,7 @@ const partialize = (s: UIState) => ({
   logCollapsed: s.logCollapsed,
   timeline: s.timeline,
   film: s.film,
+  map: s.map,
 })
 type Persisted = ReturnType<typeof partialize>
 
@@ -147,6 +172,9 @@ export const useUI = create<UIState>()(
 
       film: { ...DEFAULT_FILM },
       setFilm: (id, value) => set((s) => ({ film: { ...s.film, [id]: value } })),
+
+      map: { ...DEFAULT_MAP },
+      setMap: (patch) => set((s) => ({ map: { ...s.map, ...patch } })),
 
       selectedJob: null,
       setSelectedJob: (id) => set({ selectedJob: id }),
@@ -202,6 +230,7 @@ export const useUI = create<UIState>()(
           params: { ...DEFAULT_VALUES, ...(p.params ?? {}) },
           tools: { ...DEFAULT_TOOLS, ...(p.tools ?? {}) },
           film: { ...DEFAULT_FILM, ...(p.film ?? {}) },
+          map: { ...DEFAULT_MAP, ...(p.map ?? {}) },
           timeline: p.timeline ?? [],
         }
       },

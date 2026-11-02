@@ -1,6 +1,6 @@
 import { useMemo, type ReactNode } from 'react'
 
-import { useConfig, useTasteBand } from '../api/queries'
+import { useConfig, useServers, useTasteBand } from '../api/queries'
 import { cn } from '../lib/utils'
 import { useUI } from '../store'
 import { Field } from './Field'
@@ -42,10 +42,11 @@ export function ParamPanel({ after }: { after?: Partial<Record<GroupId, ReactNod
   const values = useUI((s) => s.params)
   const { data: config } = useConfig()
   const { data: tasteband } = useTasteBand()
+  const { data: servers } = useServers()
 
   const ctx: Ctx = useMemo(
-    () => ({ values, config, tasteband }),
-    [values, config, tasteband],
+    () => ({ values, config, tasteband, servers }),
+    [values, config, tasteband, servers],
   )
 
   const byGroup = useMemo(() => {

@@ -77,10 +77,13 @@ def resolve_gen_defaults(args) -> None:
         args.width = d["width"]
 
 
-def load_backend(args):
-    """Construct the backend from parsed args (touches torch/diffusers)."""
+def load_backend(args, remote_ok: bool = True):
+    """Construct the backend from parsed args (touches torch/diffusers).
+
+    ``remote_ok=False`` for scripts that drive the diffusers pipeline directly
+    (``backend.model``): they always run in-process, even with SA_COMFY_URL set."""
     return make_backend(args.backend, model_id=args.model, ckpt=args.ckpt,
-                        device=args.device)
+                        device=args.device, remote_ok=remote_ok)
 
 
 def dist_prefix(args, base: str) -> str:

@@ -10,7 +10,7 @@
  * accepts has a home. `id` is the RunRequest field name; the handful of knobs
  * that are client-side only (aspect) carry `send: false`.
  */
-import type { Config, RunRequest, TasteBand } from '../api/types'
+import type { Config, RunRequest, ServerRow, ServersResponse, TasteBand } from '../api/types'
 import { evalExpr } from '../lib/calc'
 
 /* ------------------------------------------------------------------ types */
@@ -29,6 +29,8 @@ export interface Ctx {
   values: Values
   config?: Config
   tasteband?: TasteBand
+  /** GET /api/servers — where an sd15 job can run (local / ComfyUI boxes). */
+  servers?: ServersResponse
 }
 
 export type Dyn<T> = T | ((ctx: Ctx) => T)
@@ -140,6 +142,36 @@ export const PARAM_SCHEMA: ParamField[] = [
     ],
   },
   {
+    // Where an sd15 job runs: this machine, or a ComfyUI box from the server's
+    // allow-list (webui/comfy_servers.json). Blank = the server's default.
+    id: 'server',
+    type: 'select',
+    group: 'model',
+    label: 'Run on',
+    default: '',
+    emptyAsNull: true,
+    span: 2,
+    when: { backend: ['sd15'] },
+    tooltip:
+      'sd15 only. Each server is its own queue lane: jobs on different boxes run ' +
+      'in parallel, one at a time per box.',
+    options: ({ servers }) => {
+      const rows = servers?.servers ?? []
+      const def = servers?.default
+      return [
+        { value: '', label: def ? `default (${def})` : 'default' },
+        ...rows.map((r) => ({ value: r.key, label: `${serverDot(r)} ${r.label}`, title: serverStatus(r) })),
+      ]
+    },
+    hint: ({ values, servers }) => {
+      const key = values.server || servers?.default
+      const row = servers?.servers.find((r) => r.key === key)
+      if (!row) return servers ? null : { text: 'checking servers…' }
+      const bad = row.kind === 'comfy' && (!row.ok || !row.sd15 || row.downloading)
+      return { text: serverStatus(row), tone: bad ? 'warn' : 'dim' }
+    },
+  },
+  {
     id: 'model',
     type: 'select',
     group: 'model',
@@ -162,8 +194,11 @@ export const PARAM_SCHEMA: ParamField[] = [
     type: 'note',
     group: 'model',
     span: 2,
-    hint: ({ values, config }) => {
+    hint: ({ values, config, servers }) => {
       const b = values.backend
+      // A remote box loads its own checkpoint: a local pick doesn't apply there.
+      const remote = b === 'sd15' ? sd15Remote(values, servers) : null
+      if (remote) return { text: `ComfyUI ${remote.key}: SD1.5 checkpoint on that box (512²)` }
       // A checkpoint hand-picked in the ModelPicker replaces whatever the env
       // vars point at, so the "missing checkpoint" warnings no longer apply.
       if (config?.picked_models?.[b as keyof typeof config.picked_models])
@@ -560,6 +595,32 @@ export const PARAM_SCHEMA: ParamField[] = [
 ]
 
 /* -------------------------------------------------------------- helpers  */
+
+/** ● ready · ◐ SD1.5 still downloading · ○ unreachable / no SD1.5. */
+function serverDot(r: ServerRow): string {
+  if (r.kind === 'local') return '●'
+  if (!r.ok) return '○'
+  if (r.downloading) return '◐'
+  return r.sd15 ? '●' : '○'
+}
+
+/** One-line status of a run target, for the option title and the hint. */
+function serverStatus(r: ServerRow): string {
+  const ours = r.ours ? ` · ${r.ours} of ours queued` : ''
+  if (r.kind === 'local') return `in-process diffusers on the dashboard host${ours}`
+  if (!r.ok) return `${r.key} unreachable (${r.error ?? 'no answer'})`
+  if (r.downloading) return `${r.key}: SD1.5 download still in progress — wait`
+  if (!r.sd15) return `${r.key}: no SD1.5 checkpoint on that box`
+  const q = r.queue ? `busy, ${r.queue} in its queue` : 'idle'
+  return `${r.key} ready · ${q}${ours}`
+}
+
+/** The ComfyUI row an sd15 job would go to, or null when it runs locally. */
+function sd15Remote(values: Values, servers?: ServersResponse): ServerRow | null {
+  const key = values.server || servers?.default
+  const row = servers?.servers.find((r) => r.key === key)
+  return row && row.kind === 'comfy' ? row : null
+}
 
 export const DEFAULT_VALUES: Values = Object.fromEntries(
   PARAM_SCHEMA.filter((f) => f.type !== 'note').map((f) => [f.id, f.default ?? '']),

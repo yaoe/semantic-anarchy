@@ -69,6 +69,39 @@ def test_walk_outward_grows_distance():
     assert abs(ds[0] / a0 - 1.2) < 0.05                    # first frame ≈ +20%
 
 
+def test_walk_drift_turn_zero_is_random_walk():
+    """turn=0 never rotates the heading: drift reproduces the straight random walk."""
+    d = _fit(dist_backend("sd15"))[0]["embeds"]
+    anchor = _fit(dist_backend("sd15"))[1]["embeds"][0]
+    straight = d.walk(anchor, steps=5, step=0.1, mode="random", rng=np.random.default_rng(3))
+    drift = d.walk(anchor, steps=5, step=0.1, mode="drift", turn=0.0,
+                   rng=np.random.default_rng(3))
+    np.testing.assert_allclose(drift, straight, rtol=1e-4, atol=1e-4)
+
+
+def test_walk_drift_curves_at_the_requested_angle():
+    """Equal-length frame-to-frame moves, consecutive moves exactly `turn` apart,
+    and the whole path stays inside the corpus PCA span."""
+    dists, named = _fit(dist_backend("sd15"))
+    d, anchor = dists["embeds"], named["embeds"][0].astype(np.float64)
+    turn = 0.5
+    strip = d.walk(anchor, steps=8, step=0.1, mode="drift", turn=turn,
+                   rng=np.random.default_rng(7)).astype(np.float64)
+    pts = np.concatenate([anchor[None], strip]).reshape(len(strip) + 1, -1)
+    moves = np.diff(pts, axis=0)
+    lens = np.linalg.norm(moves, axis=1)
+    np.testing.assert_allclose(lens, lens[0], rtol=1e-3)
+    cos = [m0 @ m1 / (np.linalg.norm(m0) * np.linalg.norm(m1)) for m0, m1 in zip(moves, moves[1:])]
+    np.testing.assert_allclose(cos, np.cos(turn), atol=1e-3)
+    # the path bends: start-to-end is clearly shorter than the path length
+    assert np.linalg.norm(pts[-1] - pts[0]) < 0.9 * lens.sum()
+    # every move lies in the span of the PCA axes
+    comps = d.pca_components.reshape(d.pca_components.shape[0], -1).astype(np.float64)
+    q, _ = np.linalg.qr(comps.T)
+    resid = moves - (moves @ q) @ q.T
+    assert np.linalg.norm(resid) < 1e-3 * np.linalg.norm(moves)
+
+
 def test_retarget_pins_distance():
     b = dist_backend("sd15")
     dists, _ = _fit(b)

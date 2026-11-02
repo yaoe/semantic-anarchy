@@ -378,7 +378,130 @@ GALLERY_BUCKETS = [
 
 
 # --------------------------------------------------------------------------- #
-# Job model + single-worker queue
+# ComfyUI servers sd15 jobs may run on
+# --------------------------------------------------------------------------- #
+# sd15 can run on a remote ComfyUI (semantic_anarchy/comfy.py) instead of
+# in-process diffusers. The sidebar picks the box per job; the pick reaches the
+# script only as SA_COMFY_URL in that job's environment, and only for a key in
+# this allow-list -- a URL never comes from the request.
+#
+# Sources, first hit wins:
+#   SA_COMFY_SERVERS="gpu1=https://gpu1.example,gpu2=https://gpu2.example"
+#   webui/comfy_servers.json  {"servers": {"gpu1": "https://..."}}  (gitignored)
+# SA_COMFY_URL (the process-wide default) is always offered too, under its own
+# key if it matches one of the above, else as "default".
+COMFY_SERVERS_FILE = Path(
+    os.environ.get("SA_COMFY_SERVERS_FILE", str(REPO / "webui" / "comfy_servers.json"))
+)
+LOCAL_SERVER = "local"   # in-process diffusers on this machine
+_SERVER_KEY = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _clean_servers(pairs) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in pairs:
+        k, v = str(k).strip(), str(v).strip().rstrip("/")
+        if k != LOCAL_SERVER and _SERVER_KEY.match(k) and re.match(r"^https?://", v):
+            out[k] = v
+    return out
+
+
+def comfy_servers() -> dict[str, str]:
+    """``{key: url}`` of ComfyUI boxes the UI may route sd15 jobs to."""
+    env = os.environ.get("SA_COMFY_SERVERS", "").strip()
+    if env:
+        servers = _clean_servers(p.split("=", 1) for p in env.split(",") if "=" in p)
+    else:
+        try:
+            raw = json.loads(COMFY_SERVERS_FILE.read_text())
+            servers = _clean_servers((raw.get("servers") or {}).items())
+        except Exception:
+            servers = {}
+    default = (os.environ.get("SA_COMFY_URL") or "").strip().rstrip("/")
+    if default and default not in servers.values():
+        servers = {"default": default, **servers}
+    return servers
+
+
+def default_server() -> str:
+    """The server a job runs on when the request names none: whatever
+    SA_COMFY_URL points at (so pre-picker behaviour is unchanged), else local."""
+    url = (os.environ.get("SA_COMFY_URL") or "").strip().rstrip("/")
+    for k, v in comfy_servers().items():
+        if v == url:
+            return k
+    return LOCAL_SERVER
+
+
+def resolve_server(backend: str, server: Optional[str]) -> tuple[str, Optional[str]]:
+    """``(lane, comfy_url)`` for a job. Only sd15 can leave this machine; every
+    other backend runs locally whatever the picker says."""
+    if backend != "sd15":
+        return LOCAL_SERVER, None
+    key = server or default_server()
+    if key == LOCAL_SERVER:
+        return LOCAL_SERVER, None
+    servers = comfy_servers()
+    if key not in servers:
+        raise HTTPException(400, f"unknown server {key!r} (have: {', '.join([LOCAL_SERVER, *servers])})")
+    return key, servers[key]
+
+
+def job_env(comfy_url: Optional[str]) -> dict[str, Optional[str]]:
+    """Per-job env overrides: the chosen box, or *no* box (None = unset) so a
+    local job never inherits the process-wide SA_COMFY_URL."""
+    return {"SA_COMFY_URL": comfy_url}
+
+
+# The checkpoint name sd15 jobs load on a ComfyUI box, as Comfy lists it.
+COMFY_SD15_CKPT = os.environ.get("SA_COMFY_SD15_CKPT", "SD1.5/v1-5-pruned-emaonly.ckpt")
+_probe_cache: dict[str, tuple[float, dict]] = {}
+_probe_lock = threading.Lock()
+PROBE_TTL = 10.0
+
+
+def _probe_server(url: str) -> dict:
+    """Read-only health check: reachable, SD1.5 checkpoint present (and not
+    still being written by a ComfyUI-Manager download), queue depth."""
+    import urllib.request
+
+    def get(path: str, timeout: float = 4.0):
+        with urllib.request.urlopen(url + path, timeout=timeout) as r:
+            return json.load(r)
+
+    info: dict = {"ok": False, "sd15": False, "queue": None, "downloading": False, "error": None}
+    try:
+        q = get("/queue")
+        info["queue"] = len(q.get("queue_running", [])) + len(q.get("queue_pending", []))
+        info["ok"] = True
+        names = get("/object_info/CheckpointLoaderSimple")["CheckpointLoaderSimple"][
+            "input"]["required"]["ckpt_name"][0]
+        want = COMFY_SD15_CKPT.replace("\\", "/")
+        info["sd15"] = any(n.replace("\\", "/") == want for n in names)
+        try:
+            m = get("/manager/queue/status", timeout=2.0)
+            info["downloading"] = bool(m.get("is_processing"))
+        except Exception:
+            pass
+    except Exception as exc:                            # noqa: BLE001
+        info["error"] = type(exc).__name__
+    return info
+
+
+def probe_server(url: str) -> dict:
+    now = time.time()
+    with _probe_lock:
+        hit = _probe_cache.get(url)
+        if hit and now - hit[0] < PROBE_TTL:
+            return hit[1]
+    info = _probe_server(url)
+    with _probe_lock:
+        _probe_cache[url] = (time.time(), info)
+    return info
+
+
+# --------------------------------------------------------------------------- #
+# Job model + per-lane queues
 # --------------------------------------------------------------------------- #
 @dataclass
 class Job:
@@ -392,27 +515,63 @@ class Job:
     ended: Optional[float] = None
     log: list[str] = field(default_factory=list)
     cancel_requested: bool = False   # set by cancel(); decides the final status
+    lane: str = LOCAL_SERVER         # which queue: "local" GPU or a ComfyUI server key
+    env: dict = field(default_factory=dict)  # per-job env overrides (None = unset)
+    exclusive: bool = False          # runs alone across ALL lanes (writes shared state)
     _proc: Optional[subprocess.Popen] = None
 
 
 class Runner:
-    """Serialises jobs onto one worker thread (one GPU)."""
+    """One worker thread per *lane*, each lane strictly one job at a time.
+
+    ``local`` is this machine's GPU and takes every job that runs in-process.
+    Each ComfyUI server is a lane of its own, so sd15 jobs on B and C run in
+    parallel with each other and with local work, while no single box ever
+    gets two of our jobs at once.
+
+    An ``exclusive`` job (mine / evolve: they rewrite the distribution files
+    every other lane reads) waits until no lane is running and holds the others
+    off until it ends. While one is waiting, no new job starts, so it cannot
+    be starved."""
 
     def __init__(self) -> None:
-        self._q: "queue.Queue[Job]" = queue.Queue()
+        self._queues: dict[str, "queue.Queue[Job]"] = {}
         self._jobs: dict[int, Job] = {}
         self._seq = 0
         self._lock = threading.Lock()
-        self._current: Optional[Job] = None
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._gate = threading.Condition(self._lock)
+        self._current: dict[str, Job] = {}   # guarded by _lock
+        self._running = 0                    # non-exclusive jobs running
+        self._exclusive = False              # an exclusive job is running
+        self._excl_waiting = 0               # exclusive jobs waiting to start
 
-    def submit(self, action: str, label: str, argv: list[str]) -> Job:
+    def _queue_for(self, lane: str) -> "queue.Queue[Job]":
+        with self._lock:
+            q = self._queues.get(lane)
+            if q is None:
+                q = self._queues[lane] = queue.Queue()
+                threading.Thread(target=self._loop, args=(lane, q), daemon=True).start()
+            return q
+
+    def submit(self, action: str, label: str, argv: list[str],
+               lane: str = LOCAL_SERVER, env: Optional[dict] = None,
+               exclusive: bool = False) -> Job:
         with self._lock:
             self._seq += 1
-            job = Job(id=self._seq, action=action, label=label, argv=argv)
+            job = Job(id=self._seq, action=action, label=label, argv=argv,
+                      lane=lane, env=dict(env or {}), exclusive=exclusive)
             self._jobs[job.id] = job
-        self._q.put(job)
+        self._queue_for(lane).put(job)
         return job
+
+    def busy_lanes(self) -> dict[str, int]:
+        """``{lane: queued + running}`` of our own jobs."""
+        out: dict[str, int] = {}
+        with self._lock:
+            for j in self._jobs.values():
+                if j.status in ("queued", "running"):
+                    out[j.lane] = out.get(j.lane, 0) + 1
+        return out
 
     def get(self, job_id: int) -> Optional[Job]:
         return self._jobs.get(job_id)
@@ -423,10 +582,12 @@ class Runner:
         job = self._jobs.get(job_id)
         if not job:
             return False
-        if job.status == "queued":
-            job.status = "cancelled"
-            job.log.append("[webui] cancelled before it started")
-            return True
+        with self._gate:
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.log.append("[webui] cancelled before it started")
+                self._gate.notify_all()      # wake it if it waits at the gate
+                return True
         proc = job._proc
         if job.status == "running" and proc:
             job.cancel_requested = True
@@ -449,8 +610,12 @@ class Runner:
     def snapshot(self) -> dict:
         with self._lock:
             jobs = sorted(self._jobs.values(), key=lambda j: j.id, reverse=True)
+            running = sorted(j.id for j in self._current.values())
         return {
-            "running": self._current.id if self._current else None,
+            # "running" stays a single id (restart.sh and the legacy page read
+            # it); running_ids lists every lane's current job.
+            "running": next(iter(running), None),
+            "running_ids": running,
             "jobs": [
                 {
                     "id": j.id,
@@ -462,20 +627,60 @@ class Runner:
                     "ended": j.ended,
                     "lines": len(j.log),
                     "cmd": " ".join(shlex.quote(a) for a in j.argv),
+                    "lane": j.lane,
                 }
                 for j in jobs
             ],
         }
 
-    def _loop(self) -> None:
-        while True:
-            job = self._q.get()
+    def _acquire(self, job: Job) -> bool:
+        """Block until ``job`` may start; False if it was cancelled meanwhile."""
+        with self._gate:
+            if job.exclusive:
+                self._excl_waiting += 1
+                if self._running or self._exclusive:
+                    job.log.append("[webui] waiting for the other lanes to finish")
+                while (self._running or self._exclusive) and job.status != "cancelled":
+                    self._gate.wait()
+                self._excl_waiting -= 1
+            else:
+                if self._exclusive or self._excl_waiting:
+                    job.log.append("[webui] waiting for an exclusive job (mine/evolve)")
+                while (self._exclusive or self._excl_waiting) and job.status != "cancelled":
+                    self._gate.wait()
             if job.status == "cancelled":
+                self._gate.notify_all()
+                return False
+            if job.exclusive:
+                self._exclusive = True
+            else:
+                self._running += 1
+            return True
+
+    def _release(self, lane: str, job: Job) -> None:
+        with self._gate:
+            self._current.pop(lane, None)
+            if job.exclusive:
+                self._exclusive = False
+            else:
+                self._running -= 1
+            self._gate.notify_all()
+
+    def _loop(self, lane: str, q: "queue.Queue[Job]") -> None:
+        while True:
+            job = q.get()
+            if job.status == "cancelled" or not self._acquire(job):
                 continue
-            self._current = job
-            job.status = "running"
+            with self._lock:
+                self._current[lane] = job
+                job.status = "running"
             job.started = time.time()
             env = dict(os.environ, PYTHONUNBUFFERED="1")
+            for k, v in job.env.items():
+                if v is None:
+                    env.pop(k, None)
+                else:
+                    env[k] = v
             try:
                 job._proc = subprocess.Popen(
                     job.argv, cwd=str(REPO), env=env,
@@ -500,7 +705,7 @@ class Runner:
             finally:
                 job.ended = time.time()
                 job._proc = None
-                self._current = None
+                self._release(lane, job)
 
 
 RUNNER = Runner()
@@ -538,6 +743,7 @@ class RunRequest(BaseModel):
     init_strength: float = 0.7        # img2img denoise from the init (0.6-0.8)
     ip_scale: float = 0.7             # IP-Adapter image-embedding strength
     init_folder: Optional[str] = None # which subfolder to pick from ("" / "__any__" = any)
+    server: Optional[str] = None      # sd15: "local" or a comfy_servers() key; None = default
 
 
 def _model_flags(req: RunRequest) -> list[str]:
@@ -546,6 +752,10 @@ def _model_flags(req: RunRequest) -> list[str]:
     A checkpoint hand-picked in the sidebar (webui/model_config.json) overrides
     all of that for its backend.
     """
+    # sd15 on a remote ComfyUI (SA_COMFY_URL): the checkpoint lives on that box,
+    # so there is no local path to check -- pass Comfy's own checkpoint name.
+    if resolve_server(req.backend, req.server)[1]:
+        return ["--ckpt", COMFY_SD15_CKPT]
     picked = selected_model(req.backend)
     if picked:
         if not Path(picked).exists():
@@ -728,9 +938,34 @@ def legacy_index() -> str:
 
 @app.post("/api/run")
 def api_run(req: RunRequest) -> JSONResponse:
+    lane, url = resolve_server(req.backend, req.server)
     label, argv = build_argv(req)
-    job = RUNNER.submit(req.action, label, argv)
-    return JSONResponse({"job_id": job.id, "label": label})
+    if req.backend == "sd15":
+        label += f" @ {lane}"
+    job = RUNNER.submit(req.action, label, argv, lane=lane, env=job_env(url),
+                        exclusive=req.action == "mine")
+    return JSONResponse({"job_id": job.id, "label": label, "lane": lane})
+
+
+@app.get("/api/servers")
+def api_servers() -> JSONResponse:
+    """Where sd15 jobs can run, with a live read-only probe of each ComfyUI box
+    (cached ~10 s) and how many of our own jobs each lane holds."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    servers = comfy_servers()
+    with ThreadPoolExecutor(max_workers=max(1, len(servers))) as ex:
+        probes = dict(zip(servers, ex.map(probe_server, servers.values())))
+    busy = RUNNER.busy_lanes()
+    rows = [{"key": LOCAL_SERVER, "kind": "local", "url": None,
+             "label": "this machine (diffusers)", "ok": True, "sd15": None,
+             "queue": None, "downloading": False, "error": None,
+             "ours": busy.get(LOCAL_SERVER, 0)}]
+    for k, url in servers.items():
+        host = re.sub(r"^https?://", "", url).split(".")[0]
+        rows.append({"key": k, "kind": "comfy", "url": url, "label": f"{k} · {host}",
+                     **probes[k], "ours": busy.get(k, 0)})
+    return JSONResponse({"default": default_server(), "servers": rows})
 
 
 #: Upscale engines, in the order the UI offers them.
@@ -783,7 +1018,8 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         backend = "sd2"
     else:
         backend = "sd15"
-    model = _model_flags(RunRequest(action="refine", backend=backend))
+    # Every refine engine drives a local pipeline: never the ComfyUI lane.
+    model = _model_flags(RunRequest(action="refine", backend=backend, server=LOCAL_SERVER))
     if req.engine == "hires":
         # The conditioning may live one or more `refined_from` hops back (this is
         # also the pre-flight: an untraceable source 400s instead of burning a job).
@@ -793,14 +1029,14 @@ def api_refine(req: RefineRequest) -> JSONResponse:
             raise HTTPException(400, f"{obackend} latents can't be replayed; use the FLUX engine")
         if req.interp not in INTERPS:
             raise HTTPException(400, f"bad interp {req.interp!r}")
-        model = _model_flags(RunRequest(action="refine", backend=obackend))
+        model = _model_flags(RunRequest(action="refine", backend=obackend, server=LOCAL_SERVER))
         argv = [PYTHON, "-u", "scripts/upscale.py", "--backend", obackend, *model,
                 "--src", str(src), "--factor", str(req.scale),
                 "--denoise", str(req.strength), "--interp", req.interp]
         if req.steps is not None:
             argv += ["--steps", str(int(req.steps))]
         label = f"upscale · {obackend} · {src.name} · x{req.scale} · d{req.strength}"
-        job = RUNNER.submit("refine", label, argv)
+        job = RUNNER.submit("refine", label, argv, env=job_env(None))
         return JSONResponse({"job_id": job.id, "label": label})
     if req.engine == "flux":
         argv = [FLUX_PYTHON, "-u", "scripts/refine_flux.py", "--src", str(src),
@@ -810,7 +1046,7 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         if req.prompt:
             argv += ["--prompt", req.prompt]
         label = f"refine · flux-klein · {src.name} · x{req.scale}"
-        job = RUNNER.submit("refine", label, argv)
+        job = RUNNER.submit("refine", label, argv, env=job_env(None))
         return JSONResponse({"job_id": job.id, "label": label})
     if req.scheduler and req.scheduler not in SCHEDULERS:
         raise HTTPException(400, f"bad scheduler {req.scheduler!r}")
@@ -824,7 +1060,7 @@ def api_refine(req: RefineRequest) -> JSONResponse:
         argv += ["--tiled", "--overlap", str(int(req.overlap))]
     mode = "tiled" if req.tiled else "single"
     label = f"refine · {backend} · {src.name} · x{req.scale} · d{req.strength} · {mode}"
-    job = RUNNER.submit("refine", label, argv)
+    job = RUNNER.submit("refine", label, argv, env=job_env(None))
     return JSONResponse({"job_id": job.id, "label": label})
 
 
@@ -834,12 +1070,14 @@ class ExploreRequest(BaseModel):
     b: Optional[str] = None           # second parent (breed)
     radius: float = 0.3
     mutate: float = 0.15
-    direction: str = "outward"        # walk: outward | random | axis
+    direction: str = "outward"        # walk: outward | random | axis | drift
+    turn: float = 0.35                # walk drift: heading change per frame (radians)
     step: float = 0.15                # walk: per-frame step
     axis: Optional[int] = None        # walk: which principal axis
     n: int = 6
     steps: Optional[int] = None
     guidance: Optional[float] = None
+    server: Optional[str] = None      # sd15: run target, as RunRequest.server
 
 
 def _resolve_output_png(rel: str) -> Path:
@@ -884,15 +1122,18 @@ def _explorable_source(p: Path) -> Path:
 def api_explore(req: ExploreRequest) -> JSONResponse:
     if req.mode not in ("neighborhood", "breed", "walk"):
         raise HTTPException(400, f"bad mode {req.mode!r}")
-    if req.direction not in ("outward", "random", "axis"):
+    if req.direction not in ("outward", "random", "axis", "drift"):
         raise HTTPException(400, f"bad direction {req.direction!r}")
+    if not 0.0 <= req.turn <= 1.6:
+        raise HTTPException(400, "turn must be in [0, 1.6] radians")
     src = _explorable_source(_resolve_output_png(req.src))
     backend = "sd15"
     for b in ("flux2", "krea2", "sdxl", "sd2"):
         if f"anarchy_{b}_" in src.name:
             backend = b
             break
-    model = _model_flags(RunRequest(action="explore", backend=backend))
+    lane, url = resolve_server(backend, req.server)
+    model = _model_flags(RunRequest(action="explore", backend=backend, server=req.server))
     argv = [python_for(backend), "-u", "scripts/explore.py", "--backend", backend, *model,
             "--mode", req.mode, "--src", str(src),
             "--n", str(int(req.n)), "--scheduler", "ddim"]
@@ -904,6 +1145,8 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         label = f"breed · {backend} · {src.name} × {b.name}"
     elif req.mode == "walk":
         argv += ["--direction", req.direction, "--step", str(req.step)]
+        if req.direction == "drift":
+            argv += ["--turn", str(float(req.turn))]
         if req.axis is not None:
             argv += ["--axis", str(int(req.axis))]
         label = f"walk · {backend} · {src.name} · {req.direction} ×{req.n}"
@@ -921,8 +1164,10 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         argv += ["--guidance", str(guidance)]
     if backend == "sdxl":
         argv += ["--neg-mode", "mean"]
-    job = RUNNER.submit("explore", label, argv)
-    return JSONResponse({"job_id": job.id, "label": label})
+    if backend == "sd15":
+        label += f" @ {lane}"
+    job = RUNNER.submit("explore", label, argv, lane=lane, env=job_env(url))
+    return JSONResponse({"job_id": job.id, "label": label, "lane": lane})
 
 
 class EvolveRequest(BaseModel):
@@ -930,6 +1175,7 @@ class EvolveRequest(BaseModel):
     n: int = 8
     temperature: float = 1.0
     base_blend: float = 0.25
+    server: Optional[str] = None      # sd15: run target, as RunRequest.server
 
 
 def _most_starred_backend() -> str:
@@ -947,7 +1193,8 @@ def api_evolve(req: EvolveRequest) -> JSONResponse:
     backend = req.backend or _most_starred_backend()
     if backend not in BACKENDS:
         raise HTTPException(400, f"bad backend {backend!r}")
-    model = _model_flags(RunRequest(action="evolve", backend=backend))
+    lane, url = resolve_server(backend, req.server)
+    model = _model_flags(RunRequest(action="evolve", backend=backend, server=req.server))
     argv = [python_for(backend), "-u", "scripts/evolve_favorites.py", "--backend", backend, *model,
             "--n", str(int(req.n)), "--temperature", str(req.temperature),
             "--base-blend", str(req.base_blend), "--scheduler", "ddim"]
@@ -956,8 +1203,10 @@ def api_evolve(req: EvolveRequest) -> JSONResponse:
         argv += ["--steps", str(d["steps"]), "--guidance", str(d["guidance"]),
                  "--neg-mode", "mean"]
     label = f"evolve★ · {backend} · T={req.temperature}"
-    job = RUNNER.submit("evolve", label, argv)
-    return JSONResponse({"job_id": job.id, "label": label})
+    if backend == "sd15":
+        label += f" @ {lane}"
+    job = RUNNER.submit("evolve", label, argv, lane=lane, env=job_env(url), exclusive=True)
+    return JSONResponse({"job_id": job.id, "label": label, "lane": lane})
 
 
 @app.post("/api/resonance")
@@ -1045,7 +1294,7 @@ def api_genprompt(req: GenPromptRequest) -> JSONResponse:
             argv += [flag, str(meta[k])]
     if meta.get("scheduler") and meta["scheduler"] != "default":
         argv += ["--scheduler", meta["scheduler"]]
-    job = RUNNER.submit("genprompt", f"from-prompt · {src.name}", argv)
+    job = RUNNER.submit("genprompt", f"from-prompt · {src.name}", argv, env=job_env(None))
     return JSONResponse({"job_id": job.id})
 
 
@@ -1155,6 +1404,48 @@ async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
             "X-Accel-Buffering": "no",      # don't let a reverse proxy buffer it
         },
     )
+
+
+_map_lock = threading.Lock()
+
+
+def _map_signature() -> str:
+    """Changes whenever any ``.npz`` under outputs/ does -- image sidecars and
+    the fitted distributions alike."""
+    n, newest = 0, 0.0
+    if OUTPUTS.is_dir():
+        for p in OUTPUTS.rglob("*.npz"):
+            n += 1
+            newest = max(newest, p.stat().st_mtime)
+    return f"{n}:{newest:.3f}"
+
+
+@app.get("/api/latent-map")
+def api_latent_map(backend: str = "sd15") -> FileResponse:
+    """🌌 Map data: every explored image projected onto PCA axes (built by
+    scripts/latent_map.py -- NumPy only, so it runs here, not in the GPU queue)."""
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    out = OUTPUTS / f"latent_map_{backend}.json"
+    sig_file = out.with_suffix(".sig")
+    with _map_lock:
+        sig = _map_signature()
+        fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
+        if not fresh:
+            try:
+                proc = subprocess.run(
+                    [PYTHON, str(REPO / "scripts" / "latent_map.py"),
+                     "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
+                     "--prompts", str(REPO / "prompts_1000.txt")],
+                    cwd=str(REPO), capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                raise HTTPException(504, f"latent map for {backend} took over 300 s") from None
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout).strip().splitlines()
+                raise HTTPException(404 if proc.returncode == 3 else 500,
+                                    msg[-1] if msg else "latent map build failed")
+            sig_file.write_text(sig)
+    return FileResponse(out, media_type="application/json")
 
 
 @app.get("/api/images")
@@ -1569,7 +1860,7 @@ def api_film(req: FilmRequest) -> JSONResponse:
 
     label = (f"film · {name} · {len(rels)} keys × {req.frames_per} · "
              f"{frames}f @ {req.fps}fps · {req.interp}")
-    job = RUNNER.submit("film", label, argv)
+    job = RUNNER.submit("film", label, argv, env=job_env(None))
     return JSONResponse({"job_id": job.id, "label": label, "name": name,
                          "frames": frames})
 
@@ -2438,7 +2729,7 @@ async function refineImage(name, btn) {
   setTimeout(() => { if (btn){ btn.disabled=false; btn.textContent="⤴ Upscale"; } }, 4000);
 }
 const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distance","radius","mutate",
-  "direction","step","walk_frame","target_distance","elites","base_blend","dist",
+  "direction","step","turn","walk_frame","target_distance","elites","base_blend","dist",
   "backend","model","sampler","temperature","coherence",
   "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
   "batch_seed","image_seed","index","refined_from","cond_from","engine","factor","denoise",

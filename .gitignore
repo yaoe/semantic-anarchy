@@ -66,3 +66,6 @@ webui/frontend/dist/
 # paths to weights on *this* machine, so they're per-user: pick your models once
 # in the UI rather than committing someone else's layout.
 webui/model_config.json
+webui/comfy_servers.json
+# personal Claude Code notes (machine/infra-specific rules)
+CLAUDE.local.md

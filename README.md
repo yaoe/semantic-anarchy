@@ -133,6 +133,46 @@ as a keyframe, drag the keyframes into the order you want, set fps / frames-per-
 / interpolation, and render — the mp4 plays inline in the 🎞 Films tab. Mixed
 backends or mixed resolutions are flagged there before you spend the GPU time.
 
+**Walks** — `explore.py --mode walk` steps away from an existing image. `outward`,
+`random` and `axis` each hold one heading, so the path is a straight line;
+`--direction drift --turn 0.35` starts like `random` but rotates the heading by
+`turn` radians every frame (step length unchanged, still inside the corpus PCA
+span), so long walks curve. `--turn 0` reproduces `random` exactly.
+
+```bash
+python scripts/explore.py --backend sd15 --mode walk --direction drift --turn 0.35 \
+    --step 0.08 --n 40 --src outputs/generated/anarchy_sd15_7_000.png
+```
+
+**🌌 Latent map** — every image with an `.npz` sidecar, placed in 3D: either on
+the corpus PCA axes (labelled with the corpus prompts at each extreme) or on the
+*explored* frame (a PCA of the gallery itself). Lineage from explore / breed /
+walk is drawn as edges, and the territory you have covered as a hull. NumPy only:
+
+```bash
+python scripts/latent_map.py --backend sd15   # -> outputs/latent_map_sd15.json
+```
+
+The dashboard's 🌌 Map tab rebuilds it whenever the set of sidecars changes.
+
+**Remote ComfyUI (sd15)** — mining and generation can run on any ComfyUI that has
+the [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) pack (its
+`ConditioningToBase64` / `Base64ToConditioning` nodes carry the tensors over HTTP).
+Mine through the same box you generate on, so the distribution lives in that
+box's encoder space:
+
+```bash
+export SA_COMFY_URL=http://127.0.0.1:8188           # your ComfyUI
+python scripts/mine_distribution.py --backend sd15 --prompts prompts_1000.txt --out outputs/dist
+python scripts/generate.py --backend sd15 --n 8
+```
+
+In the dashboard, list your boxes once — `SA_COMFY_SERVERS="gpu1=https://…,gpu2=https://…"`
+or a gitignored `webui/comfy_servers.json` (`{"servers": {"gpu1": "https://…"}}`) —
+and pick one per job in the sidebar's **Run on** field. Each box gets its own job
+lane: one job at a time per box, boxes in parallel with each other and with local
+work. img2img / IP-Adapter, upscale and films still run in-process (diffusers).
+
 `prompts_1000.txt` is a wide, deterministic "good" corpus you can regenerate with
 `python gen_prompts.py`. Distributions are saved backend-namespaced (`sd15` keeps
 `outputs/dist`; `sdxl` writes `outputs/dist_sdxl__*`), so the two never clash.
@@ -146,11 +186,14 @@ semantic_anarchy/
   pipeline.py       SDModel (SD1.5) + SDXLModel (SDXL) — stock diffusers, lazy torch import
   cli_args.py       shared --backend argparse wiring + per-family defaults
   travel.py         keyframe films — slerp/lerp, easing, frame schedule (pure numpy)
+  latent_map.py     corpus/explored projections + off-manifold score for the 🌌 map (pure numpy)
+  comfy.py          remote ComfyUI executor for sd15 — stdlib HTTP, lazy torch
   viz.py · aesthetic.py · evolve.py · cli.py
 scripts/
   mine_distribution.py · generate.py · temperature_sweep.py · sampler_sweep.py
   explore.py            local navigation around an existing image
   morph_film.py         latent travel through keyframes -> x264 mp4
+  latent_map.py         build outputs/latent_map_<backend>.json for the 🌌 Map tab
   explore_session.py    unattended time-budgeted gallery
   demo_no_sd.py         the torch-free demo
 tests/                  pytest — distribution + evolution + backend abstraction (all torch-free)
@@ -179,7 +222,9 @@ Covers: fit recovers known mean/std; sampling shapes + temperature scaling; PCA
 extrapolation (no clipping); save/load round-trip; the backend abstraction
 (sd15/sdxl two-tensor fit/sample, sampler dispatch); evolution raising the mean
 score on an analytic objective; and the film trajectory math (interpolation
-endpoints, easing curves, frame schedule, noise window).
+endpoints, easing curves, frame schedule, noise window); walk geometry (outward
+growth, drift turn angle and span); the latent-map projections; and the ComfyUI
+executor's checkpoint matching and graph builders.
 
 ## License
 
