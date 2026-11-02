@@ -830,7 +830,10 @@ export interface LatentMap {
   frames: Record<MapSpace, { alike: number | null }>
   regions: MapRegion[]
   axes: { corpus: { share: number[]; extremes: { pos: string[]; neg: string[] }[] } }
-  atlas: { cols: number; tile: number }
+  /** v: the atlas image's version, so a doc never pairs with a stale cached sheet */
+  atlas: { cols: number; tile: number; v?: number }
+  /** this is the last build; a newer one is running on the server */
+  rebuilding?: boolean
   nodes: MapNode[]
   edges: MapEdge[]
   corpus: { label: string; c: number[] }[]

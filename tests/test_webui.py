@@ -4,8 +4,11 @@ webui/app.py imports fastapi but no torch, so these stay in the torch-free tier.
 """
 
 import importlib.util
+import json
 import re
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -201,6 +204,96 @@ def test_map_rejects_an_unknown_focus(app):
     with pytest.raises(app.HTTPException) as e:
         app.api_latent_map("sd15", focus="; rm -rf")
     assert e.value.status_code == 400
+
+
+def _map_setup(app, monkeypatch, tmp_path, builds):
+    """A map endpoint over tmp_path whose build is a stub writing doc number N."""
+    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    monkeypatch.setattr(app, "resolve_dist_base", lambda b: "outputs/dist")
+    monkeypatch.setattr(app, "current_dist", lambda b: {"kind": "base", "path": None})
+    monkeypatch.setattr(app, "_map_building", set())
+    monkeypatch.setattr(app, "_map_failed", {})
+    out = tmp_path / "latent_map_sd15_balanced.json"
+
+    def build(cmd, **kw):
+        result = builds(len(calls))
+        calls.append(cmd)
+        if result == 0:
+            out.write_text(json.dumps({"backend": "sd15", "built": len(calls), "nodes": [],
+                                       "warning": None}))
+        return subprocess.CompletedProcess(cmd, result, "", "boom")
+
+    calls: list = []
+    monkeypatch.setattr(app.subprocess, "run", build)
+    return calls
+
+
+def _map_get(app):
+    return json.loads(app.api_latent_map("sd15", "balanced").body)
+
+
+def _wait_map_idle(app):
+    for _ in range(500):
+        with app._map_jobs_lock:
+            if not app._map_building:
+                return
+        time.sleep(0.01)
+    raise AssertionError("background map build never finished")
+
+
+def test_first_map_is_waited_for_then_served_from_cache(app, monkeypatch, tmp_path):
+    calls = _map_setup(app, monkeypatch, tmp_path, lambda n: 0)
+    assert _map_get(app)["rebuilding"] is False
+    assert _map_get(app)["built"] == 1
+    assert len(calls) == 1
+
+
+def test_stale_map_answers_at_once_and_rebuilds_behind_it(app, monkeypatch, tmp_path):
+    release = threading.Event()
+    def builds(n):
+        if n:
+            assert release.wait(5)
+        return 0
+    calls = _map_setup(app, monkeypatch, tmp_path, builds)
+    _map_get(app)
+
+    (tmp_path / "new_image.npz").write_bytes(b"")
+    stale = _map_get(app)       # returning at all proves it didn't wait for the build
+    assert (stale["built"], stale["rebuilding"]) == (1, True)
+    assert _map_get(app)["rebuilding"] is True     # and one build, however many polls
+    release.set()
+    _wait_map_idle(app)
+
+    assert len(calls) == 2
+    fresh = _map_get(app)
+    assert (fresh["built"], fresh["rebuilding"]) == (2, False)
+
+
+def test_failed_rebuild_keeps_the_old_map_without_retrying(app, monkeypatch, tmp_path):
+    calls = _map_setup(app, monkeypatch, tmp_path, lambda n: 0 if n == 0 else 1)
+    _map_get(app)
+    (tmp_path / "new_image.npz").write_bytes(b"")
+    _map_get(app)
+    _wait_map_idle(app)
+
+    doc = _map_get(app)
+    assert (doc["built"], doc["rebuilding"]) == (1, False)
+    assert "boom" in doc["warning"]
+    assert len(calls) == 2      # polling a broken build must not spin it
+
+
+def test_map_thumbnails_follow_the_atlas_on_disk(app, monkeypatch, tmp_path):
+    """Another focus' build can regrid the shared atlas under an older document."""
+    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    out = tmp_path / "latent_map_sd15_balanced.json"
+    out.write_text(json.dumps({"atlas": {"cols": 1, "tile": 96},
+                               "nodes": [{"rel": "a.jpg", "a": 0}, {"rel": "gone.jpg", "a": 1}]}))
+    (tmp_path / "latent_map_sd15.atlas.jpg").write_bytes(b"x")
+    (tmp_path / "latent_map_sd15.atlas.json").write_text(
+        json.dumps({"rels": ["new.jpg", "a.jpg"], "cols": 2, "tile": 48}))
+    doc = app._read_map_doc(out, "sd15")
+    assert [n["a"] for n in doc["nodes"]] == [1, -1]
+    assert (doc["atlas"]["cols"], doc["atlas"]["tile"]) == (2, 48)
 
 
 def test_taste_model_does_not_invalidate_the_map(app, monkeypatch, tmp_path):

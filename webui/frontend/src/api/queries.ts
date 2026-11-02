@@ -124,6 +124,9 @@ export function useLatentMap(backend: BackendId, focus: string, busy: boolean) {
     queryKey: qk.latentMap(backend, focus, gen.current),
     queryFn: () => api.latentMap(backend, focus),
     placeholderData: keepPreviousData,
+    // The server answers with its last build while a newer one runs. Not during a
+    // job: each new image would just start another rebuild.
+    refetchInterval: (q) => (!busy && q.state.data?.rebuilding ? 2000 : false),
     retry: false,
   })
 }

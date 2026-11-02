@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import zipfile
@@ -47,6 +48,14 @@ from semantic_anarchy.latent_map import (
 CHUNK = 256
 ATLAS_MAX = 4096     # px per side: every browser's safe WebGL texture size
 ATLAS_TILE = 96
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """The dashboard serves the last build while the next one runs, so a reader
+    must only ever see a whole file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def read_prompts(path: Path) -> list[str]:
@@ -204,9 +213,11 @@ def build_atlas(nodes: list[dict], outputs: Path, jpg: Path) -> dict:
             broken.add(rel)
             print(f"[map] no thumbnail for {rel}: {exc}", file=sys.stderr)
     jpg.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(jpg, quality=82, optimize=True)
+    tmp = jpg.with_name(jpg.name + ".tmp")
+    sheet.save(tmp, format="JPEG", quality=82, optimize=True)
+    os.replace(tmp, jpg)
     meta = {"rels": order, "cols": cols, "tile": tile, "broken": sorted(broken)}
-    index.write_text(json.dumps(meta))
+    write_text_atomic(index, json.dumps(meta))
     return meta
 
 
@@ -371,7 +382,7 @@ def main(argv=None) -> int:
         "corpus": [{"label": labels_c[i], "c": rnd(c_coords[i])} for i in range(len(c_coords))],
     }
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(doc, separators=(",", ":")))
+    write_text_atomic(out, json.dumps(doc, separators=(",", ":")))
     print(f"[map] wrote {out} ({len(out_nodes)} nodes, {len(regions)} regions, "
           f"{len(doc['edges'])} edges, {len(doc['corpus'])} corpus points) in {time.time() - t0:.1f}s")
     return 0

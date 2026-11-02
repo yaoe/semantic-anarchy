@@ -210,17 +210,18 @@ export function LatentMap({ busy }: { busy: boolean }) {
   const asked = useRef(-1)
   const missing = doc?.unembedded ?? 0
   useEffect(() => {
-    if (!missing || busy || asked.current === missing) return
+    // A doc being rebuilt may predate the embeddings, so its count can't be trusted.
+    if (!missing || busy || doc?.rebuilding || asked.current === missing) return
     asked.current = missing
     resonance.mutate()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [missing, busy])
+  }, [missing, busy, doc?.rebuilding])
 
   // Re-frame the camera only when *what* is plotted changes, not on new images.
   const viewKey = `${backend}|${space}|${map.focus}`
   const lastView = useRef('')
   const atlasUrl = doc
-    ? `/api/latent-map/atlas?backend=${encodeURIComponent(backend)}&v=${Math.floor(doc.built)}`
+    ? `/api/latent-map/atlas?backend=${encodeURIComponent(backend)}&v=${doc.atlas.v ?? Math.floor(doc.built)}`
     : ''
 
   useEffect(() => {
@@ -379,7 +380,7 @@ export function LatentMap({ busy }: { busy: boolean }) {
         <div>
           <div className="text-[11px] uppercase tracking-[2px] text-[#e9dccb]/55">
             latent map · {backend}
-            {isFetching ? <span className="ml-2 normal-case tracking-normal text-[#f3c27a]">placing images…</span> : null}
+            {isFetching || doc?.rebuilding ? <span className="ml-2 normal-case tracking-normal text-[#f3c27a]">placing images…</span> : null}
           </div>
           {doc ? (
             <>

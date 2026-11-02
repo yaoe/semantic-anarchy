@@ -2021,7 +2021,11 @@ async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
     )
 
 
-_map_lock = threading.Lock()
+_map_lock = threading.Lock()      # one build at a time: the focuses share an atlas
+_map_jobs_lock = threading.Lock() # guards the two below, never held across a build
+_map_building: set[Path] = set()  # maps a background rebuild is running or waiting for
+_map_failed: dict[Path, tuple[str, str]] = {}  # map -> (signature, why): don't retry that one
+
 
 # The one UMAP knob with a visible effect, as three positions rather than two
 # raw numbers: (n_neighbors, min_dist).
@@ -2050,10 +2054,65 @@ def _map_signature(*inputs: str) -> str:
     return "|".join((*inputs, f"{n}:{newest:.3f}"))
 
 
+def _build_map(cmd: list[str], out: Path, sig: str) -> None:
+    """Run scripts/latent_map.py and record what it was built from. Raises
+    HTTPException on failure. Takes ``_map_lock``."""
+    with _map_lock:
+        try:
+            proc = subprocess.run(cmd, cwd=str(REPO), capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, f"latent map {out.name} took over 300 s") from None
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout).strip().splitlines()
+            raise HTTPException(404 if proc.returncode == 3 else 500,
+                                msg[-1] if msg else "latent map build failed")
+        out.with_suffix(".sig").write_text(sig)
+
+
+def _rebuild_map_in_background(cmd: list[str], out: Path, sig: str) -> None:
+    try:
+        _build_map(cmd, out, sig)
+        failure = None
+    except Exception as exc:
+        failure = (sig, str(getattr(exc, "detail", exc)))
+    with _map_jobs_lock:
+        _map_building.discard(out)
+        if failure:
+            _map_failed[out] = failure
+        else:
+            _map_failed.pop(out, None)
+
+
+def _read_map_doc(out: Path, backend: str) -> Optional[dict]:
+    """The built map, or None if there isn't a readable one. Thumbnail cells are
+    re-read from the atlas, which all focuses share: another focus' build may have
+    regridded it since this document was written."""
+    try:
+        doc = json.loads(out.read_text())
+    except (OSError, ValueError):
+        return None
+    jpg = OUTPUTS / f"latent_map_{backend}.atlas.jpg"
+    try:
+        atlas = json.loads(jpg.with_suffix(".json").read_text())
+        version = int(jpg.stat().st_mtime)
+    except (OSError, ValueError):
+        return doc
+    cell = {r: i for i, r in enumerate(atlas["rels"])}
+    for node in doc["nodes"]:
+        node["a"] = cell.get(node["rel"], -1)
+    doc["atlas"] = {"cols": atlas["cols"], "tile": atlas["tile"], "v": version}
+    return doc
+
+
 @app.get("/api/latent-map")
-def api_latent_map(backend: str = "sd15", focus: str = "balanced") -> FileResponse:
+def api_latent_map(backend: str = "sd15", focus: str = "balanced") -> JSONResponse:
     """🌌 Map data: every explored image placed in 3D (built by
-    scripts/latent_map.py -- no model, so it runs here, not in the GPU queue)."""
+    scripts/latent_map.py -- no model, so it runs here, not in the GPU queue).
+
+    A build takes ~15s and is needed whenever any image is added, so only the very
+    first one is waited for. After that the last build answers at once, with
+    ``rebuilding: true`` while a new one runs behind it: rebuilds barely move
+    existing images, so the old layout is a good map, just short of the newest."""
     if backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {backend!r}")
     if focus not in MAP_FOCUS:
@@ -2066,25 +2125,32 @@ def api_latent_map(backend: str = "sd15", focus: str = "balanced") -> FileRespon
     out = OUTPUTS / f"latent_map_{backend}_{focus}.json"
     sig_file = out.with_suffix(".sig")
     neighbors, min_dist = MAP_FOCUS[focus]
-    with _map_lock:
-        sig = _map_signature(str(base), str(prompts), focus)
-        fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
-        if not fresh:
-            try:
-                proc = subprocess.run(
-                    [PYTHON, str(REPO / "scripts" / "latent_map.py"),
-                     "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
-                     "--dist", str(base), "--prompts", str(prompts),
-                     "--neighbors", str(neighbors), "--min-dist", str(min_dist)],
-                    cwd=str(REPO), capture_output=True, text=True, timeout=300)
-            except subprocess.TimeoutExpired:
-                raise HTTPException(504, f"latent map for {backend} took over 300 s") from None
-            if proc.returncode != 0:
-                msg = (proc.stderr or proc.stdout).strip().splitlines()
-                raise HTTPException(404 if proc.returncode == 3 else 500,
-                                    msg[-1] if msg else "latent map build failed")
-            sig_file.write_text(sig)
-    return FileResponse(out, media_type="application/json")
+    sig = _map_signature(str(base), str(prompts), focus)
+    cmd = [PYTHON, str(REPO / "scripts" / "latent_map.py"),
+           "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
+           "--dist", str(base), "--prompts", str(prompts),
+           "--neighbors", str(neighbors), "--min-dist", str(min_dist)]
+
+    doc = _read_map_doc(out, backend)
+    if doc is None:
+        _build_map(cmd, out, sig)
+        doc = _read_map_doc(out, backend)
+        if doc is None:
+            raise HTTPException(500, "latent map build wrote no readable map")
+        return JSONResponse({**doc, "rebuilding": False})
+
+    fresh = sig_file.is_file() and sig_file.read_text() == sig
+    with _map_jobs_lock:
+        failed = _map_failed.get(out)
+        rebuilding = out in _map_building
+        if not (fresh or rebuilding or (failed and failed[0] == sig)):
+            _map_building.add(out)
+            rebuilding = True
+            threading.Thread(target=_rebuild_map_in_background, args=(cmd, out, sig),
+                             daemon=True).start()
+    if failed and failed[0] == sig and not rebuilding:
+        doc["warning"] = f"showing the previous map: rebuild failed ({failed[1]})"
+    return JSONResponse({**doc, "rebuilding": rebuilding})
 
 
 @app.get("/api/latent-map/atlas")
