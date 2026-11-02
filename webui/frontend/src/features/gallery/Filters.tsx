@@ -44,7 +44,8 @@ export function Filters({ actions }: { actions?: ReactNode }) {
         onChange={(v) => setTab(v as TabKey)}
         options={TABS}
         grow={false}
-        itemClassName="!py-[5px] !text-[12px]"
+        className="!gap-1"
+        itemClassName="!px-[5px] !py-[5px] !text-[12px]"
       />
       {!UNSORTED.includes(tab) ? (
         <Select
