@@ -44,6 +44,7 @@ import type {
   TagCell,
   TagVocabulary,
   TasteBand,
+  WipeFilters,
   WipePreview,
   WipeResult,
 } from './types'
@@ -98,7 +99,7 @@ export const api = {
   films: () => req<Film[]>('/api/films'),
   tasteband: () => req<TasteBand>('/api/tasteband'),
   experiments: () => req<ExperimentRow[]>('/api/experiments'),
-  wipePreview: () => req<WipePreview>('/api/wipe/preview'),
+  wipePreview: (f: WipeFilters) => req<WipePreview>(`/api/wipe/preview${qs({ ...f })}`),
   meta: (path: string) =>
     req<ImageMeta>(`/api/meta?path=${encodeURIComponent(path)}`),
   /** Plain-text fallback for the SSE log stream. */
@@ -183,7 +184,12 @@ export const api = {
     post<{ ok: boolean; fav: boolean; count: number }>('/api/favorite', { rel, on }),
   animate: (body: AnimateRequest) =>
     post<{ job_id: number; label: string; name: string }>('/api/animate', body),
-  wipe: () => post<WipeResult>('/api/wipe'),
+  wipe: (f: WipeFilters) =>
+    post<WipeResult>('/api/wipe', {
+      ...f,
+      since: f.since ? Number(f.since) : null,
+      until: f.until ? Number(f.until) : null,
+    }),
   deleteFilm: (dir: string) => post<{ deleted: string }>('/api/films/delete', { dir }),
   deleteImage: (rel: string) =>
     post<{ deleted: string; files: number }>('/api/image/delete', { rel }),

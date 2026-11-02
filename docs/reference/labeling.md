@@ -220,3 +220,13 @@ fifty are.
 The gallery's delete button (`POST /api/image/delete` in `webui/app.py`) removes every extension of the stem plus its `.json`/`.npz`, and drops it from favorites, the score/novelty/resonance caches and `clip_embeds.npz`. It appends an empty record to `tags.jsonl`, because the universe vocabulary is derived from what images wear. It never touches `labels.jsonl`: each label carries its own snapshot of the knobs, so it stays a complete data point after the pixels are gone.
 
 **Trap:** `unique_image_path` treats a deleted name as free, so re-running the same seed reuses the rel-path and the new image inherits the old image's label. Upscales of a deleted image also lose the conditioning source they walk back to via `refined_from`.
+
+## Bulk delete: 🧹 Wipe
+
+`features/taste/WipeDialog.tsx` → `GET /api/wipe/preview` + `POST /api/wipe`; both go through `_wipe_plan` in `webui/app.py`, so the count shown and the deletion can't apply different rules. Deletion and cleanup are the same helpers the single delete uses (`_delete_image_files`, `_forget_images`), so `labels.jsonl` survives here too.
+
+- **The cutoff reads your 0-9 labels, not `scores.json`.** It used to read the LAION aesthetic guess, which is why the old button matched nothing once that cache was gone. `cutoff` is strict: 0 matches no labeled image, 10 matches all of them. A bodyless POST means "labels below 5", which is what the legacy UI's button still sends.
+- **Filters AND together**, over the same index as the labeling queue (`_label_index`), so it covers `anarchy_*` anywhere under `outputs/`. Sweep and marginal images aren't in that index and are never wiped. The time filter is the image's mtime; model filters are the `backend` and `ckpt` facets.
+- **Anything that survives keeps its ancestry**, even if it matched: `_wipe_plan` walks `refined_from`/`parent` up from every non-doomed row. Survivors are the root of protection, not just stars, because an unlabeled original of a 9-scored upscale would otherwise go the moment "include unlabeled" is ticked. Corollary: a wipe matching everything leaves nothing, with no special case.
+- **The client sends the preview's `as_of` as `until`** when no end time is set, so an image that finishes rendering while the dialog is open can't be deleted unseen.
+- **Dialog settings are deliberately not persisted** (the form unmounts on close): a past "delete everything" must not still be armed on the next open.

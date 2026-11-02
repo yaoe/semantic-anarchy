@@ -230,6 +230,7 @@ interface UIState {
 
   /** A deleted image leaves every saved selection that could still point at it. */
   forgetImage: (rel: string) => void
+  forgetImages: (rels: string[]) => void
 }
 
 /**
@@ -329,6 +330,14 @@ export const useUI = create<UIState>()(
           fitSel: s.fitSel.filter((r) => r !== rel),
           breedParent: s.breedParent === rel ? null : s.breedParent,
         })),
+      forgetImages: (rels) => {
+        const gone = new Set(rels)
+        set((s) => ({
+          timeline: s.timeline.filter((r) => !gone.has(r)),
+          fitSel: s.fitSel.filter((r) => !gone.has(r)),
+          breedParent: s.breedParent && gone.has(s.breedParent) ? null : s.breedParent,
+        }))
+      },
 
       label: { ...DEFAULT_LABEL },
       // Any change to WHICH queue is being walked rewinds the cursor — the

@@ -51,7 +51,7 @@ function scoreOptions(anyLabel: string): Option[] {
   ]
 }
 
-const WINDOWS: { label: string; hours: number | null }[] = [
+export const WINDOWS: { label: string; hours: number | null }[] = [
   { label: 'all time', hours: null },
   { label: '1h', hours: 1 },
   { label: '6h', hours: 6 },
@@ -60,7 +60,7 @@ const WINDOWS: { label: string; hours: number | null }[] = [
   { label: '30d', hours: 24 * 30 },
 ]
 
-function toLocalInput(sec: string): string {
+export function toLocalInput(sec: string): string {
   if (!sec) return ''
   const d = new Date(Number(sec) * 1000)
   if (Number.isNaN(d.getTime())) return ''
@@ -69,13 +69,13 @@ function toLocalInput(sec: string): string {
     d.getHours(),
   )}:${pad(d.getMinutes())}`
 }
-function fromLocalInput(v: string): string {
+export function fromLocalInput(v: string): string {
   if (!v) return ''
   const t = new Date(v).getTime()
   return Number.isNaN(t) ? '' : String(Math.floor(t / 1000))
 }
 
-function facetOptions(cells: FacetCell[] | undefined, anyLabel: string): Option[] {
+export function facetOptions(cells: FacetCell[] | undefined, anyLabel: string): Option[] {
   const opts: Option[] = [{ value: '', label: anyLabel }]
   for (const c of cells ?? []) {
     opts.push({

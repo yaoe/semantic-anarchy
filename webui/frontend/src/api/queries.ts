@@ -5,7 +5,13 @@
  * without a manual poke.
  */
 import { useEffect, useRef } from 'react'
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from '@tanstack/react-query'
 
 import { api } from './client'
 import type {
@@ -27,6 +33,7 @@ import type {
   RefineRequest,
   RunRequest,
   RunResponse,
+  WipeFilters,
 } from './types'
 import { paramsFromSidecar } from '../params/fromSidecar'
 import { useUI } from '../store'
@@ -556,23 +563,35 @@ export function useFavorite() {
   })
 }
 
+/** Everything whose answer changes when images leave the disk. */
+function invalidateAfterDelete(qc: QueryClient) {
+  for (const queryKey of [
+    qk.images,
+    qk.tasteband,
+    qk.tags,
+    qk.labelFacets,
+    qk.wipePreview,
+    ['fitCandidates'],
+  ]) {
+    qc.invalidateQueries({ queryKey })
+  }
+}
+
 export function useWipe() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: () => api.wipe(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.images })
-      qc.invalidateQueries({ queryKey: qk.wipePreview })
+    mutationFn: (filters: WipeFilters) => api.wipe(filters),
+    onSuccess: (res) => {
+      useUI.getState().forgetImages(res.rels)
+      invalidateAfterDelete(qc)
     },
   })
 }
 
-export function useWipePreview(enabled: boolean) {
+export function useWipePreview(filters: WipeFilters) {
   return useQuery({
-    queryKey: qk.wipePreview,
-    queryFn: api.wipePreview,
-    enabled,
-    refetchInterval: 30000,
+    queryKey: [...qk.wipePreview, filters],
+    queryFn: () => api.wipePreview(filters),
   })
 }
 
@@ -595,16 +614,7 @@ export function useDeleteImage() {
             ) as Images)
           : old,
       )
-      for (const queryKey of [
-        qk.images,
-        qk.tasteband,
-        qk.tags,
-        qk.labelFacets,
-        qk.wipePreview,
-        ['fitCandidates'],
-      ]) {
-        qc.invalidateQueries({ queryKey })
-      }
+      invalidateAfterDelete(qc)
     },
   })
 }

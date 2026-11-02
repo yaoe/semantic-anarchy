@@ -2013,6 +2013,7 @@ def _label_index() -> list:
             "sampler": meta.get("sampler"),
             "distance": meta.get("distance"),
             "image_seed": meta.get("image_seed"),
+            "parent": meta.get("refined_from") or meta.get("parent"),
             # Does this image carry its own conditioning? One stat, cached with
             # the rest of the row — it is what decides whether the image can go
             # into a selection fit (an upscale carries none of its own).
@@ -2363,43 +2364,79 @@ def api_img(path: str) -> FileResponse:
     return FileResponse(target)
 
 
-def _wipe_candidates():
-    """Non-starred images with aesthetic score < 5. Favorites and their whole
-    ancestry (refined_from / parent chains) are protected -- deleting a
-    favorite's original would break native inversion and exploration."""
-    favs = set()
-    try:
-        favs = set(json.loads((OUTPUTS / "favorites.json").read_text()))
-    except Exception:
-        pass
-    try:
-        scores = json.loads((OUTPUTS / "scores.json").read_text())
-    except Exception:
-        scores = {}
-    protected = set(favs)
-    for rel in list(favs):                      # protect ancestry chains
-        p = OUTPUTS / rel
-        for _ in range(6):
-            jj = p.with_suffix(".json")
-            if not jj.is_file():
+#: One above the highest label score: "below this" then means every labeled image.
+WIPE_CUTOFF_ALL = labelset.SCORE_MAX + 1
+
+
+class WipeRequest(BaseModel):
+    """What 🧹 Wipe should delete. The defaults are the original "Wipe <5".
+
+    ``cutoff`` is against YOUR 0-9 label, never the LAION aesthetic guess in
+    scores.json: an image is matched when its label is below it. 0 matches no
+    labeled image at all, ``WIPE_CUTOFF_ALL`` matches every one.
+    """
+    cutoff: int = 5
+    include_unlabeled: bool = False
+    include_starred: bool = False
+    backend: str = ""
+    ckpt: str = ""
+    since: Optional[float] = None
+    until: Optional[float] = None
+
+
+def _stem(rel: str) -> str:
+    """An image's identity: its path without the extension."""
+    return Path(rel).with_suffix("").as_posix()
+
+
+def _wipe_plan(req: WipeRequest) -> dict:
+    """Which images a wipe would delete, and which it spares and why.
+
+    Filters are ANDed. Whatever survives keeps its whole ancestry, matched or not:
+    an upscale has no conditioning of its own and replays its original's, so
+    deleting that original would quietly break a keeper. It follows that a wipe
+    matching everything really does delete everything.
+    """
+    if not 0 <= req.cutoff <= WIPE_CUTOFF_ALL:
+        raise HTTPException(400, f"cutoff must be 0-{WIPE_CUTOFF_ALL}, got {req.cutoff}")
+    rows = _label_index()
+    scores = labeled_scores()
+    favs = load_favs()
+    filters = {"backend": req.backend.strip(), "ckpt": req.ckpt.strip()}
+    in_filter = _select(rows, filters, req.since, req.until)
+
+    matched, starred = {}, 0
+    for row in in_filter:
+        score = scores.get(row["rel"])
+        if not (req.include_unlabeled if score is None else score < req.cutoff):
+            continue
+        if row["rel"] in favs and not req.include_starred:
+            starred += 1
+            continue
+        matched[row["rel"]] = score
+
+    by_stem = {_stem(r["rel"]): r for r in rows}
+    protected = set()
+    for row in rows:
+        if row["rel"] in matched:
+            continue
+        seen = {_stem(row["rel"])}
+        while row.get("parent"):
+            up = (Path(row["rel"]).parent / row["parent"]).as_posix()
+            stem = _stem(up)
+            row = by_stem.get(stem)
+            if row is None or stem in seen:
                 break
-            try:
-                m = json.loads(jj.read_text())
-            except Exception:
-                break
-            up = m.get("refined_from") or m.get("parent")
-            if not up:
-                break
-            p = p.parent / up
-            protected.add(str(p.relative_to(OUTPUTS)))
-    out = []
-    gen = OUTPUTS / "generated"
-    for img in sorted(q for e in IMAGE_EXTS for q in gen.glob(f"anarchy_*{e}")):
-        rel = str(img.relative_to(OUTPUTS))
-        sc = scores.get(rel)
-        if rel not in protected and sc is not None and sc < 5.0:
-            out.append(rel)
-    return out
+            seen.add(stem)
+            protected.add(row["rel"])
+    doomed = [rel for rel in matched if rel not in protected]
+    return {
+        "doomed": doomed,
+        "labeled": sum(1 for rel in doomed if matched[rel] is not None),
+        "unlabeled": sum(1 for rel in doomed if matched[rel] is None),
+        "kept_starred": starred,
+        "kept_lineage": len(matched) - len(doomed),
+    }
 
 
 _purge_lock = threading.Lock()
@@ -2436,25 +2473,64 @@ def _purge_image_caches(gone: set) -> None:
                 pass
 
 
+def _delete_image_files(target: Path) -> int:
+    """Unlink every extension of an image's stem, plus its sidecars."""
+    n_files = 0
+    for ext in IMAGE_EXTS + (".json", ".npz"):
+        p = target.with_suffix(ext)
+        if p.is_file():
+            p.unlink(missing_ok=True)
+            n_files += 1
+    return n_files
+
+
+def _forget_images(gone: set) -> None:
+    """Drop deleted rels (every extension) from everything derived from them.
+
+    labels.jsonl is left alone: a score is the one record that can't be re-made,
+    and it carries its own snapshot of the knobs for experiment_report.py. Tags are
+    cleared because the vocabulary is derived from what images wear, so a universe
+    has to retire when its last image is deleted.
+    """
+    with _favs_lock:
+        favs = load_favs()
+        if favs & gone:
+            save_favs(favs - gone)
+    tagged = current_tags()
+    for rel in gone & tagged.keys():
+        tagset.append_record(tagset.make_record(rel, []), TAGS_FILE)
+    _purge_image_caches(gone)
+
+
 @app.get("/api/wipe/preview")
-def api_wipe_preview() -> JSONResponse:
-    return JSONResponse({"count": len(_wipe_candidates())})
+def api_wipe_preview(cutoff: int = 5, include_unlabeled: bool = False,
+                     include_starred: bool = False, backend: str = "", ckpt: str = "",
+                     since: Optional[float] = None,
+                     until: Optional[float] = None) -> JSONResponse:
+    """What this wipe would do. ``as_of`` is what the client should send as ``until``
+    if it set none, so an image rendered after you read the count can't be deleted."""
+    as_of = time.time()
+    plan = _wipe_plan(WipeRequest(
+        cutoff=cutoff, include_unlabeled=include_unlabeled,
+        include_starred=include_starred, backend=backend, ckpt=ckpt,
+        since=since, until=until))
+    return JSONResponse({
+        "count": len(plan["doomed"]),
+        "labeled": plan["labeled"],
+        "unlabeled": plan["unlabeled"],
+        "kept_starred": plan["kept_starred"],
+        "kept_lineage": plan["kept_lineage"],
+        "as_of": as_of,
+    })
 
 
 @app.post("/api/wipe")
-def api_wipe() -> JSONResponse:
-    doomed = _wipe_candidates()
-    gone = set(doomed)
-    n_files = 0
-    for rel in doomed:
-        base = OUTPUTS / rel
-        for ext in IMAGE_EXTS + (".json", ".npz"):
-            p = base.with_suffix(ext)
-            if p.is_file():
-                p.unlink()
-                n_files += 1
-    _purge_image_caches(gone)
-    return JSONResponse({"deleted": len(doomed), "files": n_files})
+def api_wipe(req: WipeRequest = WipeRequest()) -> JSONResponse:
+    doomed = _wipe_plan(req)["doomed"]
+    n_files = sum(_delete_image_files(OUTPUTS / rel) for rel in doomed)
+    _forget_images({Path(rel).with_suffix(e).as_posix()
+                    for rel in doomed for e in IMAGE_EXTS})
+    return JSONResponse({"deleted": len(doomed), "files": n_files, "rels": doomed})
 
 
 class DeleteImageRequest(BaseModel):
@@ -2469,11 +2545,6 @@ def api_image_delete(req: DeleteImageRequest) -> JSONResponse:
     where _resolve_output_image is forgiving: its fallback to generated/ could
     delete a same-named image the caller never pointed at. Deleting something
     already gone succeeds, so a double-click can't surface an error.
-
-    labels.jsonl is left alone: a score is the one record that can't be re-made,
-    and it carries its own snapshot of the knobs for experiment_report.py. Tags are
-    cleared because the vocabulary is derived from what images wear, so a universe
-    has to retire when its last image is deleted.
     """
     base = OUTPUTS.resolve()
     target = (base / req.rel).resolve()
@@ -2482,21 +2553,8 @@ def api_image_delete(req: DeleteImageRequest) -> JSONResponse:
             or target.suffix.lower() not in IMAGE_EXTS
             or not target.name.startswith(prefixes)):
         raise HTTPException(404, "not a gallery image")
-    n_files = 0
-    for ext in IMAGE_EXTS + (".json", ".npz"):
-        p = target.with_suffix(ext)
-        if p.is_file():
-            p.unlink(missing_ok=True)
-            n_files += 1
-    gone = {target.with_suffix(e).relative_to(base).as_posix() for e in IMAGE_EXTS}
-    with _favs_lock:
-        favs = load_favs()
-        if favs & gone:
-            save_favs(favs - gone)
-    tagged = current_tags()
-    for rel in gone & tagged.keys():
-        tagset.append_record(tagset.make_record(rel, []), TAGS_FILE)
-    _purge_image_caches(gone)
+    n_files = _delete_image_files(target)
+    _forget_images({target.with_suffix(e).relative_to(base).as_posix() for e in IMAGE_EXTS})
     return JSONResponse({"deleted": req.rel, "files": n_files})
 
 

@@ -642,13 +642,34 @@ export interface RunResponse {
   label?: string
 }
 
+/** What 🧹 Wipe should delete. Every field is ANDed with the others. */
+export interface WipeFilters {
+  /** Labeled images scoring below this go: 0 = none of them, 10 = all of them. */
+  cutoff: number
+  include_unlabeled: boolean
+  include_starred: boolean
+  backend: string
+  ckpt: string
+  since: string
+  until: string
+}
+
 export interface WipePreview {
   count: number
+  labeled: number
+  unlabeled: number
+  /** Matched, but starred and the "also starred" box is off. */
+  kept_starred: number
+  /** Matched, but an image that survives is derived from it. */
+  kept_lineage: number
+  /** Send as `until` when none is set: the count can't grow behind your back. */
+  as_of: number
 }
 
 export interface WipeResult {
   deleted: number
   files: number
+  rels: string[]
 }
 
 /**
