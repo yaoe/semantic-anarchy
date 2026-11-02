@@ -53,7 +53,7 @@ python scripts/experiment_report.py E00-census # one experiment
 python scripts/morph_film.py --name drift --refine none --frames-per 24 --fps 16 \
     --images generated/a.jpg generated/b.jpg generated/c.jpg
 
-python scripts/latent_map.py --backend sd15   # outputs/latent_map_sd15.json for the 🌌 Map tab (NumPy only)
+python scripts/latent_map.py --backend sd15   # JSON + thumbnail atlas for the 🌌 Map tab (no GPU; needs umap-learn)
 
 # sd15 on a remote ComfyUI instead of in-process diffusers (needs the RES4LYF pack there)
 SA_COMFY_URL=https://<box> python scripts/generate.py --backend sd15 --n 8
@@ -121,7 +121,7 @@ Also here: `distance()` (RMS z-score from the corpus center — the "how far off
 
 **Remote ComfyUI (sd15).** With `SA_COMFY_URL`, or a per-job *Run on* pick from an allow-list of boxes, `make_backend("sd15")` returns `ComfySD15Backend`, which encodes and renders over HTTP. Scripts that touch `backend.model` must load with `remote_ok=False` (a test enforces it); payloads from a box go through `comfy._CondUnpickler`, never a bare `pickle.loads`. → [docs/reference/remote-comfy.md](docs/reference/remote-comfy.md)
 
-**🌌 Latent map.** `semantic_anarchy/latent_map.py` + `scripts/latent_map.py` place every image with an `.npz` on the selected fit's PCA axes for the dashboard's Map tab, torch-free and outside the GPU queue. → [docs/reference/latent-map.md](docs/reference/latent-map.md)
+**🌌 Latent map.** `semantic_anarchy/latent_map.py` + `scripts/latent_map.py` place every image in 3D for the dashboard's Map tab, torch-free and outside the GPU queue. The default space is a UMAP of CLIP embeddings, because on the real gallery conditioning neighbours and visual neighbours overlap only at chance; clicking a spot samples by perturbing the nearest image with `explore.py --stay-local`. → [docs/reference/latent-map.md](docs/reference/latent-map.md)
 
 **`analysis.py` + `scripts/analyze_distribution.py` — the corpus autopsy.** Torch-free
 statistics (moments, quantile envelope, half-sigmas, Gram-trick PCA with a

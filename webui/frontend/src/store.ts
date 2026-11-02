@@ -84,18 +84,17 @@ export const DEFAULT_FILM: Record<string, string> = {
  * the flags are '1' / '' like every other boolean form value.
  */
 export const DEFAULT_MAP: Record<string, string> = {
-  frame: 'corpus',
-  x: '0',
-  y: '1',
-  z: '2',
-  slot: 'x',
-  color: 'origin',
-  blob: '1',
-  corpus: '1',
+  space: 'look',
+  focus: 'balanced',
+  paint: 'region',
+  thumbs: '1',
+  size: '1',
   edges: '1',
+  corpus: '1',
   path: '1',
-  squash: '1',
-  panel: '1',
+  spin: '',
+  reach: '0.2',
+  count: '6',
 }
 
 /**
@@ -459,7 +458,10 @@ export const useUI = create<UIState>()(
           params: { ...DEFAULT_VALUES, ...(p.params ?? {}) },
           tools: { ...DEFAULT_TOOLS, ...(p.tools ?? {}) },
           film: { ...DEFAULT_FILM, ...(p.film ?? {}) },
-          map: { ...DEFAULT_MAP, ...(p.map ?? {}) },
+          // Only the current keys: the old axis picker's leftovers must not linger.
+          map: Object.fromEntries(
+            Object.entries(DEFAULT_MAP).map(([k, v]) => [k, p.map?.[k] ?? v]),
+          ),
           label: { ...DEFAULT_LABEL, ...(p.label ?? {}) },
           fit: { ...DEFAULT_FIT, ...(p.fit ?? {}) },
           timeline: p.timeline ?? [],

@@ -99,8 +99,8 @@ export const api = {
   state: () => req<StateSnapshot>('/api/state'),
   images: () => req<Images>('/api/images'),
   films: () => req<Film[]>('/api/films'),
-  latentMap: (backend: BackendId) =>
-    req<LatentMap>(`/api/latent-map?backend=${encodeURIComponent(backend)}`),
+  latentMap: (backend: BackendId, focus: string) =>
+    req<LatentMap>(`/api/latent-map?backend=${encodeURIComponent(backend)}&focus=${encodeURIComponent(focus)}`),
   tasteband: () => req<TasteBand>('/api/tasteband'),
   servers: () => req<ServersResponse>('/api/servers'),
   experiments: () => req<ExperimentRow[]>('/api/experiments'),

@@ -155,3 +155,60 @@ def test_cancelling_a_job_waiting_at_the_gate_frees_it(app):
     after = r.submit("t", "after", _py("pass"), lane="local")
     _wait(r, [after], timeout=5)                   # the gate is open again
     assert after.status == "done"
+
+
+# ---- 🌌 map: sampling that stays local ---------------------------------------
+def _explore_argv(app, monkeypatch, tmp_path, **body):
+    """argv /api/explore would queue for a real source image with this sidecar."""
+    import json as _json
+    ckpt = tmp_path / "source_model.safetensors"
+    ckpt.write_bytes(b"")
+    src = tmp_path / "anarchy_sd15_1_000.jpg"
+    src.write_bytes(b"")
+    src.with_suffix(".npz").write_bytes(b"")
+    src.with_suffix(".json").write_text(_json.dumps({"model": str(ckpt)}))
+    seen = {}
+
+    class Job:
+        id = 1
+
+    def submit(kind, label, argv, **kw):
+        seen["argv"] = argv
+        return Job()
+
+    monkeypatch.setattr(app.RUNNER, "submit", submit)
+    monkeypatch.setattr(app, "_resolve_output_image", lambda rel: src)
+    monkeypatch.setattr(app, "resolve_dist_base", lambda backend: "outputs/dist")
+    monkeypatch.setattr(app, "resolve_server", lambda backend, server: ("local", None))
+    monkeypatch.setattr(app, "_model_flags", lambda req: ["--ckpt", "selected.safetensors"])
+    app.api_explore(app.ExploreRequest(src=src.name, **body))
+    return seen["argv"], str(ckpt)
+
+
+def test_stay_local_renders_with_the_sources_checkpoint(app, monkeypatch, tmp_path):
+    argv, ckpt = _explore_argv(app, monkeypatch, tmp_path, stay_local=True)
+    assert "--stay-local" in argv
+    assert argv[argv.index("--ckpt") + 1] == ckpt
+
+
+def test_plain_explore_still_uses_the_selected_checkpoint(app, monkeypatch, tmp_path):
+    argv, _ = _explore_argv(app, monkeypatch, tmp_path)
+    assert "--stay-local" not in argv
+    assert argv[argv.index("--ckpt") + 1] == "selected.safetensors"
+
+
+def test_map_rejects_an_unknown_focus(app):
+    with pytest.raises(app.HTTPException) as e:
+        app.api_latent_map("sd15", focus="; rm -rf")
+    assert e.value.status_code == 400
+
+
+def test_taste_model_does_not_invalidate_the_map(app, monkeypatch, tmp_path):
+    """resonance.py rewrites it every run; counting it rebuilt the map forever."""
+    monkeypatch.setattr(app, "OUTPUTS", tmp_path)
+    (tmp_path / "a.npz").write_bytes(b"")
+    before = app._map_signature("x")
+    (tmp_path / "taste_model.npz").write_bytes(b"")
+    assert app._map_signature("x") == before
+    (tmp_path / "b.npz").write_bytes(b"")
+    assert app._map_signature("x") != before

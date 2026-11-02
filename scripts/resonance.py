@@ -67,17 +67,28 @@ def embed_new(names, vecs, batch=16):
     clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
     proc = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    new_vecs = []
+    new_vecs, embedded = [], []
     with torch.no_grad():
         for i in range(0, len(todo), batch):
             chunk = todo[i:i + batch]
-            imgs = [Image.open(p).convert("RGB") for _, p in chunk]
+            imgs, ok = [], []
+            for r, p in chunk:
+                try:
+                    imgs.append(Image.open(p).convert("RGB"))
+                    ok.append(r)
+                except OSError as exc:   # one half-written file must not cost the batch
+                    print(f"[resonance]   skipping unreadable {r}: {exc}", flush=True)
+            print(f"[resonance]   embed {min(i + batch, len(todo))}/{len(todo)}", flush=True)
+            if not imgs:
+                continue
             inputs = proc(images=imgs, return_tensors="pt").to(device)
             f = image_features(clip, inputs)
             f = f / f.norm(dim=-1, keepdim=True)
             new_vecs.append(f.float().cpu().numpy())
-            print(f"[resonance]   embed {min(i + batch, len(todo))}/{len(todo)}", flush=True)
-    names = names + [r for r, _ in todo]
+            embedded += ok
+    if not embedded:
+        return names, vecs
+    names = names + embedded
     vecs = np.concatenate([vecs, np.concatenate(new_vecs)], axis=0)
     np.savez_compressed(EMB_FILE, names=np.array(names), vecs=vecs.astype(np.float16))
     return names, vecs

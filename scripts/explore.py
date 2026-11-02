@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,20 @@ def _load_anchor(png: Path) -> dict:
     return {k: data[k] for k in data.files}
 
 
+def replay_source_params(args, src: Path) -> dict:
+    """``--stay-local``: copy how ``src`` was rendered onto ``args``, and return
+    its sidecar, for what can't be copied (noise seed, distribution)."""
+    try:
+        meta = json.loads(src.with_suffix(".json").read_text())
+    except (OSError, ValueError):
+        print(f"[explore] {src.name} has no readable params; rendering with the defaults")
+        return {}
+    for field in ("steps", "guidance", "height", "width", "scheduler", "neg_mode", "negative"):
+        if meta.get(field) is not None:
+            setattr(args, field, meta[field])
+    return meta
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_backend_args(parser)
@@ -84,6 +99,10 @@ def main(argv=None) -> int:
                         help="neighborhood: perturbation size as a fraction of corpus spread")
     parser.add_argument("--mutate", type=float, default=0.15,
                         help="breed: mutation radius added to each child")
+    parser.add_argument("--stay-local", action="store_true",
+                        help="render every child the way --src was rendered: its noise "
+                             "seed, size, steps, guidance, scheduler and negative, so the "
+                             "only thing that differs from the parent is the perturbation")
     parser.add_argument("--n", type=int, default=6)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -97,6 +116,8 @@ def main(argv=None) -> int:
         raise SystemExit("[explore] breed mode needs --b <second parent image>")
     if not (args.model or args.ckpt):
         args.backend = _detect_backend(args.src)
+    source = replay_source_params(args, args.src) if args.stay_local else {}
+    child_seed = source.get("image_seed")
     resolve_gen_defaults(args)
 
     seed = args.seed
@@ -136,10 +157,24 @@ def main(argv=None) -> int:
 
     print(f"[explore] decoding {args.n} children (guidance={args.guidance}, "
           f"steps={args.steps}) ...")
+    # --neg-mode mean pushes from a distribution's mean, so the parent's own.
+    neg_dists = dists
+    if source.get("dist") and args.neg_mode == "mean":
+        try:
+            neg_dists = backend.load_dists(dist_prefix(args, str(source["dist"])))
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            print(f"[explore] can't read {source['dist']} ({exc}); "
+                  "negative from the selected distribution")
     gen_kw = dict(guidance=args.guidance, steps=args.steps, seed=seed,
                   height=args.height, width=args.width, neg_mode=args.neg_mode,
-                  **neg_dists_kwarg(args, dists))
-    images = backend.generate(named, **gen_kw)
+                  **neg_dists_kwarg(args, neg_dists))
+    if child_seed is None:
+        images = backend.generate(named, **gen_kw)
+    else:
+        # generate() seeds image i with seed + i, so one call per child.
+        gen_kw["seed"] = child_seed
+        images = [backend.generate({k: np.asarray(v)[i:i + 1] for k, v in named.items()},
+                                   **gen_kw)[0] for i in range(args.n)]
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     for i, img in enumerate(images):
@@ -166,7 +201,8 @@ def main(argv=None) -> int:
             "steps": args.steps, "guidance": args.guidance,
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,
             "negative": effective_negative(backend, args.neg_mode),
-            "batch_seed": seed, "image_seed": seed + i, "index": i,
+            "batch_seed": seed,
+            "image_seed": seed + i if child_seed is None else child_seed, "index": i,
             "distance": round(d, 3), "anchor_distance": round(anchor_dist, 3),
         }
         path.with_suffix(".json").write_text(json.dumps(meta, indent=2))

@@ -15,6 +15,10 @@ matplotlib>=3.7
 pillow>=10.0
 pytest>=7.4
 
+# 🌌 latent map layouts + regions; without them the map falls back to corpus PCA.
+umap-learn>=0.5
+scikit-learn>=1.3
+
 # ---------------------------------------------------------------- full tier ---
 # Uncomment (or `pip install torch diffusers transformers accelerate
 # safetensors`) to encode real prompts and decode embeddings to images. A

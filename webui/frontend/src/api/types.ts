@@ -649,6 +649,8 @@ export interface ExploreRequest {
   n?: number
   steps?: number | null
   guidance?: number | null
+  /** Render like the source image: its noise seed, size, steps, scheduler, checkpoint. */
+  stay_local?: boolean
   /** sd15 run target (filled from the sidebar's "Run on"). */
   server?: string | null
 }
@@ -779,7 +781,7 @@ export interface ImageMeta {
 export interface MapNode {
   rel: string
   name: string
-  /** png mtime (s) */
+  /** image mtime (s) */
   t: number
   kind: string | null
   mode: string | null
@@ -788,10 +790,16 @@ export interface MapNode {
   distance: number | null
   /** share of the deviation outside the corpus PCA span, 0..1 */
   off: number
-  /** corpus-frame z-scores, one per exported axis */
+  /** corpus PCA z-scores */
   c: number[]
-  /** explored-frame coordinates (unit std per axis) */
-  e: number[]
+  /** look layout (UMAP of CLIP); null until the image has an embedding */
+  l: number[] | null
+  /** conditioning layout (UMAP of the conditioning) */
+  u: number[] | null
+  /** look region, -1 = unclaimed */
+  r: number
+  /** thumbnail cell in the atlas, -1 = none */
+  a: number
 }
 
 export interface MapEdge {
@@ -800,16 +808,29 @@ export interface MapEdge {
   kind: 'parent' | 'breed' | 'walk'
 }
 
+export interface MapRegion {
+  id: number
+  count: number
+  /** node indexes of its most typical images, most typical first */
+  faces: number[]
+}
+
+export type MapSpace = 'look' | 'cond' | 'corpus'
+
 export interface LatentMap {
   backend: BackendId
   tensor: string
   dims: number
   dist: string
   built: number
-  axes: {
-    corpus: { share: number[]; extremes: { pos: string[]; neg: string[] }[] }
-    explored: { share: number[] }
-  }
+  warning: string | null
+  /** images with no CLIP embedding yet, so no look position */
+  unembedded: number
+  /** per space, how far near-on-the-map means looks-alike: 1 perfect, 0.5 random */
+  frames: Record<MapSpace, { alike: number | null }>
+  regions: MapRegion[]
+  axes: { corpus: { share: number[]; extremes: { pos: string[]; neg: string[] }[] } }
+  atlas: { cols: number; tile: number }
   nodes: MapNode[]
   edges: MapEdge[]
   corpus: { label: string; c: number[] }[]

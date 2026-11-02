@@ -3,15 +3,13 @@
  * it typed arrays via `update()`, it hands back hover/pick events. Nothing in
  * here knows about the API or the store.
  *
- * Layers, back to front: a starfield, the faint corpus "dust", the explored
- * territory as a metaball hull (marching cubes, drawn three times over the same
- * geometry: faceted glass, wireframe, vertex dots), lineage edges, the timeline
- * path, and the image nodes as additive glow sprites. Node positions tween when
- * the axes change; the hull is rebuilt at the destination and fades in.
+ * Layers, back to front: a faint starfield, the corpus "dust", lineage edges,
+ * the timeline path, the sampling probe, and the images themselves -- point
+ * sprites that draw either a thumbnail out of one atlas texture or a lit bead.
+ * Node positions tween when the layout changes.
  */
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { MarchingCubes } from 'three/addons/objects/MarchingCubes.js'
 
 export type EdgeKind = 'parent' | 'breed' | 'walk'
 
@@ -22,14 +20,17 @@ export interface SceneData {
   colors: Float32Array
   /** n, world-unit diameter */
   sizes: Float32Array
+  /** n, atlas cell of each node (-1 = no thumbnail) */
+  tiles: Float32Array
+  /** n, 1 = in focus, lower = faded back (region isolation) */
+  fades: Float32Array
   edges: { a: number; b: number; kind: EdgeKind }[]
   /** m*3 corpus dust positions, or null when hidden */
   corpus: Float32Array | null
   /** node indexes of the 🎬 timeline, in order */
   path: number[]
-  /** [neg, pos] end labels for the x, y, z axes */
+  /** [neg, pos] end labels for the x, y, z axes; empty = this space has no axes */
   axisLabels: [string, string][]
-  showBlob: boolean
   showEdges: boolean
   /** re-frame the camera on the data (frame / axis change) */
   refit: boolean
@@ -42,6 +43,9 @@ export type Hit =
 interface Callbacks {
   hover: (hit: Hit | null) => void
   pick: (index: number, e: { shiftKey: boolean }) => void
+  /** a click that hit no image: the point on the ray nearest what is around it */
+  pickEmpty: (p: [number, number, number]) => void
+  open: (index: number) => void
 }
 
 const EDGE_COLOR: Record<EdgeKind, THREE.Color> = {
@@ -50,37 +54,59 @@ const EDGE_COLOR: Record<EdgeKind, THREE.Color> = {
   breed: new THREE.Color('#e07ab8'),
 }
 const TWEEN_MS = 750
-const BLOB_RES = 52
-const ISO = 80
-const SUBTRACT = 12
-
 const NODE_VERT = /* glsl */ `
   attribute float size;
   attribute float highlight;
+  attribute float tile;
+  attribute float fade;
   attribute vec3 color;
   uniform float uProj;
+  uniform float uScale;
+  uniform float uDepth;
   varying vec3 vColor;
   varying float vHi;
+  varying float vTile;
+  varying float vFade;
   void main() {
     vColor = color;
     vHi = highlight;
+    vTile = tile;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mv;
-    gl_PointSize = max(4.0, size * (1.0 + 0.6 * highlight) * uProj / -mv.z);
+    // Depth cue: what is behind the orbit centre recedes.
+    vFade = fade * clamp(1.25 - 0.08 * max(-mv.z - uDepth, 0.0), 0.4, 1.0);
+    gl_PointSize = max(3.0, size * uScale * (1.0 + 0.8 * highlight) * uProj / -mv.z);
   }
 `
-// A bright core, a thin ring, and a soft halo -- the "lit bead" look.
+// uThumb = 1: the image, rounded, with its colour as a border. 0: a lit bead.
 const NODE_FRAG = /* glsl */ `
+  uniform sampler2D uAtlas;
+  uniform float uCols;
+  uniform float uThumb;
   varying vec3 vColor;
   varying float vHi;
+  varying float vTile;
+  varying float vFade;
   void main() {
-    float d = length(gl_PointCoord - 0.5);
+    vec2 uv = gl_PointCoord;
+    if (uThumb > 0.5 && vTile >= 0.0) {
+      vec2 q = abs(uv - 0.5);
+      float corner = length(max(q - 0.40, 0.0));
+      if (corner > 0.10) discard;
+      float border = max(q.x, q.y) > (0.44 - 0.06 * vHi) ? 1.0 : 0.0;
+      vec2 cell = vec2(mod(vTile, uCols), floor(vTile / uCols));
+      vec3 img = texture2D(uAtlas, (cell + uv) / uCols).rgb;
+      vec3 c = mix(img, mix(vColor, vec3(1.0), vHi), border);
+      gl_FragColor = vec4(c * vFade, 1.0);
+      return;
+    }
+    float d = length(uv - 0.5);
     if (d > 0.5) discard;
     float core = smoothstep(0.17, 0.10, d);
     float ring = smoothstep(0.035, 0.0, abs(d - 0.30)) * (0.55 + 0.45 * vHi);
     float halo = exp(-d * d * 26.0) * 0.55;
     vec3 c = mix(vColor, vec3(1.0), core * 0.55 + vHi * 0.25);
-    float a = clamp(core + ring + halo, 0.0, 1.0);
+    float a = clamp(core + ring + halo, 0.0, 1.0) * vFade;
     gl_FragColor = vec4(c * a, a);
   }
 `
@@ -110,11 +136,24 @@ function textSprite(text: string, color = '#f1e6d6'): THREE.Sprite {
   return s
 }
 
-function concat(a: Float32Array, b: Float32Array): Float32Array {
-  const out = new Float32Array(a.length + b.length)
-  out.set(a)
-  out.set(b, a.length)
-  return out
+function ringTexture(): THREE.CanvasTexture {
+  const c = document.createElement('canvas')
+  c.width = c.height = 64
+  const ctx = c.getContext('2d')!
+  ctx.strokeStyle = '#fff'
+  ctx.lineWidth = 5
+  ctx.beginPath()
+  ctx.arc(32, 32, 24, 0, Math.PI * 2)
+  ctx.moveTo(32, 2)
+  ctx.lineTo(32, 16)
+  ctx.moveTo(32, 48)
+  ctx.lineTo(32, 62)
+  ctx.moveTo(2, 32)
+  ctx.lineTo(16, 32)
+  ctx.moveTo(48, 32)
+  ctx.lineTo(62, 32)
+  ctx.stroke()
+  return new THREE.CanvasTexture(c)
 }
 
 /** Per-axis [q_lo, q_hi] quantile box of xyz triples, widened by `grow`. */
@@ -134,25 +173,6 @@ function coreBox(p: Float32Array, qlo: number, qhi: number, grow: number) {
   return { lo, hi }
 }
 
-/** Median nearest-neighbour distance over (a sample of) the given nodes. */
-function medianNN(p: Float32Array, idx: number[]): number {
-  const s = idx.length > 1200 ? idx.filter((_, i) => i % Math.ceil(idx.length / 1200) === 0) : idx
-  if (s.length < 2) return 0.3
-  const nn = s.map((i) => {
-    let best = Infinity
-    for (const j of s) {
-      if (j === i) continue
-      const dx = p[i * 3] - p[j * 3]
-      const dy = p[i * 3 + 1] - p[j * 3 + 1]
-      const dz = p[i * 3 + 2] - p[j * 3 + 2]
-      best = Math.min(best, dx * dx + dy * dy + dz * dz)
-    }
-    return Math.sqrt(best)
-  })
-  nn.sort((a, b) => a - b)
-  return nn[Math.floor(nn.length / 2)]
-}
-
 const ease = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2)
 
 export class LatentScene {
@@ -169,9 +189,16 @@ export class LatentScene {
   private edges: THREE.LineSegments
   private path: THREE.Line
   private dust: THREE.Points
-  private blob: MarchingCubes
-  private blobMats: (THREE.Material & { opacity: number })[] = []
-  private blobBase: number[] = []
+  private probe: THREE.Group
+  private probeLines: THREE.LineSegments
+  private probeMark: THREE.Sprite
+  private probeAt: [number, number, number] | null = null
+  private probeTo: number[] = []
+  private atlasUrl: string | null = null
+  private wantThumbs = false
+  private selected: number | null = null
+  private hovered: number | null = null
+  private fly: { t0: number; fromT: THREE.Vector3; toT: THREE.Vector3; fromP: THREE.Vector3; toP: THREE.Vector3 } | null = null
   private axes = new THREE.Group()
 
   private from = new Float32Array(0)
@@ -220,28 +247,6 @@ export class LatentScene {
     )
     this.scene.add(this.dust)
 
-    // explored hull: one marching-cubes field, three materials over its geometry
-    const glass = new THREE.MeshPhongMaterial({
-      color: 0xcfe9b4, emissive: 0x16240f, specular: 0xffffff, shininess: 70,
-      flatShading: true, transparent: true, opacity: 0.2,
-      side: THREE.DoubleSide, depthWrite: false,
-    })
-    this.blob = new MarchingCubes(BLOB_RES, glass, false, false, 90000)
-    this.blob.isolation = ISO
-    this.blob.renderOrder = 1
-    const wire = new THREE.MeshBasicMaterial({
-      color: 0xe9f8d2, wireframe: true, transparent: true, opacity: 0.3, depthWrite: false,
-    })
-    const dots = new THREE.PointsMaterial({
-      color: 0xf4ffe6, size: 1.6, sizeAttenuation: false,
-      transparent: true, opacity: 0.55, depthWrite: false,
-    })
-    this.blob.add(new THREE.Mesh(this.blob.geometry, wire))
-    this.blob.add(new THREE.Points(this.blob.geometry, dots))
-    this.blobMats = [glass, wire, dots]
-    this.blobBase = this.blobMats.map((m) => m.opacity)
-    this.scene.add(this.blob)
-
     this.edges = new THREE.LineSegments(
       new THREE.BufferGeometry(),
       new THREE.LineBasicMaterial({
@@ -264,7 +269,14 @@ export class LatentScene {
     this.nodeMat = new THREE.ShaderMaterial({
       vertexShader: NODE_VERT,
       fragmentShader: NODE_FRAG,
-      uniforms: { uProj: { value: 500 } },
+      uniforms: {
+        uProj: { value: 500 },
+        uScale: { value: 1 },
+        uDepth: { value: 10 },
+        uAtlas: { value: null },
+        uCols: { value: 1 },
+        uThumb: { value: 0 },
+      },
       transparent: true,
       depthWrite: false,
       blending: THREE.CustomBlending,
@@ -276,11 +288,28 @@ export class LatentScene {
     this.scene.add(this.nodes)
     this.scene.add(this.axes)
 
+    this.probe = new THREE.Group()
+    this.probeLines = new THREE.LineSegments(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0x6fffd0, transparent: true, opacity: 0.7, depthWrite: false }),
+    )
+    this.probeMark = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: ringTexture(), color: 0x6fffd0, depthTest: false, transparent: true, sizeAttenuation: false,
+      }),
+    )
+    this.probeMark.scale.set(0.045, 0.045, 1)
+    this.probe.add(this.probeLines, this.probeMark)
+    this.probe.visible = false
+    this.probe.renderOrder = 5
+    this.scene.add(this.probe)
+
     const el = this.renderer.domElement
     el.addEventListener('pointermove', this.onMove)
     el.addEventListener('pointerdown', this.onDown)
     el.addEventListener('pointerup', this.onUp)
     el.addEventListener('pointerleave', this.onLeave)
+    el.addEventListener('dblclick', this.onDouble)
 
     this.ro = new ResizeObserver(() => this.resize())
     this.ro.observe(host)
@@ -305,6 +334,8 @@ export class LatentScene {
       g.setAttribute('highlight', new THREE.BufferAttribute(new Float32Array(n), 1))
     g.setAttribute('color', new THREE.BufferAttribute(d.colors, 3))
     g.setAttribute('size', new THREE.BufferAttribute(d.sizes, 1))
+    g.setAttribute('tile', new THREE.BufferAttribute(d.tiles, 1))
+    g.setAttribute('fade', new THREE.BufferAttribute(d.fades, 1))
 
     // edges: two vertices per edge, coloured by kind
     const eg = this.edges.geometry
@@ -328,18 +359,101 @@ export class LatentScene {
     }
     this.dust.visible = !!d.corpus
 
-    this.buildBlob(d)
     this.buildAxes(d)
     this.writePositions()
-    if (d.refit) this.fit(this.to, d.corpus)
+    this.paintHighlight()
+    if (d.refit) this.fit(this.to)
   }
 
-  setHighlight(index: number | null) {
-    const a = this.nodes.geometry.getAttribute('highlight') as THREE.BufferAttribute | undefined
-    if (!a) return
-    ;(a.array as Float32Array).fill(0)
-    if (index != null && index < a.count) (a.array as Float32Array)[index] = 1
-    a.needsUpdate = true
+  setHover(index: number | null) {
+    this.hovered = index
+    this.paintHighlight()
+  }
+
+  setSelected(index: number | null) {
+    this.selected = index
+    this.paintHighlight()
+  }
+
+  /** The sampling marker, tied by lines to the images it would draw from. */
+  setProbe(at: [number, number, number] | null, to: number[]) {
+    this.probeAt = at
+    this.probeTo = to
+    this.probe.visible = !!at
+    this.writeProbe()
+  }
+
+  /**
+   * Draw thumbnails from this atlas, or beads for null. Images only switch on
+   * once the texture has loaded: sampling an empty one paints every node black,
+   * so a slow or failed download shows beads instead.
+   */
+  setAtlas(url: string | null, cols: number) {
+    this.wantThumbs = !!url
+    this.nodeMat.uniforms.uCols.value = cols
+    if (url && url !== this.atlasUrl) {
+      this.atlasUrl = url
+      new THREE.TextureLoader().load(
+        url,
+        (tex) => {
+          if (url !== this.atlasUrl) return tex.dispose()
+          tex.flipY = false
+          tex.needsUpdate = true
+          ;(this.nodeMat.uniforms.uAtlas.value as THREE.Texture | null)?.dispose()
+          this.nodeMat.uniforms.uAtlas.value = tex
+          this.applyThumbMode()
+        },
+        undefined,
+        () => {
+          if (url === this.atlasUrl) this.atlasUrl = null // the next update retries
+        },
+      )
+    }
+    this.applyThumbMode()
+  }
+
+  /** Opaque with a depth test for images; soft glow for beads. */
+  private applyThumbMode() {
+    const on = this.wantThumbs && !!this.nodeMat.uniforms.uAtlas.value
+    const m = this.nodeMat
+    if ((m.uniforms.uThumb.value === 1) === on) return
+    m.uniforms.uThumb.value = on ? 1 : 0
+    m.depthWrite = on
+    m.blending = on ? THREE.NormalBlending : THREE.CustomBlending
+    m.needsUpdate = true
+  }
+
+  setSpin(on: boolean) {
+    this.controls.autoRotate = on
+    this.controls.autoRotateSpeed = 0.8
+  }
+
+  /** Where scene node `i` is heading (its layout position, not mid-tween). */
+  positionOf(i: number): [number, number, number] | null {
+    if ((i + 1) * 3 > this.to.length) return null
+    return [this.to[i * 3], this.to[i * 3 + 1], this.to[i * 3 + 2]]
+  }
+
+  /** Glide to frame a point, at a viewing distance for `radius` world units. */
+  flyTo(p: [number, number, number], radius: number) {
+    const toT = new THREE.Vector3(...p)
+    const dir = this.camera.position.clone().sub(this.controls.target).normalize()
+    const dist = Math.max(radius, 0.15) / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2))
+    this.fly = {
+      t0: performance.now(),
+      fromT: this.controls.target.clone(),
+      toT,
+      fromP: this.camera.position.clone(),
+      toP: toT.clone().addScaledVector(dir, dist),
+    }
+  }
+
+  resetView() {
+    if (this.to.length) this.fit(this.to)
+  }
+
+  setNodeScale(v: number) {
+    this.nodeMat.uniforms.uScale.value = v
   }
 
   dispose() {
@@ -350,6 +464,7 @@ export class LatentScene {
     el.removeEventListener('pointerdown', this.onDown)
     el.removeEventListener('pointerup', this.onUp)
     el.removeEventListener('pointerleave', this.onLeave)
+    el.removeEventListener('dblclick', this.onDouble)
     this.controls.dispose()
     this.scene.traverse((o) => {
       const m = o as THREE.Mesh
@@ -385,53 +500,9 @@ export class LatentScene {
       g,
       new THREE.PointsMaterial({
         size: 1.5, sizeAttenuation: false, vertexColors: true,
-        transparent: true, opacity: 0.8, depthWrite: false,
+        transparent: true, opacity: 0.3, depthWrite: false,
       }),
     )
-  }
-
-  /**
-   * Metaballs around the nodes at their DESTINATION; fades in with the tween.
-   * One marching-cubes grid can't resolve a dense core and a far expedition at
-   * once, so the hull covers the robust core (10-90th percentile box, widened)
-   * and outliers stay as bare nodes + paths. The ball radius follows the
-   * typical nearest-neighbour gap, so neighbours fuse into tubes and lobes
-   * instead of reading as dust or one lump.
-   */
-  private buildBlob(d: SceneData) {
-    const n = d.positions.length / 3
-    this.blob.visible = d.showBlob && n > 0
-    if (!this.blob.visible) return
-    const p = d.positions
-    const box = coreBox(p, 0.1, 0.9, 1.6)
-    const inside: number[] = []
-    for (let i = 0; i < n; i++)
-      if ([0, 1, 2].every((k) => p[i * 3 + k] >= box.lo[k] && p[i * 3 + k] <= box.hi[k])) inside.push(i)
-    const lo = [Infinity, Infinity, Infinity]
-    const hi = [-Infinity, -Infinity, -Infinity]
-    for (const i of inside)
-      for (let k = 0; k < 3; k++) {
-        lo[k] = Math.min(lo[k], p[i * 3 + k])
-        hi[k] = Math.max(hi[k], p[i * 3 + k])
-      }
-    const extent = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3)
-    const radius = Math.min(extent * 0.12, Math.max(extent * 0.035, medianNN(p, inside) * 1.35))
-    const half = extent / 2 + radius * 2.2 // cube half-size with margin
-    const centre = lo.map((v, k) => (v + hi[k]) / 2)
-    this.blob.position.set(centre[0], centre[1], centre[2])
-    this.blob.scale.setScalar(half)
-    const rn = radius / (2 * half)
-    const strength = rn * rn * (ISO + SUBTRACT)
-    this.blob.reset()
-    for (const i of inside) {
-      this.blob.addBall(
-        0.5 + (p[i * 3] - centre[0]) / (2 * half),
-        0.5 + (p[i * 3 + 1] - centre[1]) / (2 * half),
-        0.5 + (p[i * 3 + 2] - centre[2]) / (2 * half),
-        strength, SUBTRACT,
-      )
-    }
-    this.blob.update()
   }
 
   private buildAxes(d: SceneData) {
@@ -443,6 +514,7 @@ export class LatentScene {
       }
     })
     this.axes.clear()
+    if (!d.axisLabels.length) return
     const L = 3.2
     const dirs = [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1)]
     const tint = ['#f0a58a', '#b9e59c', '#9cc8f0']
@@ -467,20 +539,42 @@ export class LatentScene {
     })
   }
 
-  /** Frame the robust core (nodes + corpus), not the furthest outlier. */
-  private fit(p: Float32Array, corpus: Float32Array | null) {
-    const all = corpus ? concat(p, corpus) : p
-    const b = all.length ? coreBox(all, 0.05, 0.95, 1.15) : { lo: [-3, -3, -3], hi: [3, 3, 3] }
+  /** Frame the robust core of the images, not the furthest outlier. */
+  private fit(p: Float32Array) {
+    const b = p.length ? coreBox(p, 0.03, 0.97, 1.1) : { lo: [-3, -3, -3], hi: [3, 3, 3] }
     const box = new THREE.Box3(new THREE.Vector3(...b.lo), new THREE.Vector3(...b.hi))
     const sphere = box.getBoundingSphere(new THREE.Sphere())
-    const r = Math.max(sphere.radius, 2)
+    const r = Math.max(sphere.radius, 0.5)
     const dir = this.camera.position.clone().sub(this.controls.target).normalize()
     const dist = r / Math.sin(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 0.95
+    this.fly = null
     this.controls.target.copy(sphere.center)
     this.camera.position.copy(sphere.center).addScaledVector(dir, dist)
     this.camera.near = dist / 200
     this.camera.far = Math.max(2000, dist * 20)
     this.camera.updateProjectionMatrix()
+  }
+
+  private paintHighlight() {
+    const a = this.nodes.geometry.getAttribute('highlight') as THREE.BufferAttribute | undefined
+    if (!a) return
+    const v = a.array as Float32Array
+    v.fill(0)
+    for (const i of [this.selected, this.hovered]) if (i != null && i < a.count) v[i] = 1
+    a.needsUpdate = true
+  }
+
+  private writeProbe() {
+    if (!this.probeAt) return
+    const [x, y, z] = this.probeAt
+    this.probeMark.position.set(x, y, z)
+    const seg = new Float32Array(this.probeTo.length * 6)
+    this.probeTo.forEach((ni, i) => {
+      seg.set([x, y, z], i * 6)
+      seg.set(this.cur.subarray(ni * 3, ni * 3 + 3), i * 6 + 3)
+    })
+    this.probeLines.geometry.setAttribute('position', new THREE.BufferAttribute(seg, 3))
+    this.probeLines.geometry.computeBoundingSphere()
   }
 
   // ---------------------------------------------------------------- loop ---
@@ -502,6 +596,7 @@ export class LatentScene {
     d.path.forEach((ni, i) => pa.set(this.cur.subarray(ni * 3, ni * 3 + 3), i * 3))
     pp.needsUpdate = true
     if (d.path.length > 1) this.path.computeLineDistances()
+    this.writeProbe()
   }
 
   private loop = () => {
@@ -512,8 +607,14 @@ export class LatentScene {
       for (let i = 0; i < this.cur.length; i++)
         this.cur[i] = this.from[i] + (this.to[i] - this.from[i]) * k
       this.writePositions()
-      this.blobMats.forEach((m, i) => (m.opacity = this.blobBase[i] * k))
     }
+    if (this.fly) {
+      const f = ease(Math.min(1, (performance.now() - this.fly.t0) / TWEEN_MS))
+      this.controls.target.lerpVectors(this.fly.fromT, this.fly.toT, f)
+      this.camera.position.lerpVectors(this.fly.fromP, this.fly.toP, f)
+      if (f >= 1) this.fly = null
+    }
+    this.nodeMat.uniforms.uDepth.value = this.camera.position.distanceTo(this.controls.target)
     this.lastT = t
     if (this.hoverQueued) {
       this.hover(this.hoverQueued)
@@ -578,5 +679,40 @@ export class LatentScene {
     this.ray(e)
     const i = this.nearest(this.nodes)
     if (i != null) this.cb.pick(i, { shiftKey: e.shiftKey })
+    else this.cb.pickEmpty(this.emptyPoint())
+  }
+
+  private onDouble = (e: MouseEvent) => {
+    this.ray(e as PointerEvent)
+    const i = this.nearest(this.nodes)
+    if (i != null) this.cb.open(i)
+  }
+
+  /**
+   * A click in empty space has no depth of its own. Take the depth of the
+   * images passing closest to the ray, so the point lands among what you were
+   * looking at rather than on some arbitrary plane.
+   */
+  private emptyPoint(): [number, number, number] {
+    const ray = this.raycaster.ray
+    const n = this.cur.length / 3
+    const v = new THREE.Vector3()
+    let best = Infinity
+    for (let i = 0; i < n; i++) {
+      v.set(this.cur[i * 3], this.cur[i * 3 + 1], this.cur[i * 3 + 2])
+      best = Math.min(best, ray.distanceSqToPoint(v))
+    }
+    let sum = 0
+    let weight = 0
+    const scale = Math.max(best, 1e-4) * 2
+    for (let i = 0; i < n; i++) {
+      v.set(this.cur[i * 3], this.cur[i * 3 + 1], this.cur[i * 3 + 2])
+      const w = Math.exp(-ray.distanceSqToPoint(v) / scale)
+      sum += w * v.sub(ray.origin).dot(ray.direction)
+      weight += w
+    }
+    const depth = weight > 0 ? sum / weight : this.camera.position.distanceTo(this.controls.target)
+    const p = ray.at(depth, new THREE.Vector3())
+    return [p.x, p.y, p.z]
   }
 }

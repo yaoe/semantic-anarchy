@@ -43,7 +43,8 @@ export const qk = {
   state: ['state'] as const,
   images: ['images'] as const,
   films: ['films'] as const,
-  latentMap: (backend: BackendId, gen: number) => ['latentMap', backend, gen] as const,
+  latentMap: (backend: BackendId, focus: string, gen: number) =>
+    ['latentMap', backend, focus, gen] as const,
   keyframes: (rels: string[]) => ['keyframes', rels.join('|')] as const,
   tasteband: ['tasteband'] as const,
   servers: ['servers'] as const,
@@ -110,15 +111,18 @@ export function useImages(busy: boolean) {
 }
 
 /**
- * The 🌌 map. Keyed on the gallery's last refresh, so it rebuilds exactly when
- * new images land (the server re-projects only if a sidecar changed).
+ * The 🌌 map. Keyed on the gallery's last refresh, so it rebuilds when new
+ * images land (the server re-projects only if a sidecar changed). A rebuild is
+ * ~15s of UMAP and the gallery refreshes every 2s during a batch, so the key
+ * holds still while a job runs and catches up when it ends.
  */
-export function useLatentMap(backend: BackendId, enabled: boolean) {
-  const gen = useQueryClient().getQueryState(qk.images)?.dataUpdatedAt ?? 0
+export function useLatentMap(backend: BackendId, focus: string, busy: boolean) {
+  const seen = useQueryClient().getQueryState(qk.images)?.dataUpdatedAt ?? 0
+  const gen = useRef(seen)
+  if (!busy) gen.current = seen
   return useQuery({
-    queryKey: qk.latentMap(backend, gen),
-    queryFn: () => api.latentMap(backend),
-    enabled,
+    queryKey: qk.latentMap(backend, focus, gen.current),
+    queryFn: () => api.latentMap(backend, focus),
     placeholderData: keepPreviousData,
     retry: false,
   })

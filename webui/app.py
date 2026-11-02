@@ -1664,6 +1664,7 @@ class ExploreRequest(BaseModel):
     guidance: Optional[float] = None
     server: Optional[str] = None      # sd15: run target, as RunRequest.server
     experiment: Optional[str] = None  # tag the children too (E11-grids)
+    stay_local: bool = False          # render like src: seed, size, steps, scheduler, ckpt
 
 
 def _resolve_output_image(rel: str) -> Path:
@@ -1709,6 +1710,16 @@ def _explorable_source(p: Path) -> Path:
         400, f"{p.name} has no conditioning sidecar (and no traceable original)")
 
 
+def _source_checkpoint(src: Path) -> list[str]:
+    """``--ckpt`` for the checkpoint that rendered ``src``, if it is still on disk."""
+    try:
+        recorded = json.loads(src.with_suffix(".json").read_text()).get("model")
+        path = Path(recorded)
+        return ["--ckpt", str(path)] if path.is_file() and path_kind(path) else []
+    except (OSError, ValueError, TypeError):
+        return []
+
+
 @app.post("/api/explore")
 def api_explore(req: ExploreRequest) -> JSONResponse:
     if req.mode not in ("neighborhood", "breed", "walk"):
@@ -1727,10 +1738,14 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
     model = _model_flags(RunRequest(action="explore", backend=backend, server=req.server))
     # Measure the radius against whatever corpus is selected, like every other
     # sampling action, not always the repo's own outputs/dist.
+    if req.stay_local and not url:
+        model = _source_checkpoint(src) or model
     argv = [python_for(backend), "-u", "scripts/explore.py", "--backend", backend, *model,
             "--dist", resolve_dist_base(backend),
             "--mode", req.mode, "--src", str(src),
             "--n", str(int(req.n)), "--scheduler", "ddim"]
+    if req.stay_local:
+        argv.append("--stay-local")
     if req.mode == "breed":
         b = _explorable_source(_resolve_output_image(req.b or ""))
         if backend not in b.name:
@@ -2008,14 +2023,25 @@ async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
 
 _map_lock = threading.Lock()
 
+# The one UMAP knob with a visible effect, as three positions rather than two
+# raw numbers: (n_neighbors, min_dist).
+MAP_FOCUS = {
+    "islands": (8, 0.02),      # tight local clusters, gaps between them
+    "balanced": (20, 0.1),
+    "continents": (60, 0.4),   # the gallery's overall shape, local detail blurred
+}
+
 
 def _map_signature(*inputs: str) -> str:
-    """Changes whenever any ``.npz`` under outputs/ does -- image sidecars and
-    the fitted distributions alike -- or the map's own inputs (which fit, which
-    prompt file) do."""
+    """Changes whenever any ``.npz`` the map reads does -- image sidecars, the
+    CLIP embeddings and the fitted distributions alike -- or the map's own
+    inputs (which fit, which prompt file, which focus) do. The taste model is the
+    one that isn't read: resonance.py rewrites it every run, embedding or not."""
     n, newest = 0, 0.0
     if OUTPUTS.is_dir():
         for p in OUTPUTS.rglob("*.npz"):
+            if p.name == "taste_model.npz":
+                continue
             try:
                 newest = max(newest, p.stat().st_mtime)
                 n += 1
@@ -2025,26 +2051,31 @@ def _map_signature(*inputs: str) -> str:
 
 
 @app.get("/api/latent-map")
-def api_latent_map(backend: str = "sd15") -> FileResponse:
-    """🌌 Map data: every explored image projected onto PCA axes (built by
-    scripts/latent_map.py -- NumPy only, so it runs here, not in the GPU queue)."""
+def api_latent_map(backend: str = "sd15", focus: str = "balanced") -> FileResponse:
+    """🌌 Map data: every explored image placed in 3D (built by
+    scripts/latent_map.py -- no model, so it runs here, not in the GPU queue)."""
     if backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {backend!r}")
-    # The axes are the corpus the sidebar has selected, like every sampling action.
+    if focus not in MAP_FOCUS:
+        raise HTTPException(400, f"unknown focus {focus!r}")
+    # The corpus frame's axes are the corpus the sidebar has selected, like every
+    # sampling action.
     base = _abs_base(resolve_dist_base(backend))
     row = current_dist(backend)
     prompts = row["path"] if row["kind"] == "prompts" and row["path"] else DEFAULT_PROMPTS
-    out = OUTPUTS / f"latent_map_{backend}.json"
+    out = OUTPUTS / f"latent_map_{backend}_{focus}.json"
     sig_file = out.with_suffix(".sig")
+    neighbors, min_dist = MAP_FOCUS[focus]
     with _map_lock:
-        sig = _map_signature(str(base), str(prompts))
+        sig = _map_signature(str(base), str(prompts), focus)
         fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
         if not fresh:
             try:
                 proc = subprocess.run(
                     [PYTHON, str(REPO / "scripts" / "latent_map.py"),
                      "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
-                     "--dist", str(base), "--prompts", str(prompts)],
+                     "--dist", str(base), "--prompts", str(prompts),
+                     "--neighbors", str(neighbors), "--min-dist", str(min_dist)],
                     cwd=str(REPO), capture_output=True, text=True, timeout=300)
             except subprocess.TimeoutExpired:
                 raise HTTPException(504, f"latent map for {backend} took over 300 s") from None
@@ -2054,6 +2085,17 @@ def api_latent_map(backend: str = "sd15") -> FileResponse:
                                     msg[-1] if msg else "latent map build failed")
             sig_file.write_text(sig)
     return FileResponse(out, media_type="application/json")
+
+
+@app.get("/api/latent-map/atlas")
+def api_latent_map_atlas(backend: str = "sd15") -> FileResponse:
+    """The map's thumbnails, one JPEG (written by the build above)."""
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    f = OUTPUTS / f"latent_map_{backend}.atlas.jpg"
+    if not f.is_file():
+        raise HTTPException(404, "no atlas yet -- open the map first")
+    return FileResponse(f, media_type="image/jpeg")
 
 
 @app.get("/api/images")
