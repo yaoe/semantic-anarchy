@@ -22,7 +22,7 @@ function startDir(row?: ModelRow): string | null {
  * dialog (zenity/kdialog/osascript). That only helps when you're sitting at the
  * machine, so if no dialog is available — or it fails — we fall back to the
  * in-browser server-side file browser, which works from any tailnet device.
- * The choice persists in webui/model_config.json, per backend.
+ * The choice persists in config.json -> "models", per backend.
  */
 export function ModelPicker() {
   const backend = useUI((s) => s.params.backend) as BackendId

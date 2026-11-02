@@ -112,7 +112,8 @@ def test_script_end_to_end(tmp_path):
     for i, kind in enumerate(["generate", "generate", "explore"]):
         stem = outputs / "generated" / f"anarchy_sd15_1_{i:03d}"
         np.savez(stem.with_suffix(".npz"), embeds=d.sample(1, rng=rng)[0])
-        stem.with_suffix(".png").write_bytes(b"")
+        # the stem is the identity: renders are JPEG now, the old gallery is PNG
+        stem.with_suffix(".jpg" if i else ".png").write_bytes(b"")
         meta = {"kind": kind, "backend": "sd15"}
         if kind == "explore":
             meta["parent"] = "anarchy_sd15_1_000.png"

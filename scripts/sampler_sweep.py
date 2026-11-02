@@ -27,9 +27,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_anarchy.io_utils import unique_path
+from semantic_anarchy.io_utils import image_ext, save_image, unique_path
 from semantic_anarchy.cli_args import (
     add_backend_args, resolve_gen_defaults, load_backend, dist_prefix,
+    sampler_kwargs, resolve_lengths, neg_dists_kwarg,
 )
 
 
@@ -53,7 +54,7 @@ def main(argv=None) -> int:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--out", type=Path, default=Path("outputs/sampler_sweep.png"))
+    parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
     resolve_gen_defaults(args)
 
@@ -78,15 +79,20 @@ def main(argv=None) -> int:
     print(f"[sweep] backend={args.backend} rows={[r[0] for r in rows]} seeds={seeds} "
           f"({len(rows)}x{len(seeds)} images)")
 
+    resolve_lengths(args, backend, dists, 1, np.random.default_rng(0))
+
     def render(sampler_kw, seed):
+        rng = np.random.default_rng(seed)
+        lengths = resolve_lengths(args, backend, dists, 1, rng, quiet=True)
+        # The row's own sampler/coherence override whatever the sidebar picked;
+        # everything else (rho, empirical head, truncation, ...) is shared, so
+        # every row is the same experiment with one thing changed.
+        kwargs = {**sampler_kwargs(args, lengths), **sampler_kw}
         named = backend.sample(dists, n=1, temperature=args.temperature,
-                               rng=np.random.default_rng(seed),
-                               components=args.components, truncation=args.truncation,
-                               **sampler_kw)
+                               rng=rng, **kwargs)
         kw = dict(guidance=args.guidance, steps=args.steps, seed=seed,
-                  height=args.height, width=args.width, neg_mode=args.neg_mode)
-        if args.backend == "sdxl":
-            kw["dists"] = dists
+                  height=args.height, width=args.width, neg_mode=args.neg_mode,
+                  **neg_dists_kwarg(args, dists))
         return backend.generate(named, **kw)[0]
 
     grid, cw, ch = [], None, None
@@ -112,9 +118,11 @@ def main(argv=None) -> int:
         for ci in range(ncol):
             sheet.paste(grid[ri][ci], (label_w + ci*cw, y))
 
+    if args.out is None:      # default follows SA_IMAGE_FORMAT
+        args.out = Path(f"outputs/sampler_sweep{image_ext()}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     out = unique_path(args.out.with_name(f"{args.out.stem}_{args.backend}{args.out.suffix}"))
-    sheet.save(out)
+    save_image(sheet, out)
     print(f"[sweep] contact sheet ({len(rows)} samplers x {ncol} seeds) -> {out}")
     return 0
 

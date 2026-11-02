@@ -30,14 +30,28 @@ export function Field({
 
   const options = (resolve(field.options, ctx) ?? []) as Option[]
   const placeholder = resolve(field.placeholder, ctx)
+  // Label and tooltip can depend on the form state: a knob whose MEANING moves
+  // with the action or the sampler (Components is a PCA rank when mining and an
+  // axis count when sampling; Temperature is a jitter weight under hybrid) has
+  // to say so where it is read, not in a paragraph somewhere else.
+  const labelText = resolve(field.label, ctx)
+  const tooltip = resolve(field.tooltip, ctx)
 
-  const label = field.label ? (
-    <Tip content={field.tooltip} side="top">
+  // Turn the shown default into editable text on first focus, so a knob whose
+  // placeholder IS the real value (steps, guidance, width/height, the negative
+  // prompt) can be tweaked instead of retyped. Clearing the box still means
+  // "blank -> the script's own default", so nothing is sent that wasn't shown.
+  const seedDefault = () => {
+    if (field.seedFromPlaceholder && !value && placeholder) onChange(placeholder)
+  }
+
+  const label = labelText ? (
+    <Tip content={tooltip} side="top">
       <label
-        className={cn('sa-label w-fit', field.tooltip && 'cursor-help decoration-dotted')}
+        className={cn('sa-label w-fit', tooltip && 'cursor-help decoration-dotted')}
         htmlFor={`f-${field.id}`}
       >
-        {field.label}
+        {labelText}
       </label>
     </Tip>
   ) : null
@@ -51,8 +65,23 @@ export function Field({
         value={value}
         onChange={onChange}
         options={options}
-        ariaLabel={field.label ?? field.id}
-        title={field.tooltip}
+        ariaLabel={labelText ?? field.id}
+        title={tooltip}
+      />
+    )
+  } else if (field.type === 'textarea') {
+    control = (
+      <textarea
+        id={`f-${field.id}`}
+        className="sa-input h-auto py-1 leading-snug resize-y"
+        rows={field.rows ?? 3}
+        autoComplete="off"
+        spellCheck={false}
+        value={value}
+        placeholder={placeholder}
+        title={tooltip}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={seedDefault}
       />
     )
   } else if (field.expr) {
@@ -72,8 +101,9 @@ export function Field({
         spellCheck={false}
         value={value}
         placeholder={placeholder}
-        title={field.tooltip}
+        title={tooltip}
         onChange={(e) => onChange(e.target.value)}
+        onFocus={seedDefault}
         onBlur={collapse}
         onKeyDown={(e) => {
           if (e.key === 'Enter') {
@@ -93,8 +123,9 @@ export function Field({
         min={field.min}
         value={value}
         placeholder={placeholder}
-        title={field.tooltip}
+        title={tooltip}
         onChange={(e) => onChange(e.target.value)}
+        onFocus={seedDefault}
       />
     )
   }

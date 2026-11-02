@@ -27,3 +27,32 @@ export function fmtDuration(started?: number | null, ended?: number | null): str
   const m = Math.floor(s / 60)
   return `${m}m ${s % 60}s`
 }
+
+
+/**
+ * A store value (always a string) as a number, falling back when it is blank.
+ * Shared by every surface that reads knob values out of `tools` — the gallery
+ * card and the lightbox both submit the same actions from the same settings.
+ */
+export const numOr = (v: string | undefined, dflt: number): number =>
+  (v ?? '').trim() === '' ? dflt : Number(v)
+
+
+/** Backends whose images carry conditioning, in the order they are shown. */
+export const IMAGE_BACKENDS = ['sd15', 'sd2', 'sdxl', 'flux2', 'krea2'] as const
+
+/**
+ * Which model made this image, read off its filename (`anarchy_<backend>_...`).
+ *
+ * Filename rather than sidecar because callers have a rel-path and nothing else
+ * — the persisted fit selection, the timeline, a favorites entry. Returns null
+ * for anything not named by a generator (an upscale keeps its ancestor's name,
+ * so it still answers correctly).
+ */
+export function backendOf(rel: string): string | null {
+  const name = rel.split('/').pop() ?? rel
+  for (const b of IMAGE_BACKENDS) {
+    if (name.includes(`anarchy_${b}_`)) return b
+  }
+  return null
+}

@@ -122,7 +122,7 @@ function Keyframe({
           ‹
         </button>
         <span className="min-w-0 flex-1 truncate text-center text-[10px] text-dim">
-          {name.replace(/^anarchy_/, '').replace(/\.png$/, '')}
+          {name.replace(/^anarchy_/, '').replace(/\.(jpe?g|png|webp)$/i, '')}
         </span>
         <button
           className="sa-btn sa-btn-sm"

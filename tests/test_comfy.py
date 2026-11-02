@@ -107,3 +107,55 @@ def test_unpickler_refuses_code_hidden_in_storage_bytes():
     assert "pwned" not in str(ei.value)
     assert isinstance(ei.value, (pickle.UnpicklingError, RuntimeError, io.UnsupportedOperation)) \
         or "weights_only" in str(ei.value) or "Weights only" in str(ei.value)
+
+
+# ---- the backend honours the same generate() contract as SD15Backend --------
+class _FakeClient:
+    def __init__(self):
+        self.graphs = []
+
+    def run(self, graph, label=""):
+        self.graphs.append(graph)
+        return {k: {"images": [k]} for k, n in graph.items() if n["class_type"] == "PreviewImage"}
+
+    def fetch_image(self, ref):
+        return ref
+
+
+def _comfy_backend():
+    from semantic_anarchy.backend import ComfySD15Backend
+    be = ComfySD15Backend(_FakeClient(), "m.ckpt")
+    be.negative_prompt = "blurry (bad)"
+    return be
+
+
+def test_generate_streams_each_image_and_takes_dists():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("torch")
+    be, seen = _comfy_backend(), []
+    out = be.generate({"embeds": np.zeros((2, 77, 768), dtype=np.float32)}, dists=None, seed=3,
+                      on_image=lambda i, im: seen.append(i))
+    assert seen == [0, 1] and len(out) == 2
+
+
+@pytest.mark.parametrize("mode,kind,text", [
+    ("text", "CLIPTextEncode", "blurry \\(bad\\)"),
+    ("empty", "CLIPTextEncode", ""),
+    ("zeros", "Base64ToConditioning", None),
+    ("mean", "Base64ToConditioning", None),
+])
+def test_generate_honours_every_neg_mode(mode, kind, text):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+    be = _comfy_backend()
+    dists = {"embeds": SimpleNamespace(mean=np.ones((77, 768)))}
+    be.generate({"embeds": np.zeros((1, 77, 768), dtype=np.float32)}, dists=dists, seed=1, neg_mode=mode)
+    neg = be.client.graphs[0]["neg"]
+    assert neg["class_type"] == kind
+    if text is not None:
+        assert neg["inputs"]["text"] == text
+
+
+def test_no_tokenizer_means_no_length_dimension():
+    assert _comfy_backend().token_lengths(["a"]) is None

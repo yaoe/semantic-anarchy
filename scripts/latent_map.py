@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.backend import dist_backend
+from semantic_anarchy.cli_args import dist_prefix
+from semantic_anarchy.io_utils import find_image
 from semantic_anarchy.latent_map import (
     axis_extremes, corpus_indices, explained, explored_frame, off_manifold,
     project, sketch,
@@ -51,8 +54,8 @@ def find_nodes(outputs: Path, backend: str, tensor: str, shape: tuple) -> list[d
     """Images with an ``.npz`` conditioning sidecar for this backend, oldest first."""
     nodes = []
     for npz in outputs.rglob("*.npz"):
-        png = npz.with_suffix(".png")
-        if not png.is_file():
+        img = find_image(npz)  # the stem is the identity: png, jpg, whatever
+        if img is None:
             continue          # distributions, evolved branches, other caches
         meta = {}
         js = npz.with_suffix(".json")
@@ -63,7 +66,7 @@ def find_nodes(outputs: Path, backend: str, tensor: str, shape: tuple) -> list[d
                 pass
         if meta.get("backend", backend) != backend:
             continue
-        nodes.append({"npz": npz, "png": png, "meta": meta, "mtime": png.stat().st_mtime})
+        nodes.append({"npz": npz, "img": img, "meta": meta, "mtime": img.stat().st_mtime})
     nodes.sort(key=lambda n: n["mtime"])
     return nodes
 
@@ -84,7 +87,7 @@ def lineage(nodes: list[dict]) -> list[dict]:
     newest same-named image older than the child (names repeat across folders)."""
     by_name: dict[str, list[int]] = {}
     for i, n in enumerate(nodes):
-        by_name.setdefault(n["png"].name, []).append(i)
+        by_name.setdefault(n["img"].name, []).append(i)
     def resolve(name, i):
         older = [j for j in by_name.get(Path(name).name, []) if j != i
                  and nodes[j]["mtime"] <= nodes[i]["mtime"]]
@@ -127,14 +130,16 @@ def main(argv=None) -> int:
 
     be = dist_backend(args.backend)
     tensor = be.tensor_names[0]
-    base = args.dist or args.outputs / "dist"
-    prefix = base if args.backend == "sd15" or args.dist else Path(f"{base}_{args.backend}")
+    prefix = dist_prefix(args, str(args.dist or args.outputs / "dist"))
     try:
         dist = be.load_dists(prefix)[tensor]
     except FileNotFoundError:
         print(f"no {args.backend} distribution at {prefix} -- mine one first",
               file=sys.stderr)
         return 3
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        print(f"{prefix}: unreadable distribution ({exc}) -- re-mine it", file=sys.stderr)
+        return 2
     if dist.pca_components is None:
         print(f"[map] {prefix}: distribution has no PCA -- re-mine it", file=sys.stderr)
         return 2
@@ -166,7 +171,8 @@ def main(argv=None) -> int:
     prompts = read_prompts(args.prompts)
     corpus = dist.corpus_embeddings
     c_coords = project(dist, corpus, dims) if corpus is not None else np.zeros((0, dims))
-    if len(prompts) == dist.n_samples and corpus is not None:
+    labelled = len(prompts) == dist.n_samples and corpus is not None
+    if labelled:
         labels = [prompts[i] for i in corpus_indices(dist.n_samples, len(corpus))]
     else:
         labels = [f"corpus #{i}" for i in range(len(c_coords))]
@@ -181,8 +187,8 @@ def main(argv=None) -> int:
     for i, n in enumerate(nodes):
         m = n["meta"]
         out_nodes.append({
-            "rel": n["png"].relative_to(args.outputs).as_posix(),
-            "name": n["png"].name,
+            "rel": n["img"].relative_to(args.outputs).as_posix(),
+            "name": n["img"].name,
             "t": round(n["mtime"], 1),
             "kind": m.get("kind"), "mode": m.get("mode"),
             "sampler": m.get("sampler"), "temperature": m.get("temperature"),
@@ -195,7 +201,7 @@ def main(argv=None) -> int:
         "dist": str(prefix), "built": time.time(),
         "axes": {
             "corpus": {"share": rnd(explained(dist, dims), 4),
-                       "extremes": axis_extremes(c_coords, labels) if len(labels) else []},
+                       "extremes": axis_extremes(c_coords, labels) if labelled else []},
             "explored": {"share": rnd(ex_share, 4)},
         },
         "nodes": out_nodes,

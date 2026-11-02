@@ -2,7 +2,8 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { useImages } from '../../api/queries'
-import type { GalleryKey, ImageItem, TabKey } from '../../api/types'
+import { UNSET, type GalleryKey, type ImageItem, type TabKey } from '../../api/types'
+import { FitPage } from '../fit/FitPage'
 import { FilmList } from '../timeline/FilmList'
 import { Timeline } from '../timeline/Timeline'
 import { useUI, type SortKey } from '../../store'
@@ -16,12 +17,28 @@ const LatentMap = lazy(() =>
 
 const SHEET_TABS: TabKey[] = ['temperature', 'sampler', 'marginals']
 const MIN_COL = 220
-const GAP = 12
+const GAP = 6
 
 const EMPTY_MSG: Partial<Record<TabKey, string>> = {
   favorites: 'no favorites yet — click the ☆ on any image to add it.',
   top: 'nothing scored yet — click “Score all ▶” to rank by aesthetic.',
   frontier: 'no analysis yet — click “🎯 Analyze” to compute novelty + resonance.',
+}
+
+/**
+ * Narrow a bucket to one aesthetic universe. '' keeps everything; `UNSET` keeps
+ * the images that have not been sorted into one yet — the useful inverse when
+ * you are working through a backlog.
+ *
+ * Client-side, like the sort: /api/images already carries each row's tags, so
+ * filtering here costs one pass over an array that is in memory anyway and
+ * needs no round trip.
+ */
+function filterByTag(list: ImageItem[], tag: string): ImageItem[] {
+  if (!tag) return list
+  if (tag === UNSET) return list.filter((im) => !im.tags?.length)
+  const want = tag.toLocaleLowerCase()
+  return list.filter((im) => im.tags?.some((t) => t.toLocaleLowerCase() === want))
 }
 
 /** Client-side reorder of a bucket. 'new' is the server's own mtime order. */
@@ -45,7 +62,7 @@ function sortItems(list: ImageItem[], sortBy: SortKey): ImageItem[] {
 }
 
 /** Tabs that render their own thing instead of the virtualized image grid. */
-const CUSTOM_TABS: TabKey[] = ['films', 'timeline', 'map']
+const CUSTOM_TABS: TabKey[] = ['films', 'timeline', 'fit', 'map']
 const isGrid = (t: TabKey): t is GalleryKey => !CUSTOM_TABS.includes(t)
 
 /**
@@ -56,10 +73,19 @@ const isGrid = (t: TabKey): t is GalleryKey => !CUSTOM_TABS.includes(t)
 export function Gallery({ busy }: { busy: boolean }) {
   const tab = useUI((s) => s.tab)
   const sortBy = useUI((s) => s.sortBy)
+  const tagFilter = useUI((s) => s.tagFilter)
   const { data: images, isLoading } = useImages(busy)
 
-  const list = isGrid(tab) ? (images?.[tab] ?? []) : []
-  const view = useMemo(() => sortItems(list, sortBy), [list, sortBy])
+  // Memoized so the `[]` fallback isn't a fresh array on every render, which
+  // would re-run the filter+sort below for nothing.
+  const list = useMemo(
+    () => (isGrid(tab) ? (images?.[tab] ?? []) : []),
+    [images, tab],
+  )
+  const view = useMemo(
+    () => sortItems(filterByTag(list, tagFilter), sortBy),
+    [list, tagFilter, sortBy],
+  )
 
   const parentRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
@@ -81,24 +107,23 @@ export function Gallery({ busy }: { busy: boolean }) {
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => (sheet ? 720 : Math.round(colW + 60)),
+    estimateSize: () => (sheet ? 720 : Math.round(colW + 30)),
     overscan: 3,
   })
 
   // Column count and bucket changes invalidate every cached row measurement.
   useEffect(() => {
     virtualizer.measure()
-  }, [cols, tab, sortBy, virtualizer])
+  }, [cols, tab, sortBy, tagFilter, virtualizer])
 
   useEffect(() => {
     if (parentRef.current) parentRef.current.scrollTop = 0
     setFresh(0)
-  }, [tab, sortBy])
+  }, [tab, sortBy, tagFilter])
 
   // Keep the view still when the bucket changes under it. Starring refetches
   // the gallery, and with sort=new every image made since the last fetch lands
-  // at the top at once, pushing rows down; the lightbox cursor is an index, so
-  // it would slide onto another image too. Anchor both on the item they show.
+  // at the top at once, pushing rows down. Anchor the grid on the item it shows.
   const prevRef = useRef<{ view: ImageItem[]; tab: TabKey; sortBy: SortKey; cols: number } | null>(null)
   const [fresh, setFresh] = useState(0) // new items parked above the anchor
   useLayoutEffect(() => {
@@ -107,14 +132,6 @@ export function Gallery({ busy }: { busy: boolean }) {
     const el = parentRef.current
     if (!prev || !el || prev.view === view || !prev.view.length || !view.length) return
     if (prev.tab !== tab || prev.sortBy !== sortBy || prev.cols !== cols) return
-
-    // Lightbox: follow the open image to its new index.
-    const ui = useUI.getState()
-    if (ui.lightboxIndex >= 0) {
-      const rel = prev.view[ui.lightboxIndex]?.rel
-      const ni = rel ? view.findIndex((v) => v.rel === rel) : -1
-      if (ni >= 0 && ni !== ui.lightboxIndex) ui.openLightbox(ni)
-    }
 
     // Grid: the first row that is still on screen is the anchor. Row sizes are
     // cached per row *index*, and a prepend only adds rows at the end of the
@@ -166,11 +183,17 @@ export function Gallery({ busy }: { busy: boolean }) {
         <Timeline />
       ) : tab === 'films' ? (
         <FilmList />
+      ) : tab === 'fit' ? (
+        <FitPage />
       ) : isLoading ? (
         <div className="p-8 text-center text-dim">loading gallery…</div>
       ) : !view.length ? (
         <div className="p-8 text-center text-dim">
-          {EMPTY_MSG[tab] ?? `no ${tab} artifacts yet — run something.`}
+          {tagFilter && list.length
+            ? tagFilter === UNSET
+              ? 'every image here is already sorted into a universe.'
+              : `nothing in this tab wears “${tagFilter}”.`
+            : (EMPTY_MSG[tab] ?? `no ${tab} artifacts yet — run something.`)}
         </div>
       ) : (
         <>
@@ -190,17 +213,16 @@ export function Gallery({ busy }: { busy: boolean }) {
                   style={{ transform: `translateY(${row.start}px)` }}
                 >
                   <div
-                    className="grid pb-3"
+                    className="grid pb-1.5"
                     style={{
                       gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
                       gap: `${GAP}px`,
                     }}
                   >
-                    {rowItems.map((im, i) => (
+                    {rowItems.map((im) => (
                       <Card
                         key={im.rel}
                         im={im}
-                        index={start + i}
                         sheet={sheet}
                         showNovRes={tab === 'frontier'}
                       />
@@ -210,8 +232,14 @@ export function Gallery({ busy }: { busy: boolean }) {
               )
             })}
           </div>
-          <div className="py-3.5 text-center text-[12px] text-dim">
+          <div className="py-1.5 text-center text-[12px] text-dim">
             {view.length} image{view.length === 1 ? '' : 's'}
+            {tagFilter ? (
+              <span className="text-tag">
+                {' '}
+                · {tagFilter === UNSET ? 'untagged' : tagFilter} of {list.length}
+              </span>
+            ) : null}
           </div>
         </>
       )}

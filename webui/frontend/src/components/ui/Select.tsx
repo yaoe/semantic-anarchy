@@ -50,7 +50,7 @@ export function Select({
         <RS.Content
           position="popper"
           sideOffset={4}
-          className="z-[80] max-h-[60vh] min-w-[var(--radix-select-trigger-width)]
+          className="z-[110] max-h-[60vh] min-w-[var(--radix-select-trigger-width)]
                      overflow-hidden rounded-lg border border-line bg-panel2 shadow-2xl"
         >
           <RS.Viewport className="p-1">

@@ -1,16 +1,17 @@
 import { Select } from '../../components/ui/Select'
 import { Tip } from '../../components/ui/Tip'
+import { BreedIcon, ExploreIcon } from '../../components/ui/actionIcons'
 import { Tool } from '../../components/ui/Tool'
 import { basename } from '../../lib/utils'
 import { useUI } from '../../store'
 
-/** Settings + status line for the 🧭 / 🚶 / 🧬 card actions (POST /api/explore). */
 const WALK_DIRS = [
   { value: 'outward', label: 'outward' },
   { value: 'random', label: 'random' },
   { value: 'drift', label: 'drift' },
 ]
 
+/** Settings + status line for the explore / walk / breed card actions (POST /api/explore). */
 export function ExploreBar() {
   const breedParent = useUI((s) => s.breedParent)
 
@@ -19,7 +20,7 @@ export function ExploreBar() {
       <Tool
         id="exRadius"
         label="Explore radius"
-        tooltip="perturbation size for 🧭 Explore (fraction of the corpus spread)"
+        tooltip="perturbation size for Explore (fraction of the corpus spread)"
         type="number"
         step={0.05}
         placeholder="0.3"
@@ -29,16 +30,18 @@ export function ExploreBar() {
       <WalkTool />
       {breedParent ? (
         <span className="sa-hint mb-1.5 min-w-[220px] max-w-[520px] flex-1 basis-0">
-          🧬 parent A = <b className="text-ink">{basename(breedParent)}</b> — click 🧬 on a
-          second image (same backend) to breed, or click it again to cancel.
+          <BreedIcon size={12} className="inline" /> parent A = <b className="text-ink">{basename(breedParent)}</b> — click{' '}
+          <BreedIcon size={12} className="inline" /> on a second image (same backend) to breed, or
+          click it again to cancel.
         </span>
       ) : (
         <Tip
           side="top"
           content={
             <>
-              <b>🧭 Explore</b> samples around an image's latent point (hill-climb on taste);{' '}
-              <b>🧬 Breed</b>: click two images to SLERP-cross them.
+              <ExploreIcon size={12} className="inline" /> <b>Explore</b> samples around an image's latent
+              point (hill-climb on taste); <BreedIcon size={12} className="inline" /> <b>Breed</b>: click
+              two images to SLERP-cross them.
             </>
           }
         >

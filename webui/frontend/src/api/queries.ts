@@ -5,20 +5,37 @@
  * without a manual poke.
  */
 import { useEffect, useRef } from 'react'
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from '@tanstack/react-query'
 
 import { api } from './client'
 import type {
+  AnimateRequest,
   BackendId,
+  DistKind,
+  ImageMeta,
   EvolveRequest,
   ExploreRequest,
   FilmRequest,
+  FitQueryParams,
+  FitRequest,
   GenPromptRequest,
   InvertRequest,
+  LabelQueryParams,
+  Images,
+  LabelQueue,
+  PickMode,
   RefineRequest,
   RunRequest,
   RunResponse,
+  WipeFilters,
 } from './types'
+import { paramsFromSidecar } from '../params/fromSidecar'
 import { useUI } from '../store'
 
 export const qk = {
@@ -30,10 +47,21 @@ export const qk = {
   keyframes: (rels: string[]) => ['keyframes', rels.join('|')] as const,
   tasteband: ['tasteband'] as const,
   servers: ['servers'] as const,
+  experiments: ['experiments'] as const,
+  labelStats: ['labelStats'] as const,
+  labelFacets: ['labelFacets'] as const,
+  labelQueue: (k: LabelQueryParams) => ['labelQueue', k] as const,
+  tags: ['tags'] as const,
   wipePreview: ['wipePreview'] as const,
   meta: (rel: string) => ['meta', rel] as const,
   model: ['model'] as const,
-  fs: (path: string | null) => ['fs', path] as const,
+  fs: (path: string | null, pick: PickMode, backend?: string, model?: string | null) =>
+    ['fs', pick, backend ?? '', model ?? '', path] as const,
+  dist: (backend: string, model?: string | null) => ['dist', backend, model ?? ''] as const,
+  distProbe: (backend: string, path: string | null, model?: string | null) =>
+    ['distProbe', backend, model ?? '', path] as const,
+  fitCandidates: (k: FitQueryParams) => ['fitCandidates', k] as const,
+  fitList: (backend?: string | null) => ['fitList', backend ?? ''] as const,
 }
 
 /* --------------------------------------------------------------- reads --- */
@@ -65,12 +93,19 @@ export function useJobState() {
   })
 }
 
-/** Gallery. Cheap when idle (no polling), 6s while a job is producing files. */
+/**
+ * Gallery. Cheap when idle (no polling), 2s while a job is producing files.
+ *
+ * generate.py writes each image the moment it renders rather than at the end of
+ * the batch, so this poll is what turns a batch of 8 into eight arrivals — the
+ * point being to judge an experiment without waiting for the whole run. A 6s
+ * tick would hide a 3s image for twice its render time.
+ */
 export function useImages(busy: boolean) {
   return useQuery({
     queryKey: qk.images,
     queryFn: api.images,
-    refetchInterval: busy ? 6000 : false,
+    refetchInterval: busy ? 2000 : false,
   })
 }
 
@@ -104,6 +139,192 @@ export function useKeyframes(timeline: string[]) {
     queryFn: () => api.keyframes(timeline),
     enabled: timeline.length > 0,
     staleTime: 60_000,
+  })
+}
+
+/* ------------------------------------------------------------- labeling --- */
+
+/**
+ * The labeling queue.
+ *
+ * Deliberately frozen once fetched (`staleTime: Infinity`, no refetch on focus
+ * or on a label being submitted): the page is a cursor walking a list, and a
+ * background refetch would renumber "34/50" and slide a different image under
+ * the keypress that was already on its way. New arrivals are picked up by the
+ * explicit reload button, which invalidates this key.
+ */
+export function useLabelQueue(key: LabelQueryParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.labelQueue(key),
+    queryFn: () => api.labelQueue(key),
+    enabled,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * What the queue can be sliced by, with counts. Computed over the whole
+ * labelable set, so an option never vanishes because of an earlier pick —
+ * how many images a combination actually matches is what the queue reports.
+ */
+export function useLabelFacets(enabled = true) {
+  return useQuery({
+    queryKey: qk.labelFacets,
+    queryFn: api.labelFacets,
+    enabled,
+    staleTime: 30_000,
+  })
+}
+
+/** Experiment ids + how much of each is still unlabeled (the queue selector). */
+export function useExperiments(enabled = true) {
+  return useQuery({ queryKey: qk.experiments, queryFn: api.experiments, enabled, staleTime: 15_000 })
+}
+
+export function useLabelStats(enabled = true) {
+  return useQuery({ queryKey: qk.labelStats, queryFn: api.labelStats, enabled, staleTime: 5_000 })
+}
+
+/**
+ * Submit one label. The score is written straight into the cached queue row so
+ * the UI never waits on the round trip — at one keypress per image, a 40ms
+ * flicker per score is the difference between fluent and unusable.
+ */
+export function useSubmitLabel(key: LabelQueryParams) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, score }: { rel: string; score: number }) => api.label(rel, score),
+    onMutate: async ({ rel, score }) => {
+      qc.setQueryData<LabelQueue>(qk.labelQueue(key), (old) =>
+        old
+          ? { ...old, queue: old.queue.map((r) => (r.rel === rel ? { ...r, score } : r)) }
+          : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.labelStats })
+      qc.invalidateQueries({ queryKey: qk.experiments })
+      // Facet counts carry an "unlabeled" column, so they move on every label —
+      // but the queue itself is deliberately NOT invalidated (see above).
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/**
+ * The tag vocabulary — every aesthetic universe in use, commonest first.
+ *
+ * Derived server-side from what images actually wear, so a tag appears the
+ * moment it is first assigned and retires when the last image drops it. There
+ * is no separate "create tag" call.
+ */
+export function useTags(enabled = true) {
+  return useQuery({ queryKey: qk.tags, queryFn: api.tags, enabled, staleTime: 15_000 })
+}
+
+/**
+ * Set an image's universes. The whole set is sent, so this one mutation covers
+ * assign, un-assign and create.
+ *
+ * Optimistic like `useSubmitLabel`, and for the same reason: tagging is done at
+ * keyboard speed and a round trip per chip would be felt. The queue row is
+ * patched in place rather than refetched, so the cursor never moves under you.
+ */
+export function useSetTags(key: LabelQueryParams) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, tags }: { rel: string; tags: string[] }) => api.setTags(rel, tags),
+    onMutate: async ({ rel, tags }) => {
+      qc.setQueryData<LabelQueue>(qk.labelQueue(key), (old) =>
+        old ? { ...old, queue: old.queue.map((r) => (r.rel === rel ? { ...r, tags } : r)) } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.tags })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+      // The gallery shows tag chips too, but it is a different (and much
+      // heavier) query — let it pick them up on its own poll rather than
+      // refetching 10k rows for one chip.
+    },
+  })
+}
+
+/**
+ * Score an image from the GALLERY (the lightbox), as opposed to the label
+ * queue. Same endpoint, different cache to keep in step: the gallery's rows
+ * carry `label`, and /api/meta carries `label_score` for whatever the lightbox
+ * has pinned — both are patched in place so the judgement shows instantly
+ * without refetching ten thousand rows.
+ */
+export function useScoreImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, score }: { rel: string; score: number }) => api.label(rel, score),
+    onMutate: async ({ rel, score }) => {
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, items]) => [
+                k,
+                items.map((it) => (it.rel === rel ? { ...it, label: score } : it)),
+              ]),
+            ) as Images)
+          : old,
+      )
+      qc.setQueryData<ImageMeta>(qk.meta(rel), (old) =>
+        old ? { ...old, label_score: score } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.labelStats })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/** Tag an image from the gallery. Sends the whole set, like `useSetTags`. */
+export function useTagImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ rel, tags }: { rel: string; tags: string[] }) => api.setTags(rel, tags),
+    onMutate: async ({ rel, tags }) => {
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, items]) => [
+                k,
+                items.map((it) => (it.rel === rel ? { ...it, tags } : it)),
+              ]),
+            ) as Images)
+          : old,
+      )
+      qc.setQueryData<ImageMeta>(qk.meta(rel), (old) =>
+        old ? { ...old, label_tags: tags } : old,
+      )
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.tags })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+    },
+  })
+}
+
+/**
+ * Animate one image (AnimateDiff). Queued like every other GPU action, so it
+ * takes its turn behind whatever is running rather than fighting it for VRAM.
+ * The result lands in outputs/films/, which is why this refreshes the film list
+ * rather than the gallery.
+ */
+export function useAnimate() {
+  const qc = useQueryClient()
+  const watch = useJobWatcher()
+  return useMutation({
+    mutationFn: (body: AnimateRequest) => api.animate(body),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: qk.state })
+      watch(r.job_id, () => qc.invalidateQueries({ queryKey: qk.films }))
+    },
   })
 }
 
@@ -154,15 +375,48 @@ export function useModelConfig() {
   return useQuery({ queryKey: qk.model, queryFn: api.model, staleTime: 30_000 })
 }
 
-/** One directory listing for the fallback file browser. */
-export function useFs(path: string | null, enabled: boolean) {
+/**
+ * One directory listing for the in-page file browsers. `pick` decides what the
+ * server lists — checkpoints for the model picker, prompt corpora + saved fits
+ * for the distribution picker (which also gets a per-corpus `ready` flag when
+ * a backend is passed).
+ */
+export function useFs(
+  path: string | null,
+  enabled: boolean,
+  opts?: { pick?: PickMode; backend?: string; model?: string | null },
+) {
+  const pick = opts?.pick ?? 'model'
   return useQuery({
-    queryKey: qk.fs(path),
-    queryFn: () => api.fs(path),
+    queryKey: qk.fs(path, pick, opts?.backend, opts?.model),
+    queryFn: () => api.fs(path, { pick, backend: opts?.backend, model: opts?.model }),
     enabled,
     // Keep the current folder on screen while the next one loads, so the modal
     // doesn't collapse to zero height on every click.
     placeholderData: keepPreviousData,
+  })
+}
+
+/** The distribution this backend samples from (config.json -> "dists"). */
+export function useDistConfig(backend: BackendId, model?: string | null) {
+  return useQuery({
+    queryKey: qk.dist(backend, model),
+    queryFn: () => api.dist(backend, model),
+    staleTime: 10_000,
+  })
+}
+
+/** Whether a candidate corpus/fit is already encoded for the active checkpoint. */
+export function useDistProbe(
+  backend: BackendId,
+  path: string | null,
+  model?: string | null,
+) {
+  return useQuery({
+    queryKey: qk.distProbe(backend, path, model),
+    queryFn: () => api.probeDist(backend, path!, model),
+    enabled: !!path,
+    retry: false,
   })
 }
 
@@ -177,6 +431,97 @@ export function useSetModel() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.model })
       qc.invalidateQueries({ queryKey: qk.config })
+      // A corpus is fitted PER checkpoint, so a new checkpoint means a
+      // different fit — possibly one that hasn't been encoded yet.
+      qc.invalidateQueries({ queryKey: ['dist'] })
+      qc.invalidateQueries({ queryKey: ['fs'] })
+    },
+  })
+}
+
+/** Reset the whole sidebar (checkpoint and distribution too) to what made `rel`. */
+export function useRestoreConditions() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (rel: string) => api.restore(rel),
+    onSuccess: (res, rel) => {
+      const { patch, warnings } = paramsFromSidecar(res.params, res.sdxl_model)
+      useUI.getState().restoreParams(patch, {
+        rel,
+        source: res.source,
+        warnings: [...res.warnings, ...warnings],
+      })
+      qc.invalidateQueries({ queryKey: qk.model })
+      qc.invalidateQueries({ queryKey: qk.config })
+      qc.invalidateQueries({ queryKey: ['dist'] })
+      qc.invalidateQueries({ queryKey: ['fs'] })
+    },
+  })
+}
+
+/** Persist the base distribution this backend samples from. */
+export function useSetDist() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: {
+      backend: BackendId
+      kind: DistKind
+      path?: string | null
+      model?: string | null
+    }) => api.setDist(body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['dist'] }),
+  })
+}
+
+/**
+ * Queue the encode pass for a prompt corpus. It goes through the same
+ * single-worker queue as everything else, so the job list shows it running.
+ */
+export function useEncodeDist() {
+  return useJobMutation(
+    (b: { backend: BackendId; path: string; model?: string | null }) => api.encodeDist(b),
+  )
+}
+
+/* ------------------------------------------------------------------ fit --- */
+
+/**
+ * The pool a selection fit is drawn from. Re-queried on every filter change —
+ * the count it reports is what "n selected" is measured against, so it must not
+ * lag behind the controls. Kept on screen while the next one loads so the grid
+ * doesn't blink to empty between two adjacent filters.
+ */
+export function useFitCandidates(key: FitQueryParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.fitCandidates(key),
+    queryFn: () => api.fitCandidates(key),
+    enabled,
+    placeholderData: keepPreviousData,
+    staleTime: 5_000,
+  })
+}
+
+/** Saved selection fits, for the picker's third section and the fit page. */
+export function useFitList(backend?: string | null, enabled = true) {
+  return useQuery({
+    queryKey: qk.fitList(backend),
+    queryFn: () => api.fitList(backend),
+    enabled,
+    staleTime: 10_000,
+  })
+}
+
+/** Queue the fit. Fast (no GPU) but still a job, so it lands in the job log. */
+export const useCreateFit = () => useJobMutation((b: FitRequest) => api.fit(b))
+
+export function useDeleteFit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (name: string) => api.deleteFit(name),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fitList'] })
+      // A deleted fit may have been the selected base distribution.
+      qc.invalidateQueries({ queryKey: ['dist'] })
     },
   })
 }
@@ -255,23 +600,59 @@ export function useFavorite() {
   })
 }
 
+/** Everything whose answer changes when images leave the disk. */
+function invalidateAfterDelete(qc: QueryClient) {
+  for (const queryKey of [
+    qk.images,
+    qk.tasteband,
+    qk.tags,
+    qk.labelFacets,
+    qk.wipePreview,
+    ['fitCandidates'],
+  ]) {
+    qc.invalidateQueries({ queryKey })
+  }
+}
+
 export function useWipe() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: () => api.wipe(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.images })
-      qc.invalidateQueries({ queryKey: qk.wipePreview })
+    mutationFn: (filters: WipeFilters) => api.wipe(filters),
+    onSuccess: (res) => {
+      useUI.getState().forgetImages(res.rels)
+      invalidateAfterDelete(qc)
     },
   })
 }
 
-export function useWipePreview(enabled: boolean) {
+export function useWipePreview(filters: WipeFilters) {
   return useQuery({
-    queryKey: qk.wipePreview,
-    queryFn: api.wipePreview,
-    enabled,
-    refetchInterval: 30000,
+    queryKey: [...qk.wipePreview, filters],
+    queryFn: () => api.wipePreview(filters),
+  })
+}
+
+/**
+ * Delete one image from disk. The row leaves the cached gallery straight away,
+ * because the lightbox navigates through it and shouldn't show a dead image while
+ * the refetch runs. Saved selections forget it too: a stale timeline keyframe
+ * would otherwise fail the film it's in.
+ */
+export function useDeleteImage() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (rel: string) => api.deleteImage(rel),
+    onSuccess: (_, rel) => {
+      useUI.getState().forgetImage(rel)
+      qc.setQueryData<Images>(qk.images, (old) =>
+        old
+          ? (Object.fromEntries(
+              Object.entries(old).map(([k, v]) => [k, v.filter((im) => im.rel !== rel)]),
+            ) as Images)
+          : old,
+      )
+      invalidateAfterDelete(qc)
+    },
   })
 }
 

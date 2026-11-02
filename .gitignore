@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .eggs/
 build/
+webui/run.sh
 dist/
 .pytest_cache/
 .mypy_cache/
@@ -62,10 +63,26 @@ init_images/
 webui/frontend/node_modules/
 webui/frontend/dist/
 
-# The dashboard's hand-picked checkpoint paths (sidebar model picker). Absolute
-# paths to weights on *this* machine, so they're per-user: pick your models once
-# in the UI rather than committing someone else's layout.
+# Everything the dashboard remembers between restarts: the hand-picked
+# checkpoint per backend, the selected base distribution, and the whole UI store
+# (every sidebar value, the timeline, the fit selection). Absolute paths to
+# weights on *this* machine, so it's per-user: pick your models once in the UI
+# rather than committing someone else's layout.
+config.json
+
+# Superseded by config.json above; still read once, to migrate an old install.
 webui/model_config.json
 webui/comfy_servers.json
 # personal Claude Code notes (machine/infra-specific rules)
 CLAUDE.local.md
+webui/dist_config.json
+
+# A prompt corpus's fitted latents live beside the .txt (the .npz itself is
+# already ignored; this is its metadata sidecar).
+*__*.meta.json
+
+# Prompt corpora harvested off this machine's old SD experiment folders.
+# Personal material, gathered for reading, not code. prompts_filtered/ is the
+# SD-only, explicit-stripped, de-duplicated cut of prompt_files/.
+prompt_files/
+prompts_filtered/

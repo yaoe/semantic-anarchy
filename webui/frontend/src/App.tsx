@@ -1,22 +1,27 @@
 import { useEffect } from 'react'
 
-import { useJobState, useRefreshOnJobFinish } from './api/queries'
+import { useCancel, useJobState, useRefreshOnJobFinish } from './api/queries'
 import type { TabKey } from './api/types'
 import { Gallery } from './features/gallery/Gallery'
 import { Filters } from './features/gallery/Filters'
 import { JobList } from './features/jobs/JobList'
+import { DistPicker } from './features/distribution/DistPicker'
 import { ModelPicker } from './features/model/ModelPicker'
 import { JobLog } from './features/jobs/JobLog'
+import { LabelLink } from './features/labeling/LabelLink'
 import { StatusDot } from './features/jobs/StatusDot'
+import { BreedIcon } from './components/ui/actionIcons'
 import { ExploreBar } from './features/refine/ExploreBar'
+import { AnimateBar } from './features/animate/AnimateBar'
 import { RefineBar } from './features/refine/RefineBar'
 import { AnalyzeBar } from './features/taste/AnalyzeBar'
-import { EvolveBar } from './features/taste/EvolveBar'
+import { FitLink } from './features/fit/FitLink'
 import { ScoreBar } from './features/taste/ScoreBar'
 import { WipeDialog } from './features/taste/WipeDialog'
 import { ParamPanel } from './params/ParamPanel'
+import { RestoreNote } from './params/RestoreNote'
 import { RunButton } from './params/RunButton'
-import { cn, fmtDuration } from './lib/utils'
+import { basename, cn, fmtDuration } from './lib/utils'
 import { useUI } from './store'
 
 /** Tabs whose items carry conditioning, so the refine/explore bar applies. */
@@ -27,6 +32,9 @@ export default function App() {
   const selectedJob = useUI((s) => s.selectedJob)
   const setSelectedJob = useUI((s) => s.setSelectedJob)
   const tab = useUI((s) => s.tab)
+  const toolsOpen = useUI((s) => s.tools.settingsOpen === '1')
+  const setTool = useUI((s) => s.setTool)
+  const breedParent = useUI((s) => s.breedParent)
 
   const jobs = state?.jobs ?? []
   const busy = state?.running != null
@@ -40,20 +48,18 @@ export default function App() {
   const job = jobs.find((j) => j.id === selectedJob)
 
   const running = busy ? jobs.find((j) => j.id === state?.running) : undefined
+  const cancel = useCancel()
 
   return (
     <div className="flex h-full flex-col">
       <header
         className={cn(
-          'relative flex shrink-0 items-baseline gap-3.5 border-b px-5 py-3.5',
+          'relative flex shrink-0 items-center gap-3.5 border-b px-3 py-1',
           'transition-colors duration-500',
           busy ? 'border-run/40 bg-run/[0.08]' : 'border-line',
         )}
       >
-        <h1 className="m-0 text-[17px] tracking-[0.3px]">Semantic&nbsp;Anarchy</h1>
-        <span className="text-[12px] text-dim">
-          promptless explorer · {window.location.host}
-        </span>
+        <h1 className="m-0 text-[14px] tracking-[0.3px]">Semantic&nbsp;Anarchy</h1>
         <a
           href="/legacy"
           className="text-[11px] text-dim underline decoration-dotted hover:text-ink"
@@ -79,6 +85,19 @@ export default function App() {
                   {fmtDuration(running.started, running.ended)}
                 </span>
               ) : null}
+              {/* The queue is one job at a time, so "stop the running one" is
+                  the only stop anyone means. It lives up here rather than only
+                  in the sidebar list because a Wan clip is a seven-minute
+                  commitment and you decide to abandon it while looking at the
+                  gallery, not at the job cards. */}
+              <button
+                className="sa-btn sa-btn-sm shrink-0 border-err !py-0 text-danger"
+                disabled={cancel.isPending}
+                title={`stop job #${state?.running} (SIGTERM, then SIGKILL if it ignores it)`}
+                onClick={() => state?.running != null && cancel.mutate(state.running)}
+              >
+                ⏹ Stop
+              </button>
             </>
           ) : (
             'idle'
@@ -98,37 +117,70 @@ export default function App() {
             )}
           >
             <RunButton />
+            <RestoreNote />
           </div>
           {/* overflow-x-clip: `overflow-y-auto` alone computes overflow-x to
               auto, so any stray wide child would add a sideways scrollbar. The
               sidebar scrolls vertically only; its content wraps to fit. */}
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-clip p-4 pt-1">
-            <ParamPanel after={{ model: <ModelPicker /> }} />
+            <ParamPanel
+              after={{
+                model: (
+                  <>
+                    <ModelPicker />
+                    <DistPicker />
+                  </>
+                ),
+              }}
+            />
             <h2 className="sa-h2">Jobs</h2>
             <JobList jobs={jobs} />
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col gap-3 p-4 px-5">
+        <main className="flex min-h-0 flex-col gap-1.5 p-1.5">
           <JobLog job={job} />
 
           <Filters
             actions={
               <>
-                <EvolveBar />
+                <LabelLink />
+                <FitLink />
                 <AnalyzeBar />
                 <ScoreBar />
                 <WipeDialog />
+                {ACTIONABLE.includes(tab) ? (
+                  <button
+                    className={cn('sa-btn sa-btn-sm', toolsOpen && 'sa-btn-sel')}
+                    aria-expanded={toolsOpen}
+                    title="settings the per-image explore, walk, animate, breed and upscale buttons use"
+                    onClick={() => setTool('settingsOpen', toolsOpen ? '' : '1')}
+                  >
+                    ⚙ Settings
+                  </button>
+                ) : null}
               </>
             }
           />
 
-          {ACTIONABLE.includes(tab) ? (
+          {ACTIONABLE.includes(tab) && toolsOpen ? (
             <div className="sa-panel flex shrink-0 flex-wrap items-end gap-2.5 px-3 py-2.5">
               <RefineBar />
               <div className="self-stretch border-l border-line" />
+              <AnimateBar />
+              <div className="self-stretch border-l border-line" />
               <ExploreBar />
             </div>
+          ) : null}
+
+          {/* A half-finished breed has to stay explained with the settings folded:
+              the next 🧬 click on any image would otherwise be a surprise. */}
+          {ACTIONABLE.includes(tab) && !toolsOpen && breedParent ? (
+            <span className="sa-hint shrink-0">
+              <BreedIcon size={12} className="inline" /> parent A = <b className="text-ink">{basename(breedParent)}</b> — click
+              <BreedIcon size={12} className="inline" /> on a
+              second image (same backend) to breed, or click it again to cancel.
+            </span>
           ) : null}
 
           <Gallery busy={busy} />

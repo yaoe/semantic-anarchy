@@ -107,7 +107,7 @@ export function LatentMap({ busy }: { busy: boolean }) {
     if (e.shiftKey) {
       addKeyframe(n.rel)
       setFlash(`added ${n.name} to 🎬 timeline`)
-    } else openLightbox(i)
+    } else openLightbox(n.rel)
   }
 
   useEffect(() => {

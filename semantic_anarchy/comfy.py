@@ -270,17 +270,18 @@ def encode_graph(ckpt: str, prompts: list[str]) -> tuple[dict, list[str]]:
 
 def generate_graph(ckpt: str, conds_b64: list[str], seeds: list[int], *,
                    steps: int, cfg: float, sampler: str, scheduler: str,
-                   width: int, height: int, negative_b64: Optional[str] = None
-                   ) -> tuple[dict, list[str]]:
+                   width: int, height: int, negative_b64: Optional[str] = None,
+                   negative_text: str = "") -> tuple[dict, list[str]]:
     """One branch per conditioning (own seed), sharing the loader and negative.
-    The negative is the empty-prompt encoding unless ``negative_b64`` is given."""
+    The negative is ``negative_text`` encoded (default: the empty prompt) unless
+    ``negative_b64`` is given."""
     g = {
         "ckpt": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
         "latent": {"class_type": "EmptyLatentImage",
                    "inputs": {"width": width, "height": height, "batch_size": 1}},
     }
     if negative_b64 is None:
-        g["neg"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["ckpt", 1]}}
+        g["neg"] = {"class_type": "CLIPTextEncode", "inputs": {"text": escape_prompt(negative_text), "clip": ["ckpt", 1]}}
     else:
         g["neg"] = {"class_type": "Base64ToConditioning", "inputs": {"data": negative_b64}}
     outs = []

@@ -40,13 +40,19 @@ export function JobList({ jobs }: { jobs: JobSummary[] }) {
               {j.rc != null && j.rc !== 0 ? <span className="text-err">rc {j.rc}</span> : null}
               {cancellable ? (
                 <button
-                  className="ml-auto text-[10px] text-danger hover:underline"
+                  className="sa-btn sa-btn-sm ml-auto border-err !py-0 !text-[10px] text-danger"
+                  disabled={cancel.isPending}
+                  title={
+                    j.status === 'running'
+                      ? 'stop this job (SIGTERM, then SIGKILL if it ignores it)'
+                      : 'drop this job from the queue before it starts'
+                  }
                   onClick={(e) => {
                     e.stopPropagation()
                     cancel.mutate(j.id)
                   }}
                 >
-                  cancel
+                  {j.status === 'running' ? '⏹ stop' : '✕ drop'}
                 </button>
               ) : null}
             </div>

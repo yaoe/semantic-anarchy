@@ -23,6 +23,7 @@ venv python passed in ``SA_PYTHON``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import queue
 import shlex
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -52,27 +54,71 @@ from pydantic import BaseModel
 # --------------------------------------------------------------------------- #
 REPO = Path(__file__).resolve().parent.parent
 OUTPUTS = REPO / "outputs"
+
+# The one thing this file borrows from the package: the naming rules that map a
+# distribution's *base prefix* onto the .npz files it actually lives in, so the
+# dashboard can tell "already encoded" from "needs encoding" without guessing at
+# filenames the CLIs own. Torch-free (numpy only) — the rule against importing
+# the heavy tier here still holds.
+sys.path.insert(0, str(REPO))
+from semantic_anarchy import dist_paths  # noqa: E402
+# Also torch-free: the labels dataset + experiment identity. The record schema,
+# the score range and the tail-weighted summary all live there so the dashboard,
+# scripts/experiment_report.py and the tests can't disagree about what a label is.
+from semantic_anarchy import labels as labelset  # noqa: E402
+# The other half of a judgement, same discipline: which aesthetic universe an
+# image belongs to. Separate stream from the score because a tag is set-valued
+# and a score is scalar -- see semantic_anarchy/tags.py.
+from semantic_anarchy import tags as tagset  # noqa: E402
+# Torch-free too: fitting a distribution to the latents of a picked set of
+# images is pure numpy over sidecars that already exist, so the naming rules and
+# the manifest format are shared with scripts/fit_selection.py rather than
+# re-implemented here.
+from semantic_anarchy import selection_fit as fitset  # noqa: E402
+# Likewise torch-free: the house sd15 CFG negative, so the sidebar shows the
+# real text (and any SA_SD15_NEGATIVE override) instead of a copy that drifts.
+from semantic_anarchy.pipeline import default_sd15_negative  # noqa: E402
+# The image format the renderers write (JPEG by default) plus the full set the
+# gallery must still READ: everything mined before the switch is a PNG, and a
+# suffix check that only knows the current format would hide it.
+from semantic_anarchy.io_utils import IMAGE_EXTS, find_image  # noqa: E402
+
+SD15_NEGATIVE = default_sd15_negative() or ""
 # Folder of "good init images" -- when init injection is on, each generation
 # starts img2img from a RANDOM one (entropy injection). Drop images in here.
 INIT_DIR = Path(os.path.expanduser(os.environ.get("SA_INIT_DIR", str(REPO / "init_images"))))
-INIT_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+INIT_EXTS = IMAGE_EXTS + (".bmp",)
 FAVS_FILE = OUTPUTS / "favorites.json"   # persisted list of favorited image rel-paths
 
-# rel-path -> distance gauge (or None), read once from each image's json sidecar.
-_DIST_CACHE: dict = {}
+# rel-path -> (mtime, parsed .json sidecar). The gallery poll and the labeling
+# queue both read a few fields out of every image's sidecar, and there are tens
+# of thousands of them; this is what keeps that from being tens of thousands of
+# json parses per request. Keyed on mtime so a rewritten sidecar is picked up.
+_SIDECAR_CACHE: dict = {}
+
+
+def sidecar_for(rel: str) -> dict:
+    """The ``.json`` sidecar of an outputs-relative image, or ``{}``."""
+    j = OUTPUTS / Path(rel).with_suffix(".json")
+    try:
+        mtime = j.stat().st_mtime
+    except OSError:
+        return {}
+    hit = _SIDECAR_CACHE.get(rel)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    try:
+        data = json.loads(j.read_text())
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _SIDECAR_CACHE[rel] = (mtime, data)
+    return data
 
 
 def _distance_for(rel: str) -> Optional[float]:
-    if rel not in _DIST_CACHE:
-        val = None
-        j = OUTPUTS / Path(rel).with_suffix(".json")
-        if j.is_file():
-            try:
-                val = json.loads(j.read_text()).get("distance")
-            except Exception:
-                pass
-        _DIST_CACHE[rel] = val
-    return _DIST_CACHE[rel]
+    return sidecar_for(rel).get("distance")
 
 
 def init_images_count() -> int:
@@ -163,17 +209,79 @@ FLUX2_MODEL = os.environ.get("SA_FLUX2_MODEL", "black-forest-labs/FLUX.2-klein-4
 KREA2_MODEL = os.environ.get("SA_KREA2_MODEL", "krea/Krea-2-Raw")
 
 # --------------------------------------------------------------------------- #
-# Hand-picked checkpoints (webui/model_config.json)
+# Persisted dashboard config (config.json)
+# --------------------------------------------------------------------------- #
+# ONE gitignored file at the repo root holds everything the dashboard has to
+# remember between restarts, in three sections:
+#
+#   models — per-backend hand-picked checkpoint (sidebar model picker)
+#   dists  — per-backend base distribution (sidebar distribution picker)
+#   ui     — the frontend's own persisted store blob (every sidebar form value,
+#            the timeline, the fit selection, the label-page settings) exactly
+#            as zustand serialises it. The server stores it verbatim and never
+#            looks inside; the schema lives in frontend/src/store.ts.
+#
+# It is machine-specific (absolute paths to weights that live somewhere else on
+# everyone else's disk), hence gitignored — pick your models once in the UI
+# rather than committing someone else's layout. `ui` living here rather than in
+# localStorage is what makes the defaults follow the *server*, so the tailnet
+# phone and the desktop open the same setup.
+CONFIG_FILE = Path(os.environ.get("SA_CONFIG", str(REPO / "config.json")))
+# The per-section files this replaced. Folded in once, when config.json doesn't
+# exist yet, so an existing install doesn't forget its checkpoint on upgrade.
+LEGACY_CONFIG_FILES = {
+    "models": Path(
+        os.environ.get("SA_MODEL_CONFIG", str(REPO / "webui" / "model_config.json"))
+    ),
+    "dists": Path(
+        os.environ.get("SA_DIST_CONFIG", str(REPO / "webui" / "dist_config.json"))
+    ),
+}
+# One lock for the whole file — the sections share a file, so they share a lock.
+# Reentrant because the section writers below are called from inside a `with`.
+_config_lock = threading.RLock()
+
+
+def _read_json_dict(path: Path) -> dict:
+    """A JSON object from disk, or ``{}`` for missing/garbled/non-object."""
+    try:
+        raw = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_config() -> dict:
+    """The whole config file, or the migrated legacy sections on first run."""
+    cfg = _read_json_dict(CONFIG_FILE)
+    if cfg:
+        return cfg
+    merged = {}
+    for section, path in LEGACY_CONFIG_FILES.items():
+        old = _read_json_dict(path).get(section)
+        if isinstance(old, dict) and old:
+            merged[section] = old
+    return merged
+
+
+def save_config_section(section: str, value) -> None:
+    """Replace one section, leaving the others untouched (``None`` drops it)."""
+    with _config_lock:
+        cfg = load_config()
+        if value is None:
+            cfg.pop(section, None)
+        else:
+            cfg[section] = value
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Hand-picked checkpoints (config.json -> "models")
 # --------------------------------------------------------------------------- #
 # The env-var defaults above are the *fallback*. The model picker in the sidebar
 # writes a per-backend absolute path here, and that wins whenever it is set —
-# so the choice survives a restart without anyone editing run.sh. The file is
-# machine-specific (everyone's weights live somewhere else), hence gitignored.
-MODEL_CONFIG_FILE = Path(
-    os.environ.get("SA_MODEL_CONFIG", str(REPO / "webui" / "model_config.json"))
-)
-_model_cfg_lock = threading.Lock()
-
+# so the choice survives a restart without anyone editing run.sh.
 CKPT_EXTS = (".safetensors", ".ckpt")
 # What makes a folder a diffusers model rather than just a folder of files.
 DIFFUSERS_MARKERS = ("model_index.json", "unet", "transformer")
@@ -189,20 +297,15 @@ MODEL_DEFAULTS = {
 
 
 def load_model_config() -> dict:
-    """``{backend: path}`` of hand-picked checkpoints (missing file -> ``{}``)."""
-    try:
-        raw = json.loads(MODEL_CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-    models = raw.get("models") if isinstance(raw, dict) else None
+    """``{backend: path}`` of hand-picked checkpoints (nothing picked -> ``{}``)."""
+    models = load_config().get("models")
     if not isinstance(models, dict):
         return {}
     return {k: v for k, v in models.items() if k in BACKENDS and isinstance(v, str) and v}
 
 
 def save_model_config(models: dict) -> None:
-    MODEL_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MODEL_CONFIG_FILE.write_text(json.dumps({"models": models}, indent=2) + "\n")
+    save_config_section("models", models)
 
 
 def path_kind(p: Path) -> Optional[str]:
@@ -238,6 +341,179 @@ def model_flags_for_path(path: str) -> list[str]:
 def selected_model(backend: str) -> Optional[str]:
     """The hand-picked path for a backend, if one is configured."""
     return load_model_config().get(backend)
+
+
+def effective_model(backend: str, model_key: Optional[str] = None) -> str:
+    """The checkpoint this backend will actually load.
+
+    Sidebar pick > the sdxl repo dropdown > the env-var / HF default. This is
+    the string a mined corpus is tagged with, so switching checkpoints switches
+    which fit of that corpus is in play (rather than silently reusing the wrong
+    one).
+    """
+    picked = selected_model(backend)
+    if picked:
+        return picked
+    if backend == "sdxl" and model_key in SDXL_MODELS:
+        return SDXL_MODELS[model_key]
+    return MODEL_DEFAULTS[backend]
+
+
+# --------------------------------------------------------------------------- #
+# Base distribution (config.json -> "dists")
+# --------------------------------------------------------------------------- #
+# Which fit `--dist` points at. Two built-ins (the repo's own mined corpus and
+# the evolved ★ branch) plus two "point at a file on disk" kinds:
+#
+#   prompts — a .txt corpus. Its latents live BESIDE the .txt, tagged with the
+#             checkpoint that encoded them, so one corpus can hold a separate
+#             fit per model and switching checkpoints switches fits.
+#   file    — an .npz someone already mined/evolved, picked directly.
+#
+# Persisted per backend so a restart comes back to the same distribution.
+BASE_DIST = "outputs/dist"              # the repo's mined corpus (prompts_1000)
+EVOLVED_DIST = "outputs/dist_evolved"   # scripts/evolve_favorites.py's branch
+DEFAULT_PROMPTS = "prompts_1000.txt"
+DIST_KINDS = ("base", "evolved", "prompts", "file")
+DIST_EXTS = (dist_paths.PROMPTS_EXT, ".npz")
+DIST_LABELS = {"base": "base corpus", "evolved": "evolved ★ branch"}
+
+
+def load_dist_config() -> dict:
+    """``{backend: {"kind": ..., "path": ...}}`` (nothing picked -> ``{}``)."""
+    dists = load_config().get("dists")
+    if not isinstance(dists, dict):
+        return {}
+    out = {}
+    for b, row in dists.items():
+        if b in BACKENDS and isinstance(row, dict) and row.get("kind") in DIST_KINDS:
+            path = row.get("path")
+            out[b] = {"kind": row["kind"], "path": path if isinstance(path, str) else None}
+    return out
+
+
+def save_dist_config(dists: dict) -> None:
+    save_config_section("dists", dists)
+
+
+def resolve_dist_file(path: str, kind: Optional[str] = None) -> Path:
+    """Sandbox + sanity-check a hand-picked corpus / distribution file.
+
+    Same roots as the model browser: user input only ever reaches argv after
+    passing through here.
+    """
+    p = Path(os.path.expanduser(str(path).strip())).resolve()
+    if not any(p == r or r in p.parents for r in browse_roots()):
+        raise HTTPException(403, f"outside the browsable roots: {p}")
+    suffix = p.suffix.lower()
+    want = {"prompts": (dist_paths.PROMPTS_EXT,), "file": (".npz",)}.get(kind, DIST_EXTS)
+    if suffix not in want:
+        raise HTTPException(
+            400, f"expected {' or '.join(want)}, got {p.name}"
+        )
+    if not p.is_file():
+        raise HTTPException(400, f"file not found: {p}")
+    return p
+
+
+def dist_kind_for(path: str) -> str:
+    """Which kind a picked file is, by extension."""
+    return "prompts" if Path(path).suffix.lower() == dist_paths.PROMPTS_EXT else "file"
+
+
+def _abs_base(base: str) -> str:
+    """Bases are repo-relative on the command line (jobs run with cwd=REPO);
+    resolve them here so existence checks don't depend on the server's cwd."""
+    p = Path(base)
+    return str(p if p.is_absolute() else REPO / p)
+
+
+def dist_base_for(backend: str, kind: str, path: Optional[str],
+                  model_key: Optional[str] = None) -> str:
+    """The ``--dist`` / ``--out`` base a (kind, path) choice resolves to."""
+    if kind == "base":
+        return BASE_DIST
+    if kind == "evolved":
+        return EVOLVED_DIST
+    if not path:
+        raise HTTPException(400, f"{kind}: no file selected")
+    if kind == "prompts":
+        return dist_paths.prompt_dist_base(path, effective_model(backend, model_key))
+    return dist_paths.base_from_npz(path, backend)
+
+
+def describe_dist(backend: str, kind: str, path: Optional[str],
+                  model_key: Optional[str] = None) -> dict:
+    """One distribution choice, told everything the picker needs to render it:
+    where its files would be, whether they're there, and what encoded them."""
+    if kind not in DIST_KINDS:
+        raise HTTPException(400, f"unknown distribution kind {kind!r}")
+    model = effective_model(backend, model_key)
+    base = dist_base_for(backend, kind, path, model_key)
+    files = dist_paths.dist_files(_abs_base(base), backend)
+    ready = all(f.is_file() for f in files)
+    # ".npz" in the sidebar's one-line label is noise — the name is the identity.
+    label = DIST_LABELS.get(kind) or Path(path or base).name.removesuffix(".npz")
+    # A fit made from picked images carries a manifest naming them. It is what
+    # tells the picker to say "fitted from 42 images" rather than "42 prompts",
+    # and to keep quiet about corpus-only corrections it was never going to have.
+    man = fitset.read_manifest(_abs_base(base))
+    return {
+        "backend": backend,
+        "kind": kind,
+        "path": str(path) if path else None,
+        "base": base,
+        "label": label,
+        "ready": ready,
+        "files": [{"path": str(f), "exists": f.is_file()} for f in files],
+        "meta": dist_paths.dist_meta(_abs_base(base), backend) if ready else None,
+        "fit": {k: man.get(k) for k in
+                ("name", "n_samples", "note", "created", "models")} if man else None,
+        "model": {
+            "path": model,
+            "name": Path(model).name if Path(model).is_absolute() else model,
+            "slug": dist_paths.model_slug(model),
+        },
+    }
+
+
+def current_dist(backend: str, model_key: Optional[str] = None,
+                 cfg: Optional[dict] = None) -> dict:
+    """The persisted choice for a backend (the base corpus when nothing is set)."""
+    cfg = load_dist_config() if cfg is None else cfg
+    row = cfg.get(backend) or {"kind": "base", "path": None}
+    try:
+        return describe_dist(backend, row["kind"], row.get("path"), model_key)
+    except HTTPException:
+        # A selection whose file vanished shouldn't brick the dashboard — fall
+        # back to the base corpus and let the picker show the choice again.
+        return describe_dist(backend, "base", None, model_key)
+
+
+def resolve_dist_base(backend: str, requested: str = "base",
+                      model_key: Optional[str] = None) -> str:
+    """Which distribution a run samples, as a ``--dist`` base.
+
+    ``requested == "evolved"`` is the legacy dropdown's switch (the /legacy page
+    still sends it); everything else follows the persisted picker choice.
+    """
+    if requested == "evolved":
+        row = describe_dist(backend, "evolved", None, model_key)
+        if not row["ready"]:
+            raise HTTPException(
+                400, f"no evolved branch for {backend} yet — run 🧪 Evolve ★ first"
+            )
+        return row["base"]
+    row = current_dist(backend, model_key)
+    if not row["ready"]:
+        missing = ", ".join(f["path"] for f in row["files"] if not f["exists"])
+        raise HTTPException(
+            400,
+            f"“{row['label']}” is not encoded for {row['model']['name']} yet "
+            f"(missing {missing}) — open Base distribution in the sidebar and "
+            f"hit “Encode prompt distribution”",
+        )
+    return row["base"]
 
 
 # --------------------------------------------------------------------------- #
@@ -363,8 +639,9 @@ def run_native_picker(mode: str, start: Optional[str]) -> Optional[str]:
 
 # Allow-lists so user input can never become an arbitrary command.
 BACKENDS = {"sd15", "sd2", "sdxl", "flux2", "krea2"}
-SAMPLERS = {"diagonal", "pca", "blend", "hybrid"}
-NEG_MODES = {"mean", "empty", "zeros"}
+SAMPLERS = {"diagonal", "pca", "blend", "hybrid", "split"}
+LENGTH_MODES = {"off", "corpus", "fixed"}
+NEG_MODES = {"text", "mean", "empty", "zeros"}
 SCHEDULERS = {"default", "ddim", "euler", "euler_a", "dpm"}
 INTERPS = {"lanczos", "bicubic", "bilinear", "nearest"}    # hires upscale resampler
 
@@ -559,7 +836,8 @@ class Runner:
         with self._lock:
             self._seq += 1
             job = Job(id=self._seq, action=action, label=label, argv=argv,
-                      lane=lane, env=dict(env or {}), exclusive=exclusive)
+                      lane=lane, env=dict(job_env(None) if env is None else env),
+                      exclusive=exclusive)
             self._jobs[job.id] = job
         self._queue_for(lane).put(job)
         return job
@@ -728,6 +1006,8 @@ class RunRequest(BaseModel):
     components: Optional[int] = None
     truncation: Optional[float] = None
     neg_mode: Optional[str] = None
+    negative: Optional[str] = None    # sd15/sd2 CFG negative TEXT (None = the
+                                      # house default; "" = no negative text)
     temps: Optional[str] = None       # sweep: "0.5,1.0,1.5"
     seeds: Optional[str] = None       # sweep: "0,1,2"
     scheduler: Optional[str] = None   # default | ddim | euler | euler_a | dpm
@@ -735,7 +1015,9 @@ class RunRequest(BaseModel):
     height: Optional[int] = None
     comp_lo: Optional[int] = None     # pca: first axis (skip dominant/standard ones)
     equalize: bool = False            # pca: express selected axes at equal strength
-    dist: str = "base"                # base corpus | evolved ★ branch
+    dist: str = "base"                # "evolved" forces the ★ branch (the legacy
+                                      # page's switch); anything else follows the
+                                      # picker's persisted choice for this backend
     target_distance: Optional[float] = None  # shell sampling: pin the distance gauge
     min_distance: Optional[float] = None      # floor: never below this distance
     init: bool = False                # start from a random good init image
@@ -744,42 +1026,58 @@ class RunRequest(BaseModel):
     ip_scale: float = 0.7             # IP-Adapter image-embedding strength
     init_folder: Optional[str] = None # which subfolder to pick from ("" / "__any__" = any)
     server: Optional[str] = None      # sd15: "local" or a comfy_servers() key; None = default
+    experiment: Optional[str] = None  # tag every image of this batch (E01-length)
+    hypothesis: Optional[str] = None  # one falsifiable sentence -> the manifest
+    # The corpus-autopsy corrections. All default to the historical behaviour;
+    # see semantic_anarchy/distribution.py for what each one measured.
+    rho: Optional[float] = None       # diagonal row coherence in [0,1]
+    length_mode: Optional[str] = None # off | corpus | fixed (content/pad split)
+    length: Optional[int] = None      # tokens, for length_mode=fixed
+    empirical_head: Optional[int] = None  # pca: leading axes drawn from the corpus CDF
+    temp_on: Optional[float] = None   # sampler=split: on-manifold temperature
+    temp_off: Optional[float] = None  # sampler=split: off-manifold temperature
+    radius_band: bool = False         # per-sample target radius from the corpus band
+    radius_scale: Optional[float] = None  # shift that band outward
 
 
-def _model_flags(req: RunRequest) -> list[str]:
+def model_flags(backend: str, model_key: Optional[str] = None) -> list[str]:
     """--ckpt for single-file backends (sd15/sd2), --model for sdxl (cached HF id).
 
     A checkpoint hand-picked in the sidebar (webui/model_config.json) overrides
     all of that for its backend.
     """
-    # sd15 on a remote ComfyUI (SA_COMFY_URL): the checkpoint lives on that box,
-    # so there is no local path to check -- pass Comfy's own checkpoint name.
-    if resolve_server(req.backend, req.server)[1]:
-        return ["--ckpt", COMFY_SD15_CKPT]
-    picked = selected_model(req.backend)
+    picked = selected_model(backend)
     if picked:
         if not Path(picked).exists():
             raise HTTPException(
-                400, f"{req.backend}: selected checkpoint no longer exists: {picked}"
+                400, f"{backend}: selected checkpoint no longer exists: {picked}"
             )
         return model_flags_for_path(picked)
-    if req.backend in SINGLE_FILE_CKPT:
-        ckpt = SINGLE_FILE_CKPT[req.backend]
+    if backend in SINGLE_FILE_CKPT:
+        ckpt = SINGLE_FILE_CKPT[backend]
         p = Path(ckpt)
         if not p.exists():
-            raise HTTPException(400, f"{req.backend} checkpoint not found: {ckpt}")
+            raise HTTPException(400, f"{backend} checkpoint not found: {ckpt}")
         # A diffusers *folder* loads via from_pretrained (--model); a single-file
         # .ckpt/.safetensors loads via from_single_file (--ckpt).
         return ["--model", ckpt] if p.is_dir() else ["--ckpt", ckpt]
-    if req.backend == "flux2":
+    if backend == "flux2":
         return ["--model", os.environ.get("SA_FLUX2_MODEL",
                                           "black-forest-labs/FLUX.2-klein-4B")]
-    if req.backend == "krea2":
+    if backend == "krea2":
         return ["--model", os.environ.get("SA_KREA2_MODEL", "krea/Krea-2-Raw")]
-    key = req.model or SDXL_DEFAULT_MODEL
+    key = model_key or SDXL_DEFAULT_MODEL
     if key not in SDXL_MODELS:
         raise HTTPException(400, f"unknown sdxl model {key!r}")
     return ["--model", SDXL_MODELS[key]]
+
+
+def _model_flags(req: RunRequest) -> list[str]:
+    # sd15 on a remote ComfyUI: the checkpoint lives on that box, so there is no
+    # local path to check -- pass Comfy's own checkpoint name.
+    if resolve_server(req.backend, req.server)[1]:
+        return ["--ckpt", COMFY_SD15_CKPT]
+    return model_flags(req.backend, req.model)
 
 
 def _common_sampler_flags(req: RunRequest) -> list[str]:
@@ -794,6 +1092,22 @@ def _common_sampler_flags(req: RunRequest) -> list[str]:
         a += ["--comp-lo", str(int(req.comp_lo))]
     if req.equalize:
         a += ["--equalize"]
+    # ---- the corpus-autopsy knobs ----------------------------------------
+    # Each is omitted when it would be a no-op, so an untouched sidebar still
+    # produces the exact argv it did before they existed.
+    if req.rho:
+        a += ["--rho", str(float(req.rho))]
+    if req.length_mode and req.length_mode != "off":
+        a += ["--length-mode", req.length_mode]
+        if req.length_mode == "fixed" and req.length is not None:
+            a += ["--length", str(int(req.length))]
+    if req.empirical_head:
+        a += ["--empirical-head", str(int(req.empirical_head))]
+    if req.sampler == "split":
+        if req.temp_on is not None:
+            a += ["--temp-on", str(float(req.temp_on))]
+        if req.temp_off is not None:
+            a += ["--temp-off", str(float(req.temp_off))]
     return a
 
 
@@ -815,9 +1129,37 @@ def _gen_flags(req: RunRequest) -> list[str]:
         a += ["--guidance", str(guidance)]
     if req.neg_mode:
         a += ["--neg-mode", req.neg_mode]
+    # None = never sent (the script keeps the house default); "" = an explicit
+    # "no negative text", which the script turns back into the empty prompt.
+    if req.negative is not None:
+        a += ["--negative", _clean_prompt(req.negative)]
     if req.scheduler and req.scheduler != "default":
         a += ["--scheduler", req.scheduler]
     return a
+
+
+#: Prompts per text-encoder forward pass. Mining loads no UNet, so this is the
+#: only thing sizing the encode; 8 is comfortable everywhere including the
+#: cpu-offloaded flow models.
+ENCODE_BATCH = 8
+
+
+def mine_argv(backend: str, prompts: str, out: str,
+              components: Optional[int] = None,
+              model_key: Optional[str] = None,
+              batch_size: Optional[int] = None) -> list[str]:
+    """The encode pass: corpus .txt -> fitted distribution at ``out``."""
+    batch = ENCODE_BATCH if batch_size is None else max(1, min(64, int(batch_size)))
+    argv = ["scripts/mine_distribution.py", "--backend", backend,
+            *model_flags(backend, model_key),
+            "--prompts", str(prompts), "--out", str(out),
+            "--batch-size", str(batch)]
+    comps = components
+    if comps is None and backend in ("flux2", "krea2"):
+        comps = 256   # Qwen embeddings are huge; full-rank PCA would be GBs
+    if comps is not None:
+        argv += ["--components", str(int(comps))]
+    return argv
 
 
 def build_argv(req: RunRequest) -> tuple[str, list[str]]:
@@ -827,37 +1169,39 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
         raise HTTPException(400, f"bad sampler {req.sampler!r}")
     if req.neg_mode and req.neg_mode not in NEG_MODES:
         raise HTTPException(400, f"bad neg_mode {req.neg_mode!r}")
+    if req.length_mode and req.length_mode not in LENGTH_MODES:
+        raise HTTPException(400, f"bad length_mode {req.length_mode!r}")
+    if req.length_mode == "fixed" and req.length is None:
+        raise HTTPException(400, "length_mode 'fixed' needs a length")
     if req.scheduler and req.scheduler not in SCHEDULERS:
         raise HTTPException(400, f"bad scheduler {req.scheduler!r}")
 
     base = [python_for(req.backend), "-u"]
     model = _model_flags(req)
-    # Which distribution to sample: the base corpus, or the evolved ★ branch
-    # (written by scripts/evolve_favorites.py, backend-namespaced).
-    if req.dist == "evolved":
-        suffix = "" if req.backend == "sd15" else f"_{req.backend}"
-        tensor = "__prompt_embeds" if req.backend == "sdxl" else ""
-        if not (OUTPUTS / f"dist_evolved{suffix}{tensor}.npz").is_file():
-            raise HTTPException(400, f"no evolved branch for {req.backend} yet — run 🧪 Evolve ★ first")
-        dist_base = "outputs/dist_evolved"
-    else:
-        dist_base = "outputs/dist"
-    common = ["--backend", req.backend, *model, "--dist", dist_base]
 
     if req.action == "mine":
-        argv = base + ["scripts/mine_distribution.py", "--backend", req.backend,
-                       *model, "--prompts", "prompts_1000.txt", "--out", "outputs/dist"]
-        comps = req.components
-        if comps is None and req.backend in ("flux2", "krea2"):
-            comps = 256   # Qwen embeddings are huge; full-rank PCA would be GBs
-        if comps is not None:
-            argv += ["--components", str(comps)]
-        label = f"mine · {req.backend}"
-        return label, argv
+        # Mine re-encodes whatever corpus is selected — the sidebar's Mine
+        # button and the picker's "Encode prompt distribution" write the same
+        # files. Only a non-corpus selection falls back to the repo's own
+        # prompts_1000.txt. (Resolved BEFORE the readiness check below: mining
+        # is what makes an unencoded corpus ready.)
+        row = current_dist(req.backend, req.model)
+        prompts, out = (
+            (row["path"], row["base"]) if row["kind"] == "prompts" and row["path"]
+            else (DEFAULT_PROMPTS, BASE_DIST)
+        )
+        argv = base + mine_argv(req.backend, prompts, out, req.components, req.model)
+        return f"mine · {req.backend} · {Path(prompts).name}", argv
+
+    # Which distribution to sample: whatever the Base-distribution picker
+    # persisted for this backend (or the legacy dropdown's evolved ★ branch).
+    dist_base = resolve_dist_base(req.backend, req.dist, req.model)
+    common = ["--backend", req.backend, *model, "--dist", dist_base]
 
     if req.action == "generate":
         argv = base + ["scripts/generate.py", *common, *_common_sampler_flags(req),
-                       *_gen_flags(req)]
+                       *_gen_flags(req),
+                       *_experiment_flags(req.experiment, req.hypothesis)]
         if req.n is not None:
             argv += ["--n", str(req.n)]
         if req.temperature is not None:
@@ -866,6 +1210,10 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
             argv += ["--target-distance", str(req.target_distance)]
         if req.min_distance is not None:
             argv += ["--min-distance", str(req.min_distance)]
+        if req.radius_band:
+            argv += ["--radius-band"]
+            if req.radius_scale is not None:
+                argv += ["--radius-scale", str(float(req.radius_scale))]
         if req.seed is not None:
             argv += ["--seed", str(req.seed)]
         if req.width:
@@ -882,7 +1230,10 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
                 argv += ["--ip-scale", str(req.ip_scale)]
             else:
                 argv += ["--init-strength", str(req.init_strength)]
-        label = f"generate · {req.backend} · {req.sampler} · T={req.temperature or 1.0} · n={req.n or 8}"
+        exp = labelset.clean_experiment_id(req.experiment)
+        label = (f"generate · {req.backend} · {req.sampler} · "
+                 f"T={req.temperature or 1.0} · n={req.n or 8}"
+                 + (f" · {exp}" if exp else ""))
         return label, argv
 
     if req.action == "temp_sweep":
@@ -907,6 +1258,41 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
         return label, argv
 
     raise HTTPException(400, f"unknown action {req.action!r}")
+
+
+#: Longest negative prompt the UI may send. CLIP truncates at 77 tokens anyway,
+#: so this only exists to keep a runaway paste out of argv and the job log.
+MAX_NEGATIVE_CHARS = 1000
+
+
+def _experiment_flags(experiment: Optional[str],
+                      hypothesis: Optional[str] = None) -> list[str]:
+    """``--experiment``/``--hypothesis`` for the scripts that write sidecars.
+
+    The id is slugged by the same rule the CLI and the dataset use, so what the
+    dashboard shows, what argv carries and what a label records are one string.
+    """
+    exp = labelset.clean_experiment_id(experiment)
+    if not exp:
+        return []
+    flags = ["--experiment", exp]
+    if hypothesis and hypothesis.strip():
+        flags += ["--hypothesis", _clean_prompt(hypothesis)]
+    return flags
+
+
+def _clean_prompt(s: str) -> str:
+    """Sanitise free-form prompt text bound for argv.
+
+    The negative prompt is the one knob that can't be allow-listed, so it gets
+    the next-best thing: it travels as a single element of a list-form argv (no
+    shell, no interpolation), control characters and newlines are flattened to
+    spaces so it can't forge extra lines in the job log, and it is length-capped.
+    """
+    flat = " ".join(s.split())
+    if len(flat) > MAX_NEGATIVE_CHARS:
+        raise HTTPException(400, f"negative prompt too long (max {MAX_NEGATIVE_CHARS} chars)")
+    return flat
 
 
 def _clean_csv(s: str) -> str:
@@ -936,8 +1322,26 @@ def legacy_index() -> str:
     return INDEX_HTML
 
 
+@app.get("/label")
+def label_page() -> FileResponse:
+    """The labeling page as its OWN tab — same bundle, no dashboard chrome.
+
+    StaticFiles(html=True) only serves index.html for "/", so a second entry
+    point needs a route of its own; the SPA reads `location.pathname` and mounts
+    the standalone shell instead of the dashboard. Labeling is a different mode
+    of attention from generating, and it wants the whole window.
+    """
+    index = FRONTEND_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(404, "frontend not built — run `make build`")
+    return FileResponse(index)
+
+
 @app.post("/api/run")
 def api_run(req: RunRequest) -> JSONResponse:
+    # img2img / IP-Adapter need the in-process pipeline: never a ComfyUI lane.
+    if req.init and init_images_count() > 0:
+        req = req.model_copy(update={"server": LOCAL_SERVER})
     lane, url = resolve_server(req.backend, req.server)
     label, argv = build_argv(req)
     if req.backend == "sd15":
@@ -992,19 +1396,200 @@ class RefineRequest(BaseModel):
     interp: str = "lanczos"           # hires: resampling filter for the enlarge
 
 
+#: The two animators. AnimateDiff rides the SD1.5 UNet (fast, 2s, keeps the
+#: source's own resolution); Wan is a video transformer in .venv-flux (minutes,
+#: up to ~5s, renders at its own 480p pixel budget).
+ANIMATE_ENGINES = ("animatediff", "wan")
+#: Wan's temporal VAE compresses time 4:1, so a frame count must be 4k+1.
+WAN_MAX_FRAMES = 81
+#: Wan renders at 16fps. Writing its frames at AnimateDiff's 8 halves the speed.
+WAN_NATIVE_FPS = 16
+#: The Wan checkpoints on this box, as an allow-list (never a free-text repo id).
+#: 2.2's A14B is a mixture-of-experts: two 14B transformers, one for the high-
+#: noise half of the schedule and one for the low, switched at `boundary_ratio`.
+#: 2.1's 14B is a single transformer, older, and renders at a 480p budget.
+WAN_MODELS = {
+    "2.2-a14b": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    "2.1-14b": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+}
+#: Camera moves AnimateDiff can layer on the motion module (mirrors
+#: scripts/animate.py MOTION_LORAS — user input never reaches argv unchecked).
+MOTION_LORAS = ("none", "zoom-in", "zoom-out", "pan-left", "pan-right",
+                "tilt-up", "tilt-down", "roll-cw", "roll-ccw")
+#: The motion module's trained window. Past it the clip degenerates into noise,
+#: so the ceiling is enforced here as well as in the script.
+ANIMATE_MAX_FRAMES = 16
+
+
+class AnimateRequest(BaseModel):
+    src: str
+    engine: str = "animatediff"       # animatediff | wan
+    #: 0 / None = animate the image's own CONDITIONING (the sd15 world it came
+    #: from, re-rendered in motion). > 0 = img2img the actual PIXELS at this
+    #: denoise, which is how a flux-enhanced upscale keeps its enhancement.
+    strength: Optional[float] = 0.6
+    frames: int = ANIMATE_MAX_FRAMES
+    #: None = each engine's native rate: 8 for AnimateDiff's motion module,
+    #: 16 for Wan. A Wan clip written at 8 plays at half speed.
+    fps: Optional[int] = None
+    smooth_fps: int = 0               # 0 = no interpolated companion file
+    motion_lora: str = "none"
+    max_side: int = 768
+    #: AnimateDiff: text instead of the image's own conditioning. The temporal
+    #: layers were trained on text and off-grid conditioning gives them little
+    #: to enact, which is why a promptless clip can come out barely moving.
+    prompt_from: str = "none"         # none | pez | native (the discovered one)
+    free_init: int = 0                # FreeInit iterations; 0 = off, 3 = typical
+    # --- wan only -------------------------------------------------------
+    steps: Optional[int] = None       # wan: denoising steps (default 30)
+    guidance: Optional[float] = None  # wan: CFG (default 5.0)
+    wan_model: str = "2.2-a14b"       # key into WAN_MODELS
+    #: Step-distillation LoRA: 6 steps instead of 30, ~3x faster, and measurably
+    #: closer to the source. On by default because it is strictly better here.
+    lightning: bool = True
+    #: Render size. None follows Wan's own rule (square -> 640); matching the
+    #: source's size removes the resample, which is the single biggest lever on
+    #: how much frame 1 looks like your picture.
+    size: Optional[int] = None
+    #: nf4 (4-bit, fits everything) | fp8 (8-bit, the reference implementation's
+    #: precision; swaps the inactive MoE expert to host RAM to fit 24GB)
+    quant: str = "nf4"
+    prompt: Optional[str] = None      # wan: "" / None = promptless
+    #: Omit for a fresh random seed per clip (recorded in film.json). Pin it only
+    #: to reproduce a clip or to A/B a knob against an identical noise draw.
+    seed: Optional[int] = None
+
+
+@app.post("/api/animate")
+def api_animate(req: AnimateRequest) -> JSONResponse:
+    """Queue an AnimateDiff clip for one image (scripts/animate.py)."""
+    src = _resolve_output_image(req.src)
+    if req.engine not in ANIMATE_ENGINES:
+        raise HTTPException(400, f"bad engine {req.engine!r}")
+    if req.engine == "wan":
+        return _queue_wan(req, src)
+    if req.motion_lora not in MOTION_LORAS:
+        raise HTTPException(400, f"bad motion_lora {req.motion_lora!r}")
+    if not (1 <= req.frames <= ANIMATE_MAX_FRAMES):
+        raise HTTPException(
+            400, f"frames must be 1-{ANIMATE_MAX_FRAMES} (the motion module's "
+                 "trained window; past it the clip degenerates into noise)")
+    fps = req.fps or 8
+    if not (1 <= fps <= 60) or not (0 <= req.smooth_fps <= 120):
+        raise HTTPException(400, "bad fps")
+    if req.strength is not None and req.strength and not (0.0 < req.strength <= 1.0):
+        raise HTTPException(400, "strength must be in (0, 1]")
+    if not (64 <= req.max_side <= 1536):
+        raise HTTPException(400, "max_side must be 64-1536")
+
+    # The conditioning may live several `refined_from` hops back; resolving it
+    # here is the pre-flight, so an untraceable source 400s instead of loading a
+    # model first and dying.
+    origin = _explorable_source(src)
+    if not any(f"anarchy_{b}_" in origin.name for b in ("sd15", "sd2")):
+        raise HTTPException(
+            400, "AnimateDiff rides the SD1.5 UNet, so only sd15/sd2 images (or "
+                 "upscales of them) can drive it")
+
+    if req.prompt_from not in ("none", "pez", "native"):
+        raise HTTPException(400, f"bad prompt_from {req.prompt_from!r}")
+    if not (0 <= req.free_init <= 8):
+        raise HTTPException(400, "free_init must be 0-8 iterations")
+
+    name = _unique_film_name(f"{src.stem}_anim")
+    argv = [PYTHON, "-u", "scripts/animate.py", "--src", str(src), "--name", name,
+            "--frames", str(req.frames), "--fps", str(fps),
+            "--max-side", str(req.max_side)]
+    if req.seed is not None:
+        argv += ["--seed", str(int(req.seed))]
+    if req.prompt:
+        argv += ["--prompt", req.prompt]
+    elif req.prompt_from != "none":
+        argv += ["--prompt-from", req.prompt_from]
+    if req.free_init:
+        argv += ["--free-init", "--free-init-iters", str(req.free_init)]
+    if req.strength:
+        argv += ["--strength", str(req.strength)]
+    if req.smooth_fps:
+        argv += ["--smooth-fps", str(req.smooth_fps)]
+    if req.motion_lora != "none":
+        argv += ["--motion-lora", req.motion_lora]
+    label = (f"animate · {src.name} · {req.frames}f"
+             + (f" · s{req.strength}" if req.strength else " · conditioning")
+             + (" · prompted" if (req.prompt or req.prompt_from != "none") else "")
+             + (f" · free-init×{req.free_init}" if req.free_init else "")
+             + (f" · {req.motion_lora}" if req.motion_lora != "none" else ""))
+    job = RUNNER.submit("animate", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "name": name})
+
+
+def _queue_wan(req: AnimateRequest, src: Path) -> JSONResponse:
+    """Queue a Wan I2V clip (scripts/animate_wan.py, in .venv-flux).
+
+    Unlike AnimateDiff this needs no conditioning at all -- it looks at the
+    pixels -- so any generated image qualifies, including an sdxl render or a
+    FLUX upscale that carries no replayable latents.
+    """
+    if req.wan_model not in WAN_MODELS:
+        raise HTTPException(400, f"unknown wan model {req.wan_model!r}")
+    if not (5 <= req.frames <= WAN_MAX_FRAMES):
+        raise HTTPException(400, f"frames must be 5-{WAN_MAX_FRAMES} (snapped to 4k+1)")
+    if req.steps is not None and not (4 <= req.steps <= 80):
+        raise HTTPException(400, "steps must be 4-80")
+    if req.guidance is not None and not (0.0 <= req.guidance <= 20.0):
+        raise HTTPException(400, "guidance must be 0-20")
+    if req.size is not None and not (256 <= req.size <= 1024):
+        raise HTTPException(400, "size must be 256-1024")
+    if req.quant not in ("nf4", "fp8", "8bit", "auto", "off"):
+        raise HTTPException(400, f"bad quant {req.quant!r}")
+    fps = req.fps or WAN_NATIVE_FPS
+    if not (1 <= fps <= 60) or not (0 <= req.smooth_fps <= 120):
+        raise HTTPException(400, "bad fps")
+
+    name = _unique_film_name(f"{src.stem}_wan")
+    argv = [FLUX_PYTHON, "-u", "scripts/animate_wan.py", "--src", str(src),
+            "--name", name, "--frames", str(req.frames), "--fps", str(fps),
+            "--model", WAN_MODELS[req.wan_model]]
+    if req.steps is not None:
+        argv += ["--steps", str(int(req.steps))]
+    if req.guidance is not None:
+        argv += ["--guidance", str(float(req.guidance))]
+    if req.size is not None:
+        argv += ["--size", str(int(req.size))]
+    if not req.lightning:
+        argv += ["--no-lightning"]
+    argv += ["--quant", req.quant]
+    if req.smooth_fps:
+        argv += ["--smooth-fps", str(req.smooth_fps)]
+    if req.seed is not None:
+        argv += ["--seed", str(int(req.seed))]
+    if req.prompt:
+        argv += ["--prompt", req.prompt]
+    label = (f"wan{req.wan_model} · {src.name} · {req.frames}f"
+             + (" · lightning" if req.lightning else "")
+             + (f" · {req.size}px" if req.size else "")
+             + (f" · {req.quant}" if req.quant != "nf4" else "")
+             + (f" · g{req.guidance}" if req.guidance is not None else "")
+             + ("" if not req.prompt else " · prompted"))
+    job = RUNNER.submit("animate", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "name": name})
+
+
+def _unique_film_name(stem: str) -> str:
+    """A films/ directory name nobody is using — re-animating never clobbers."""
+    root = OUTPUTS / "films"
+    if not (root / stem).exists():
+        return stem
+    i = 2
+    while (root / f"{stem}_{i}").exists():
+        i += 1
+    return f"{stem}_{i}"
+
+
 @app.post("/api/refine")
 def api_refine(req: RefineRequest) -> JSONResponse:
-    # Resolve + sandbox the source to a PNG under outputs/.
-    base = OUTPUTS.resolve()
-    src = (base / Path(req.src)).resolve()
-    # Fall back to outputs/generated/ when given a bare filename (gallery cards
-    # used to send just the name, and that's where generated images live).
-    if not src.is_file():
-        alt = (base / "generated" / Path(req.src).name).resolve()
-        if alt.is_file():
-            src = alt
-    if base not in src.parents or src.suffix.lower() != ".png" or not src.is_file():
-        raise HTTPException(404, f"source not found under outputs/: {req.src}")
+    # Resolve + sandbox the source to an image under outputs/.
+    src = _resolve_output_image(req.src)
     if req.engine not in REFINE_ENGINES:
         raise HTTPException(400, f"bad engine {req.engine!r}")
     if not (0.0 < req.scale <= 3.0):
@@ -1078,19 +1663,25 @@ class ExploreRequest(BaseModel):
     steps: Optional[int] = None
     guidance: Optional[float] = None
     server: Optional[str] = None      # sd15: run target, as RunRequest.server
+    experiment: Optional[str] = None  # tag the children too (E11-grids)
 
 
-def _resolve_output_png(rel: str) -> Path:
-    """Resolve an outputs-relative (or bare) PNG name, sandboxed to outputs/."""
+def _resolve_output_image(rel: str) -> Path:
+    """Resolve an outputs-relative (or bare) image name, sandboxed to outputs/.
+
+    Any extension in :data:`IMAGE_EXTS` counts, and the *stem* is the identity:
+    a persisted ``.png`` rel-path (favorites, timeline, an old browser tab) still
+    resolves after the same render was re-made as ``.jpg``.
+    """
     base = OUTPUTS.resolve()
     p = (base / Path(rel)).resolve()
     if not p.is_file():
         alt = (base / "generated" / Path(rel).name).resolve()
-        if alt.is_file():
-            p = alt
-    if base not in p.parents or p.suffix.lower() != ".png" or not p.is_file():
+        p = alt if alt.is_file() else p
+    hit = find_image(p)
+    if hit is None or base not in hit.parents:
         raise HTTPException(404, f"image not found under outputs/: {rel}")
-    return p
+    return hit
 
 
 def _explorable_source(p: Path) -> Path:
@@ -1126,7 +1717,7 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         raise HTTPException(400, f"bad direction {req.direction!r}")
     if not 0.0 <= req.turn <= 1.6:
         raise HTTPException(400, "turn must be in [0, 1.6] radians")
-    src = _explorable_source(_resolve_output_png(req.src))
+    src = _explorable_source(_resolve_output_image(req.src))
     backend = "sd15"
     for b in ("flux2", "krea2", "sdxl", "sd2"):
         if f"anarchy_{b}_" in src.name:
@@ -1134,11 +1725,14 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
             break
     lane, url = resolve_server(backend, req.server)
     model = _model_flags(RunRequest(action="explore", backend=backend, server=req.server))
+    # Measure the radius against whatever corpus is selected, like every other
+    # sampling action, not always the repo's own outputs/dist.
     argv = [python_for(backend), "-u", "scripts/explore.py", "--backend", backend, *model,
+            "--dist", resolve_dist_base(backend),
             "--mode", req.mode, "--src", str(src),
             "--n", str(int(req.n)), "--scheduler", "ddim"]
     if req.mode == "breed":
-        b = _explorable_source(_resolve_output_png(req.b or ""))
+        b = _explorable_source(_resolve_output_image(req.b or ""))
         if backend not in b.name:
             raise HTTPException(400, "breed parents must be from the same backend")
         argv += ["--b", str(b), "--mutate", str(req.mutate)]
@@ -1164,6 +1758,7 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         argv += ["--guidance", str(guidance)]
     if backend == "sdxl":
         argv += ["--neg-mode", "mean"]
+    argv += _experiment_flags(req.experiment)
     if backend == "sd15":
         label += f" @ {lane}"
     job = RUNNER.submit("explore", label, argv, lane=lane, env=job_env(url))
@@ -1176,6 +1771,7 @@ class EvolveRequest(BaseModel):
     temperature: float = 1.0
     base_blend: float = 0.25
     server: Optional[str] = None      # sd15: run target, as RunRequest.server
+    experiment: Optional[str] = None
 
 
 def _most_starred_backend() -> str:
@@ -1195,13 +1791,17 @@ def api_evolve(req: EvolveRequest) -> JSONResponse:
         raise HTTPException(400, f"bad backend {backend!r}")
     lane, url = resolve_server(backend, req.server)
     model = _model_flags(RunRequest(action="evolve", backend=backend, server=req.server))
+    # Branch off whatever corpus is selected, not always the repo's own — the
+    # elites were sampled from that fit, and its PCA axes are what get grafted.
     argv = [python_for(backend), "-u", "scripts/evolve_favorites.py", "--backend", backend, *model,
+            "--dist", resolve_dist_base(backend),
             "--n", str(int(req.n)), "--temperature", str(req.temperature),
             "--base-blend", str(req.base_blend), "--scheduler", "ddim"]
     d = SDXL_MODEL_DEFAULTS.get(SDXL_DEFAULT_MODEL, {}) if backend == "sdxl" else {}
     if d.get("steps") is not None:
         argv += ["--steps", str(d["steps"]), "--guidance", str(d["guidance"]),
                  "--neg-mode", "mean"]
+    argv += _experiment_flags(req.experiment)
     label = f"evolve★ · {backend} · T={req.temperature}"
     if backend == "sd15":
         label += f" @ {lane}"
@@ -1228,7 +1828,7 @@ class InvertRequest(BaseModel):
 def api_invert(req: InvertRequest) -> JSONResponse:
     """Queue PEZ hard-prompt inversion (arXiv:2302.03668): find the nearest
     TYPEABLE prompt to an image born without one. Ruler, not leash."""
-    src = _resolve_output_png(req.src)
+    src = _resolve_output_image(req.src)
     if req.space == "native":
         src = _explorable_source(src)   # native needs the .npz; upscales redirect
     argv = [PYTHON, "-u", "scripts/invert_prompt.py", "--src", str(src),
@@ -1247,7 +1847,7 @@ class GenPromptRequest(BaseModel):
 def api_genprompt(req: GenPromptRequest) -> JSONResponse:
     """Render what the discovered hard prompt actually produces, through the
     same backend and seed, so discovery and best-words-can-do can be compared."""
-    src = _resolve_output_png(req.src)
+    src = _resolve_output_image(req.src)
     j = src.with_suffix(".json")
     meta = {}
     if j.is_file():
@@ -1409,15 +2009,19 @@ async def api_log_stream(job_id: int, request: Request) -> StreamingResponse:
 _map_lock = threading.Lock()
 
 
-def _map_signature() -> str:
+def _map_signature(*inputs: str) -> str:
     """Changes whenever any ``.npz`` under outputs/ does -- image sidecars and
-    the fitted distributions alike."""
+    the fitted distributions alike -- or the map's own inputs (which fit, which
+    prompt file) do."""
     n, newest = 0, 0.0
     if OUTPUTS.is_dir():
         for p in OUTPUTS.rglob("*.npz"):
-            n += 1
-            newest = max(newest, p.stat().st_mtime)
-    return f"{n}:{newest:.3f}"
+            try:
+                newest = max(newest, p.stat().st_mtime)
+                n += 1
+            except OSError:      # wiped between the walk and the stat
+                pass
+    return "|".join((*inputs, f"{n}:{newest:.3f}"))
 
 
 @app.get("/api/latent-map")
@@ -1426,17 +2030,21 @@ def api_latent_map(backend: str = "sd15") -> FileResponse:
     scripts/latent_map.py -- NumPy only, so it runs here, not in the GPU queue)."""
     if backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {backend!r}")
+    # The axes are the corpus the sidebar has selected, like every sampling action.
+    base = _abs_base(resolve_dist_base(backend))
+    row = current_dist(backend)
+    prompts = row["path"] if row["kind"] == "prompts" and row["path"] else DEFAULT_PROMPTS
     out = OUTPUTS / f"latent_map_{backend}.json"
     sig_file = out.with_suffix(".sig")
     with _map_lock:
-        sig = _map_signature()
+        sig = _map_signature(str(base), str(prompts))
         fresh = out.is_file() and sig_file.is_file() and sig_file.read_text() == sig
         if not fresh:
             try:
                 proc = subprocess.run(
                     [PYTHON, str(REPO / "scripts" / "latent_map.py"),
                      "--backend", backend, "--outputs", str(OUTPUTS), "--out", str(out),
-                     "--prompts", str(REPO / "prompts_1000.txt")],
+                     "--dist", str(base), "--prompts", str(prompts)],
                     cwd=str(REPO), capture_output=True, text=True, timeout=300)
             except subprocess.TimeoutExpired:
                 raise HTTPException(504, f"latent map for {backend} took over 300 s") from None
@@ -1459,6 +2067,11 @@ def api_images() -> JSONResponse:
     scores = _load_json("scores.json")
     novelty = _load_json("novelty.json")
     resonance = _load_json("resonance.json")
+    tag_map = current_tags()
+    # NOT the same number as `score`: that one is the LAION aesthetic model's
+    # guess, this is your own 0-9 call from labels.jsonl. They disagree often
+    # enough that showing them in the same slot would be a lie.
+    human = labeled_scores()
     buckets: dict[str, list] = {k: [] for k, _ in GALLERY_BUCKETS}
     buckets["favorites"] = []
     buckets["top"] = []
@@ -1466,8 +2079,10 @@ def api_images() -> JSONResponse:
     by_rel: dict[str, dict] = {}
     if OUTPUTS.is_dir():
         # generate.py writes to outputs/generated/; sweeps + marginals to
-        # outputs/ root. rglob covers both.
-        for p in OUTPUTS.rglob("*.png"):
+        # outputs/ root. rglob covers both. Renders are JPEG now and PNG before
+        # the switch, and the analysis plots are PNG forever -- scan them all and
+        # let the bucket prefixes decide what shows.
+        for p in (q for e in IMAGE_EXTS for q in OUTPUTS.rglob(f"*{e}")):
             name = p.name
             rel = p.relative_to(OUTPUTS).as_posix()
             for key, prefix in GALLERY_BUCKETS:
@@ -1484,6 +2099,8 @@ def api_images() -> JSONResponse:
                         "dist": _distance_for(rel),
                         "nov": novelty.get(rel),
                         "res": resonance.get(rel),
+                        "tags": tag_map.get(rel),
+                        "label": human.get(rel),
                     }
                     buckets[key].append(item)
                     by_rel[rel] = item
@@ -1537,17 +2154,457 @@ class FavRequest(BaseModel):
 
 @app.post("/api/favorite")
 def api_favorite(req: FavRequest) -> JSONResponse:
-    # Only allow favoriting PNGs that actually live under outputs/.
+    # Only allow favoriting images that actually live under outputs/.
     base = OUTPUTS.resolve()
     target = (base / req.rel).resolve()
-    if base not in target.parents or target.suffix.lower() != ".png":
-        raise HTTPException(404, "not an outputs png")
+    if base not in target.parents or target.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(404, "not an outputs image")
     rel = target.relative_to(base).as_posix()
     with _favs_lock:
         favs = load_favs()
         favs.add(rel) if req.on else favs.discard(rel)
         save_favs(favs)
     return JSONResponse({"ok": True, "fav": req.on, "count": len(favs)})
+
+
+# --------------------------------------------------------------------------- #
+# Labeling — the referee of the exploration loop
+# --------------------------------------------------------------------------- #
+# Labels are the ONE output of this project that cannot be regenerated, so they
+# do not live under the gitignored outputs/: append-only JSONL at the repo root,
+# committed to git. This file only orchestrates — the record schema, the score
+# range and the summary maths all come from semantic_anarchy/labels.py.
+LABELS_FILE = labelset.labels_file()   # repo/labels/labels.jsonl (SA_LABELS_FILE overrides)
+
+#: How the queue may be narrowed. "unlabeled" is the working default;
+#: "labeled" exists for auditing your own past calls, "all" for a blind re-pass.
+LABEL_SCOPES = ("unlabeled", "all", "labeled")
+#: Which gallery slice to pull from. Only generated/ carries per-image sidecars,
+#: so that (and its starred subset) is everything that can be labeled.
+LABEL_BUCKETS = ("generated", "favorites")
+#: The queue selector's magic experiment value for "images with no id".
+UNTAGGED = "__none__"
+#: Fields of the sidecar the labeling page shows above the image. Small type,
+#: collapsible — the label stays perceptual, not analytical.
+LABEL_KNOB_KEYS = (
+    "kind", "sampler", "temperature", "coherence", "components", "comp_lo",
+    "equalize", "truncation", "steps", "guidance", "scheduler", "neg_mode",
+    "target_distance", "min_distance", "mode", "radius", "step", "direction",
+)
+
+_labels_cache: tuple = (None, [])
+
+
+def load_labels() -> list:
+    """Every record, cached against the file's (mtime, size).
+
+    Re-read only when the file actually changed, so a keypress-per-second
+    labeling session doesn't re-parse the whole dataset on every request.
+    """
+    global _labels_cache
+    try:
+        st = LABELS_FILE.stat()
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if _labels_cache[0] == key:
+        return _labels_cache[1]
+    recs = labelset.read_labels(LABELS_FILE)
+    _labels_cache = (key, recs)
+    return recs
+
+
+def labeled_scores() -> dict:
+    """rel -> the score that currently stands for it (latest record wins)."""
+    return {rel: rec["score"]
+            for rel, rec in labelset.latest_by_rel(load_labels()).items()}
+
+
+TAGS_FILE = tagset.tags_file()         # repo/labels/tags.jsonl (SA_TAGS_FILE overrides)
+
+_tags_cache: tuple = (None, [])
+
+
+def load_tag_records() -> list:
+    """Every tag record, cached against the file's (mtime, size) like the labels."""
+    global _tags_cache
+    try:
+        st = TAGS_FILE.stat()
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if _tags_cache[0] == key:
+        return _tags_cache[1]
+    recs = tagset.read_records(TAGS_FILE)
+    _tags_cache = (key, recs)
+    return recs
+
+
+def current_tags() -> dict:
+    """rel -> the tag set that currently stands for it.
+
+    Deliberately NOT folded into ``_label_index``'s row cache: that cache is
+    keyed on the image's mtime, and tagging changes no pixel — a tag written now
+    would not appear until the file was touched. Tags are merged into rows at
+    request time instead, exactly like ``score`` and ``fav``.
+    """
+    return tagset.latest_by_rel(load_tag_records())
+
+
+#: The dimensions the queue can be sliced along, each exposed as a facet with
+#: counts. Every one is derived from the image's own sidecar/pixels — no new
+#: bookkeeping — and every one is an *equality* filter, so the UI is a row of
+#: dropdowns and the server never parses user-supplied expressions.
+LABEL_FACETS = ("experiment", "backend", "ckpt", "folder", "size", "kind", "sampler")
+#: Sentinel for "this image has no value on that dimension" (untagged, no ckpt…).
+UNSET = "__none__"
+#: Kept for readability at the call sites that mean the experiment dimension.
+UNTAGGED = UNSET
+
+# rel -> (mtime, row). Deriving a row costs a sidecar parse and, for the images
+# whose sidecar predates height/width, an image-header read; caching on
+# mtime keeps a facet refresh over 10k images cheap.
+_ROW_CACHE: dict = {}
+
+
+def _label_index() -> list:
+    """Every labelable image, with each dimension the queue can filter on.
+
+    Anything named ``anarchy_*`` (any image extension) anywhere under
+    ``outputs/`` — that prefix is
+    exactly the set of images that carry a per-image ``.json`` sidecar, and a
+    label on an image with no sidecar would record no knobs. ``--outdir`` can put
+    those outside ``generated/``, hence the recursive walk and the ``folder``
+    facet.
+    """
+    if not OUTPUTS.is_dir():
+        return []
+    rows = []
+    for p in (q for e in IMAGE_EXTS for q in OUTPUTS.rglob(f"anarchy_*{e}")):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        rel = p.relative_to(OUTPUTS).as_posix()
+        hit = _ROW_CACHE.get(rel)
+        if hit is not None and hit[0] == mtime:
+            rows.append(hit[1])
+            continue
+        meta = sidecar_for(rel)
+        # Sidecar first (free), pixels second: evolve-branch sidecars record no
+        # size at all, and a refine's recorded size can predate its own upscale.
+        w, h = meta.get("width"), meta.get("height")
+        if not (w and h):
+            size = _image_size(p)
+            h, w = size if size else (None, None)
+        backend = meta.get("backend")
+        if not backend:
+            for b in BACKENDS:                      # fall back to the filename
+                if f"anarchy_{b}_" in p.name:
+                    backend = b
+                    break
+        row = {
+            "rel": rel,
+            "url": f"/img?path={rel}",
+            "mtime": mtime,
+            "experiment": labelset.clean_experiment_id(meta.get("experiment")),
+            "backend": backend,
+            "ckpt": dist_paths.model_slug(meta["model"]) if meta.get("model") else None,
+            "folder": Path(rel).parent.as_posix() or ".",
+            "size": f"{w}x{h}" if w and h else None,
+            "kind": meta.get("kind"),
+            "sampler": meta.get("sampler"),
+            "distance": meta.get("distance"),
+            "image_seed": meta.get("image_seed"),
+            "parent": meta.get("refined_from") or meta.get("parent"),
+            # Does this image carry its own conditioning? One stat, cached with
+            # the rest of the row — it is what decides whether the image can go
+            # into a selection fit (an upscale carries none of its own).
+            "latents": (OUTPUTS / rel).with_suffix(".npz").is_file(),
+            "knobs": {k: meta[k] for k in LABEL_KNOB_KEYS
+                      if k in meta and meta[k] is not None},
+        }
+        _ROW_CACHE[rel] = (mtime, row)
+        rows.append(row)
+    return rows
+
+
+def _facet_ok(row: dict, dim: str, want: str) -> bool:
+    """One equality filter. ``""`` = any, ``__none__`` = images missing a value."""
+    if not want:
+        return True
+    have = row.get(dim)
+    return (have is None or have == "") if want == UNSET else have == want
+
+
+def _tag_filter(tag_map: dict, want: str):
+    """A predicate on ``rel`` — ``None`` when there is no tag filter.
+
+    Tags are the one dimension that is set-valued, so this can't go through
+    :func:`_facet_ok`'s equality test: an image wearing three universes has to
+    match on any of them. ``__none__`` selects the untagged, which is the useful
+    inverse — "what haven't I sorted into a universe yet?".
+    """
+    if not want:
+        return None
+    if want == UNSET:
+        return lambda rel: rel not in tag_map
+    hits = tagset.tagged_with(tag_map, want)
+    return lambda rel: rel in hits
+
+
+def _select(rows: list, filters: dict, since: Optional[float],
+            until: Optional[float]) -> list:
+    out = []
+    for row in rows:
+        if since is not None and row["mtime"] < since:
+            continue
+        if until is not None and row["mtime"] > until:
+            continue
+        if all(_facet_ok(row, dim, want) for dim, want in filters.items()):
+            out.append(row)
+    return out
+
+
+def _shuffle_key(seed: int, rel: str) -> bytes:
+    """A stable pseudo-random order.
+
+    Hashing (seed, rel) rather than shuffling a list means the order of what is
+    LEFT doesn't change as images drop out of the queue on being labeled — so
+    re-fetching mid-session doesn't teleport you somewhere else in the batch.
+    """
+    return hashlib.blake2b(f"{seed}:{rel}".encode(), digest_size=8).digest()
+
+
+@app.get("/api/label/facets")
+def api_label_facets() -> JSONResponse:
+    """What there is to choose from: every facet value with its counts.
+
+    Computed over the WHOLE labelable set rather than the current selection, so
+    an option can never vanish because of an earlier pick. How many images a
+    given combination actually matches is answered live by the queue itself.
+    """
+    scores = labeled_scores()
+    favs = load_favs()
+    rows = _label_index()
+    tag_map = current_tags()
+    # "tag" is a facet of the queue but not of LABEL_FACETS: those are the
+    # equality dimensions read off the row itself, and this one is set-valued
+    # and lives in its own dataset.
+    tally: dict = {dim: {} for dim in (*LABEL_FACETS, "tag")}
+    for row in rows:
+        unlabeled = row["rel"] not in scores
+        for dim in LABEL_FACETS:
+            key = row.get(dim) or UNSET
+            cell = tally[dim].setdefault(key, {"value": key, "count": 0, "unlabeled": 0})
+            cell["count"] += 1
+            cell["unlabeled"] += int(unlabeled)
+        # Tags are set-valued, so one image feeds several cells (or the UNSET
+        # one). Counted here rather than in the row loop above because the row
+        # cache is keyed on the image's mtime and a tag write touches no pixel.
+        for key in tag_map.get(row["rel"]) or (UNSET,):
+            cell = tally["tag"].setdefault(key, {"value": key, "count": 0, "unlabeled": 0})
+            cell["count"] += 1
+            cell["unlabeled"] += int(unlabeled)
+    times = [r["mtime"] for r in rows]
+    return JSONResponse({
+        "total": len(rows),
+        "unlabeled": sum(1 for r in rows if r["rel"] not in scores),
+        "favorites": sum(1 for r in rows if r["rel"] in favs),
+        "tagged": sum(1 for r in rows if r["rel"] in tag_map),
+        "oldest": min(times) if times else None,
+        "newest": max(times) if times else None,
+        "facets": {
+            dim: sorted(cells.values(),
+                        key=lambda c: (c["value"] == UNSET, -c["count"]))
+            for dim, cells in tally.items()
+        },
+    })
+
+
+@app.get("/api/label/queue")
+def api_label_queue(experiment: Optional[str] = None, scope: str = "unlabeled",
+                    bucket: str = "generated", order: str = "shuffle",
+                    seed: int = 0, limit: int = 500,
+                    backend: Optional[str] = None, ckpt: Optional[str] = None,
+                    folder: Optional[str] = None, size: Optional[str] = None,
+                    kind: Optional[str] = None, sampler: Optional[str] = None,
+                    tag: Optional[str] = None,
+                    since: Optional[float] = None,
+                    until: Optional[float] = None) -> JSONResponse:
+    """The images to label next, shuffled within the selection by default.
+
+    Generation order correlates with everything (seed, position in a sweep), so
+    labeling in it invites the eye to find a trend that isn't there. Every filter
+    is an equality match on a value the image itself carries, plus the mtime
+    window — nothing here interprets a user-supplied expression.
+    """
+    if scope not in LABEL_SCOPES:
+        raise HTTPException(400, f"bad scope {scope!r}")
+    if bucket not in LABEL_BUCKETS:
+        raise HTTPException(400, f"bad bucket {bucket!r}")
+    scores = labeled_scores()
+    favs = load_favs()
+    tag_map = current_tags()
+    filters = {
+        "experiment": (experiment or "").strip(),
+        "backend": (backend or "").strip(),
+        "ckpt": (ckpt or "").strip(),
+        "folder": (folder or "").strip(),
+        "size": (size or "").strip(),
+        "kind": (kind or "").strip(),
+        "sampler": (sampler or "").strip(),
+    }
+    want_tag = (tag or "").strip()
+    keep = _tag_filter(tag_map, want_tag)
+
+    rows = []
+    for row in _select(_label_index(), filters, since, until):
+        if bucket == "favorites" and row["rel"] not in favs:
+            continue
+        if keep is not None and not keep(row["rel"]):
+            continue
+        score = scores.get(row["rel"])
+        if scope == "unlabeled" and score is not None:
+            continue
+        if scope == "labeled" and score is None:
+            continue
+        rows.append({**row, "score": score, "fav": row["rel"] in favs,
+                     "tags": tag_map.get(row["rel"], [])})
+
+    total = len(rows)
+    if order == "new":
+        rows.sort(key=lambda r: r["mtime"], reverse=True)
+    elif order == "old":
+        rows.sort(key=lambda r: r["mtime"])
+    else:
+        rows.sort(key=lambda r: _shuffle_key(seed, r["rel"]))
+    return JSONResponse({
+        "queue": rows[:max(1, min(2000, limit))],
+        "total": total,
+        "labeled": sum(1 for r in rows if r["score"] is not None),
+        "filters": {**{k: v or None for k, v in filters.items()},
+                    "tag": want_tag or None},
+        "since": since,
+        "until": until,
+        "scope": scope,
+        "bucket": bucket,
+        "order": order,
+    })
+
+
+class LabelRequest(BaseModel):
+    rel: str
+    score: int
+
+
+@app.post("/api/label")
+def api_label(req: LabelRequest) -> JSONResponse:
+    """Append one label. Relabeling appends too — history is never rewritten."""
+    base = OUTPUTS.resolve()
+    target = (base / req.rel).resolve()
+    if base not in target.parents or target.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(404, "not an outputs image")
+    rel = target.relative_to(base).as_posix()
+    try:
+        rec = labelset.make_record(rel, req.score, sidecar_for(rel))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc))
+    labelset.append_label(rec, LABELS_FILE)
+    return JSONResponse({"ok": True, "rel": rel, "score": rec["score"],
+                         "experiment": rec["experiment"],
+                         "count": len(labeled_scores())})
+
+
+class TagRequest(BaseModel):
+    rel: str
+    #: The COMPLETE set this image should wear from now on — not a delta. The
+    #: client always knows the current set (it is in the row), so sending the
+    #: whole thing makes assign and un-assign one idempotent call.
+    tags: list[str] = []
+
+
+@app.post("/api/tag")
+def api_tag(req: TagRequest) -> JSONResponse:
+    """Set an image's aesthetic universes. Appends; history is never rewritten."""
+    base = OUTPUTS.resolve()
+    target = (base / req.rel).resolve()
+    if base not in target.parents or target.suffix.lower() not in IMAGE_EXTS:
+        raise HTTPException(404, "not an outputs image")
+    rel = target.relative_to(base).as_posix()
+    rec = tagset.make_record(rel, req.tags)
+    tagset.append_record(rec, TAGS_FILE)
+    return JSONResponse({"ok": True, "rel": rel, "tags": rec["tags"],
+                         "vocabulary": tagset.vocabulary(load_tag_records())})
+
+
+@app.get("/api/tags")
+def api_tags() -> JSONResponse:
+    """The tag vocabulary — derived from what images actually wear, commonest first."""
+    records = load_tag_records()
+    tag_map = tagset.latest_by_rel(records)
+    return JSONResponse({
+        "tags": tagset.vocabulary(records),
+        "tagged": len(tag_map),
+        "records": len(records),
+        "file": str(TAGS_FILE),
+    })
+
+
+@app.get("/api/labels")
+def api_labels() -> JSONResponse:
+    """The dataset's summary: overall, then one tail-weighted row per experiment."""
+    records = load_labels()
+    latest = list(labelset.latest_by_rel(records).values())
+    groups = labelset.by_experiment(latest)
+    rows = [{"id": exp, **labelset.summarize_records(recs)}
+            for exp, recs in sorted(groups.items())]
+    rows.sort(key=lambda r: (r["keeper_rate"] or 0, r["n"]), reverse=True)
+    return JSONResponse({
+        "count": len(latest),
+        "records": len(records),
+        "file": str(LABELS_FILE),
+        "overall": labelset.summarize_records(latest),
+        "experiments": rows,
+    })
+
+
+@app.get("/api/experiments")
+def api_experiments() -> JSONResponse:
+    """Every experiment id the gallery or the manifests know about.
+
+    Manifest-only ids (a batch that was cancelled before it wrote an image) and
+    sidecar-only ids (a run launched from the CLI without a manifest) both show
+    up — the queue selector should never hide a batch that exists.
+    """
+    scores = labeled_scores()
+    images: dict = {}
+    for row in _label_index():
+        exp = row.get("experiment") or ""
+        cell = images.setdefault(exp, {"images": 0, "labeled": 0})
+        cell["images"] += 1
+        if row["rel"] in scores:
+            cell["labeled"] += 1
+
+    out = []
+    manifests = {m["id"]: m for m in labelset.list_manifests(REPO)}
+    for exp in sorted(set(images) | set(manifests)):
+        if not exp and not images.get(exp, {}).get("images"):
+            continue
+        m = manifests.get(exp) or {}
+        runs = m.get("runs") or []
+        counts = images.get(exp, {"images": 0, "labeled": 0})
+        out.append({
+            "id": exp,
+            "hypothesis": m.get("hypothesis"),
+            "created": m.get("created"),
+            "runs": len(runs),
+            "seed_panel": any(r.get("seed_panel") for r in runs),
+            **counts,
+        })
+    # Most work left to do first; untagged (id "") sorts last whatever it holds.
+    out.sort(key=lambda r: (r["id"] == "", -(r["images"] - r["labeled"]), r["id"]))
+    return JSONResponse(out)
 
 
 @app.get("/api/meta")
@@ -1587,6 +2644,13 @@ def api_meta(path: str) -> JSONResponse:
                         meta[k] = m[k]
                 meta["native_from"] = p.name
                 break
+    # The human judgement, carried alongside the machine's params so the
+    # lightbox can score and tag whatever it is showing -- including a parent
+    # image reached by a link, which may not be in the current gallery view at
+    # all and therefore has no row to read the current state off.
+    rel = target.relative_to(base).as_posix()
+    meta["label_score"] = labeled_scores().get(rel)
+    meta["label_tags"] = current_tags().get(rel, [])
     return JSONResponse(meta)
 
 
@@ -1597,88 +2661,204 @@ def api_img(path: str) -> FileResponse:
     base = OUTPUTS.resolve()
     target = (base / path).resolve()
     if (base not in target.parents
-            or target.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".mp4")
+            or target.suffix.lower() not in IMAGE_EXTS + (".mp4",)
             or not target.is_file()):
         raise HTTPException(404, "not found")
     return FileResponse(target)
 
 
-def _wipe_candidates():
-    """Non-starred images with aesthetic score < 5. Favorites and their whole
-    ancestry (refined_from / parent chains) are protected -- deleting a
-    favorite's original would break native inversion and exploration."""
-    favs = set()
-    try:
-        favs = set(json.loads((OUTPUTS / "favorites.json").read_text()))
-    except Exception:
-        pass
-    try:
-        scores = json.loads((OUTPUTS / "scores.json").read_text())
-    except Exception:
-        scores = {}
-    protected = set(favs)
-    for rel in list(favs):                      # protect ancestry chains
-        p = OUTPUTS / rel
-        for _ in range(6):
-            jj = p.with_suffix(".json")
-            if not jj.is_file():
+#: One above the highest label score: "below this" then means every labeled image.
+WIPE_CUTOFF_ALL = labelset.SCORE_MAX + 1
+
+
+class WipeRequest(BaseModel):
+    """What 🧹 Wipe should delete. The defaults are the original "Wipe <5".
+
+    ``cutoff`` is against YOUR 0-9 label, never the LAION aesthetic guess in
+    scores.json: an image is matched when its label is below it. 0 matches no
+    labeled image at all, ``WIPE_CUTOFF_ALL`` matches every one.
+    """
+    cutoff: int = 5
+    include_unlabeled: bool = False
+    include_starred: bool = False
+    backend: str = ""
+    ckpt: str = ""
+    since: Optional[float] = None
+    until: Optional[float] = None
+
+
+def _stem(rel: str) -> str:
+    """An image's identity: its path without the extension."""
+    return Path(rel).with_suffix("").as_posix()
+
+
+def _wipe_plan(req: WipeRequest) -> dict:
+    """Which images a wipe would delete, and which it spares and why.
+
+    Filters are ANDed. Whatever survives keeps its whole ancestry, matched or not:
+    an upscale has no conditioning of its own and replays its original's, so
+    deleting that original would quietly break a keeper. It follows that a wipe
+    matching everything really does delete everything.
+    """
+    if not 0 <= req.cutoff <= WIPE_CUTOFF_ALL:
+        raise HTTPException(400, f"cutoff must be 0-{WIPE_CUTOFF_ALL}, got {req.cutoff}")
+    rows = _label_index()
+    scores = labeled_scores()
+    favs = load_favs()
+    filters = {"backend": req.backend.strip(), "ckpt": req.ckpt.strip()}
+    in_filter = _select(rows, filters, req.since, req.until)
+
+    matched, starred = {}, 0
+    for row in in_filter:
+        score = scores.get(row["rel"])
+        if not (req.include_unlabeled if score is None else score < req.cutoff):
+            continue
+        if row["rel"] in favs and not req.include_starred:
+            starred += 1
+            continue
+        matched[row["rel"]] = score
+
+    by_stem = {_stem(r["rel"]): r for r in rows}
+    protected = set()
+    for row in rows:
+        if row["rel"] in matched:
+            continue
+        seen = {_stem(row["rel"])}
+        while row.get("parent"):
+            up = (Path(row["rel"]).parent / row["parent"]).as_posix()
+            stem = _stem(up)
+            row = by_stem.get(stem)
+            if row is None or stem in seen:
                 break
+            seen.add(stem)
+            protected.add(row["rel"])
+    doomed = [rel for rel in matched if rel not in protected]
+    return {
+        "doomed": doomed,
+        "labeled": sum(1 for rel in doomed if matched[rel] is not None),
+        "unlabeled": sum(1 for rel in doomed if matched[rel] is None),
+        "kept_starred": starred,
+        "kept_lineage": len(matched) - len(doomed),
+    }
+
+
+_purge_lock = threading.Lock()
+
+
+def _purge_image_caches(gone: set) -> None:
+    """Forget deleted images in the derived per-image caches.
+
+    Not just tidiness: resonance.py never re-embeds a name it already knows, so a
+    stale entry would give the next image to reuse that name a dead image's CLIP
+    vector, and would keep counting as a gallery neighbor in the novelty maths.
+    """
+    with _purge_lock:   # several 🗑 clicks can be in flight at once
+        for cache in ("novelty.json", "resonance.json", "scores.json"):
+            cp = OUTPUTS / cache
+            if cp.is_file():
+                try:
+                    d = json.loads(cp.read_text())
+                    cp.write_text(json.dumps(
+                        {k: v for k, v in d.items() if k not in gone}))
+                except Exception:
+                    pass
+        emb = OUTPUTS / "clip_embeds.npz"
+        if emb.is_file():
             try:
-                m = json.loads(jj.read_text())
+                import numpy as np
+                z = np.load(emb)
+                names, vecs = list(z["names"]), z["vecs"]
+                keep = [i for i, nm in enumerate(names) if str(nm) not in gone]
+                if len(keep) < len(names):
+                    np.savez_compressed(emb, names=np.array([str(names[i]) for i in keep]),
+                                        vecs=vecs[keep])
             except Exception:
-                break
-            up = m.get("refined_from") or m.get("parent")
-            if not up:
-                break
-            p = p.parent / up
-            protected.add(str(p.relative_to(OUTPUTS)))
-    out = []
-    for png in sorted((OUTPUTS / "generated").glob("anarchy_*.png")):
-        rel = str(png.relative_to(OUTPUTS))
-        sc = scores.get(rel)
-        if rel not in protected and sc is not None and sc < 5.0:
-            out.append(rel)
-    return out
+                pass
+
+
+def _delete_image_files(target: Path) -> int:
+    """Unlink every extension of an image's stem, plus its sidecars."""
+    n_files = 0
+    for ext in IMAGE_EXTS + (".json", ".npz"):
+        p = target.with_suffix(ext)
+        if p.is_file():
+            p.unlink(missing_ok=True)
+            n_files += 1
+    return n_files
+
+
+def _forget_images(gone: set) -> None:
+    """Drop deleted rels (every extension) from everything derived from them.
+
+    labels.jsonl is left alone: a score is the one record that can't be re-made,
+    and it carries its own snapshot of the knobs for experiment_report.py. Tags are
+    cleared because the vocabulary is derived from what images wear, so a universe
+    has to retire when its last image is deleted.
+    """
+    with _favs_lock:
+        favs = load_favs()
+        if favs & gone:
+            save_favs(favs - gone)
+    tagged = current_tags()
+    for rel in gone & tagged.keys():
+        tagset.append_record(tagset.make_record(rel, []), TAGS_FILE)
+    _purge_image_caches(gone)
 
 
 @app.get("/api/wipe/preview")
-def api_wipe_preview() -> JSONResponse:
-    return JSONResponse({"count": len(_wipe_candidates())})
+def api_wipe_preview(cutoff: int = 5, include_unlabeled: bool = False,
+                     include_starred: bool = False, backend: str = "", ckpt: str = "",
+                     since: Optional[float] = None,
+                     until: Optional[float] = None) -> JSONResponse:
+    """What this wipe would do. ``as_of`` is what the client should send as ``until``
+    if it set none, so an image rendered after you read the count can't be deleted."""
+    as_of = time.time()
+    plan = _wipe_plan(WipeRequest(
+        cutoff=cutoff, include_unlabeled=include_unlabeled,
+        include_starred=include_starred, backend=backend, ckpt=ckpt,
+        since=since, until=until))
+    return JSONResponse({
+        "count": len(plan["doomed"]),
+        "labeled": plan["labeled"],
+        "unlabeled": plan["unlabeled"],
+        "kept_starred": plan["kept_starred"],
+        "kept_lineage": plan["kept_lineage"],
+        "as_of": as_of,
+    })
 
 
 @app.post("/api/wipe")
-def api_wipe() -> JSONResponse:
-    doomed = _wipe_candidates()
-    gone = set(doomed)
-    n_files = 0
-    for rel in doomed:
-        base = OUTPUTS / rel
-        for ext in (".png", ".json", ".npz"):
-            p = base.with_suffix(ext)
-            if p.is_file():
-                p.unlink()
-                n_files += 1
-    for cache in ("novelty.json", "resonance.json", "scores.json"):
-        cp = OUTPUTS / cache
-        if cp.is_file():
-            try:
-                d = json.loads(cp.read_text())
-                cp.write_text(json.dumps(
-                    {k: v for k, v in d.items() if k not in gone}))
-            except Exception:
-                pass
-    emb = OUTPUTS / "clip_embeds.npz"
-    if emb.is_file():
-        try:
-            import numpy as np
-            z = np.load(emb)
-            names, vecs = list(z["names"]), z["vecs"]
-            keep = [i for i, nm in enumerate(names) if str(nm) not in gone]
-            np.savez_compressed(emb, names=np.array([str(names[i]) for i in keep]),
-                                vecs=vecs[keep])
-        except Exception:
-            pass
-    return JSONResponse({"deleted": len(doomed), "files": n_files})
+def api_wipe(req: WipeRequest = WipeRequest()) -> JSONResponse:
+    doomed = _wipe_plan(req)["doomed"]
+    n_files = sum(_delete_image_files(OUTPUTS / rel) for rel in doomed)
+    _forget_images({Path(rel).with_suffix(e).as_posix()
+                    for rel in doomed for e in IMAGE_EXTS})
+    return JSONResponse({"deleted": len(doomed), "files": n_files, "rels": doomed})
+
+
+class DeleteImageRequest(BaseModel):
+    rel: str
+
+
+@app.post("/api/image/delete")
+def api_image_delete(req: DeleteImageRequest) -> JSONResponse:
+    """Remove one gallery image and its sidecars from disk, with no undo.
+
+    The stem is the identity, so every extension of it goes. Deliberately strict
+    where _resolve_output_image is forgiving: its fallback to generated/ could
+    delete a same-named image the caller never pointed at. Deleting something
+    already gone succeeds, so a double-click can't surface an error.
+    """
+    base = OUTPUTS.resolve()
+    target = (base / req.rel).resolve()
+    prefixes = tuple(prefix for _, prefix in GALLERY_BUCKETS)
+    if (base not in target.parents
+            or target.suffix.lower() not in IMAGE_EXTS
+            or not target.name.startswith(prefixes)):
+        raise HTTPException(404, "not a gallery image")
+    n_files = _delete_image_files(target)
+    _forget_images({target.with_suffix(e).relative_to(base).as_posix() for e in IMAGE_EXTS})
+    return JSONResponse({"deleted": req.rel, "files": n_files})
 
 
 # --------------------------------------------------------------------------- #
@@ -1693,19 +2873,49 @@ MAX_FILM_KEYS = 64
 MAX_FILM_FRAMES = 3000            # a 3-minute film at 16fps; past this it's a typo
 
 
-def _png_size(p: Path) -> Optional[tuple[int, int]]:
-    """``(height, width)`` straight out of the PNG's IHDR chunk — no PIL here.
+def _image_size(p: Path) -> Optional[tuple[int, int]]:
+    """``(height, width)`` from the file header — PNG IHDR or JPEG SOF, no PIL.
 
     The rendered pixels are ground truth: older sidecars (evolve branches)
-    recorded no height/width at all.
+    recorded no height/width at all. Renders are JPEG now, so this walks the
+    marker chain for those; both paths read a few dozen bytes, which is what
+    keeps a facet refresh over 10k images cheap.
     """
     try:
         with p.open("rb") as f:
             head = f.read(24)
-        if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
-            return None
-        w, h = struct.unpack(">II", head[16:24])
-        return int(h), int(w)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w, h = struct.unpack(">II", head[16:24])
+                return int(h), int(w)
+            if head[:2] != b"\xff\xd8":                        # not a JPEG either
+                return None
+            f.seek(2)
+            while True:
+                b = f.read(1)
+                if not b:
+                    return None
+                if b != b"\xff":                                # resync to a marker
+                    continue
+                marker = f.read(1)
+                while marker == b"\xff":                        # fill bytes
+                    marker = f.read(1)
+                if not marker or marker == b"\xd9":
+                    return None
+                m = marker[0]
+                if m in (0x01,) or 0xd0 <= m <= 0xd8:           # standalone markers
+                    continue
+                seg = f.read(2)
+                if len(seg) < 2:
+                    return None
+                length = struct.unpack(">H", seg)[0]
+                # SOF0..SOF15 carry the frame size; DHT/DAC/DNL are not SOFs.
+                if 0xc0 <= m <= 0xcf and m not in (0xc4, 0xc8, 0xcc):
+                    body = f.read(5)
+                    if len(body) < 5:
+                        return None
+                    h, w = struct.unpack(">HH", body[1:5])
+                    return int(h), int(w)
+                f.seek(length - 2, 1)
     except Exception:                                          # noqa: BLE001
         return None
 
@@ -1715,7 +2925,7 @@ def _keyframe_row(raw: str) -> dict:
     row = {"rel": raw, "source": None, "backend": None,
            "height": None, "width": None, "filmable": False, "error": None}
     try:
-        src = _explorable_source(_resolve_output_png(raw))
+        src = _explorable_source(_resolve_output_image(raw))
     except HTTPException as exc:
         row["error"] = str(exc.detail)
         return row
@@ -1726,7 +2936,7 @@ def _keyframe_row(raw: str) -> dict:
             backend = cand
             break
     row["backend"] = backend
-    size = _png_size(src)
+    size = _image_size(src)
     if size:
         row["height"], row["width"] = size
     row["filmable"] = backend in FILM_BACKENDS
@@ -1819,7 +3029,7 @@ def api_film(req: FilmRequest) -> JSONResponse:
 
     rels, backends = [], set()
     for raw in req.images:
-        src = _explorable_source(_resolve_output_png(raw))
+        src = _explorable_source(_resolve_output_image(raw))
         rels.append(src.relative_to(OUTPUTS.resolve()).as_posix())
         b = "sd15"
         for cand in ("flux2", "krea2", "sdxl", "sd2"):
@@ -1926,11 +3136,69 @@ def api_config() -> JSONResponse:
         # Hand-picked checkpoints (webui/model_config.json) — these override the
         # env-var defaults above, so the sidebar hints have to know about them.
         "picked_models": load_model_config(),
+        # The house sd15 CFG negative, so the sidebar can show the actual text
+        # it will sample against instead of just naming the mode.
+        "sd15_negative": SD15_NEGATIVE,
         "init_dir": str(INIT_DIR),
         "init_count": init_images_count(),
         "init_folders": init_folders(),
         "repo": str(REPO),
+        # The fixed seed panel, so the sidebar can name the one flag pair that
+        # makes a batch comparable to every other comparative batch.
+        "seed_panel": {
+            "seed": labelset.SEED_PANEL_SEED,
+            "n": labelset.SEED_PANEL_N,
+            "seeds": list(labelset.SEED_PANEL),
+        },
+        "labels_file": str(LABELS_FILE),
+        "config_file": str(CONFIG_FILE),
     })
+
+
+# --------------------------------------------------------------------------- #
+# UI preferences (config.json -> "ui")
+# --------------------------------------------------------------------------- #
+# The frontend's persisted store, parked server-side so the sidebar comes back
+# the same on every device that opens the dashboard (and survives clearing a
+# browser's storage). The blob is opaque here — its shape, its version and its
+# migrations are frontend/src/store.ts's business; this end only bounds how big
+# it is allowed to get.
+UI_PREFS_MAX_BYTES = 4_000_000
+
+
+@app.get("/api/prefs")
+def api_prefs_get() -> JSONResponse:
+    """The stored UI blob, or ``null`` when nothing has been saved yet."""
+    with _config_lock:
+        ui = load_config().get("ui")
+    return JSONResponse({
+        "ui": ui if isinstance(ui, dict) else None,
+        "config_file": str(CONFIG_FILE),
+    })
+
+
+@app.post("/api/prefs")
+async def api_prefs_set(request: Request) -> JSONResponse:
+    """Store (``{"ui": {...}}``) or forget (``{"ui": null}``) the UI blob.
+
+    The body is read raw rather than through a pydantic model because the last
+    write of a session arrives via ``navigator.sendBeacon``, which sets its own
+    content type.
+    """
+    body = await request.body()
+    if len(body) > UI_PREFS_MAX_BYTES:
+        raise HTTPException(413, f"prefs too large ({len(body)} bytes)")
+    try:
+        data = json.loads(body or b"null")
+    except Exception:
+        raise HTTPException(400, "prefs body is not JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "prefs body must be a JSON object")
+    ui = data.get("ui")
+    if ui is not None and not isinstance(ui, dict):
+        raise HTTPException(400, "prefs 'ui' must be an object or null")
+    save_config_section("ui", ui)
+    return JSONResponse({"ok": True, "stored": ui is not None})
 
 
 # --------------------------------------------------------------------------- #
@@ -1957,11 +3225,11 @@ def _model_row(backend: str, picked: dict) -> dict:
 
 @app.get("/api/model")
 def api_model_get() -> JSONResponse:
-    with _model_cfg_lock:
+    with _config_lock:
         picked = load_model_config()
     return JSONResponse({
         "backends": {b: _model_row(b, picked) for b in sorted(BACKENDS)},
-        "config_file": str(MODEL_CONFIG_FILE),
+        "config_file": str(CONFIG_FILE),
         "native_picker": native_picker_tool(),
         "roots": [{"name": r.name or str(r), "path": str(r)} for r in browse_roots()],
     })
@@ -1976,7 +3244,7 @@ class ModelSelectRequest(BaseModel):
 def api_model_set(req: ModelSelectRequest) -> JSONResponse:
     if req.backend not in BACKENDS:
         raise HTTPException(400, f"unknown backend {req.backend!r}")
-    with _model_cfg_lock:
+    with _config_lock:
         picked = load_model_config()
         if req.path and req.path.strip():
             picked[req.backend] = str(validate_model_path(req.path))
@@ -1984,6 +3252,532 @@ def api_model_set(req: ModelSelectRequest) -> JSONResponse:
             picked.pop(req.backend, None)
         save_model_config(picked)
     return JSONResponse(_model_row(req.backend, picked))
+
+
+# --------------------------------------------------------------------------- #
+# Base-distribution picker
+# --------------------------------------------------------------------------- #
+@app.get("/api/dist")
+def api_dist_get(backend: str = "sd15", model: Optional[str] = None) -> JSONResponse:
+    """The distribution this backend currently samples from."""
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    with _config_lock:
+        cfg = load_dist_config()
+    return JSONResponse({
+        **current_dist(backend, model, cfg),
+        "config_file": str(CONFIG_FILE),
+        "default_prompts": DEFAULT_PROMPTS,
+    })
+
+
+@app.get("/api/dist/probe")
+def api_dist_probe(backend: str, path: str,
+                   model: Optional[str] = None) -> JSONResponse:
+    """What picking this file would mean: where its latents live, and whether
+    they've been encoded with the checkpoint that's currently active."""
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    kind = dist_kind_for(path)
+    p = resolve_dist_file(path, kind)
+    return JSONResponse(describe_dist(backend, kind, str(p), model))
+
+
+class DistSelectRequest(BaseModel):
+    backend: str
+    kind: str = "base"               # base | evolved | prompts | file
+    path: Optional[str] = None       # required for prompts / file
+    model: Optional[str] = None      # sdxl repo key (tags which fit is meant)
+
+
+@app.post("/api/dist")
+def api_dist_set(req: DistSelectRequest) -> JSONResponse:
+    """Persist the pick. Only a *ready* distribution can be selected — an
+    unencoded corpus has to go through /api/dist/encode first."""
+    if req.backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {req.backend!r}")
+    if req.kind not in DIST_KINDS:
+        raise HTTPException(400, f"unknown distribution kind {req.kind!r}")
+    path = (
+        str(resolve_dist_file(req.path or "", req.kind))
+        if req.kind in ("prompts", "file") else None
+    )
+    row = describe_dist(req.backend, req.kind, path, req.model)
+    if not row["ready"]:
+        missing = ", ".join(f["path"] for f in row["files"] if not f["exists"])
+        raise HTTPException(400, f"not encoded yet (missing {missing})")
+    with _config_lock:
+        cfg = load_dist_config()
+        cfg[req.backend] = {"kind": req.kind, "path": path}
+        save_dist_config(cfg)
+    return JSONResponse(row)
+
+
+class DistEncodeRequest(BaseModel):
+    backend: str
+    path: str                        # the .txt corpus to encode
+    model: Optional[str] = None
+    components: Optional[int] = None
+    batch_size: Optional[int] = None  # prompts per forward pass (default 8)
+
+
+@app.post("/api/dist/encode")
+def api_dist_encode(req: DistEncodeRequest) -> JSONResponse:
+    """Queue the encode pass for a prompt corpus (the same mine job the sidebar
+    runs), writing its latents beside the .txt under the active checkpoint."""
+    if req.backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {req.backend!r}")
+    p = resolve_dist_file(req.path, "prompts")
+    try:
+        n = sum(1 for line in p.read_text(errors="replace").splitlines()
+                if line.strip() and not line.lstrip().startswith("#"))
+    except OSError as exc:
+        raise HTTPException(400, f"unreadable corpus: {exc}")
+    if n == 0:
+        raise HTTPException(400, f"no prompts in {p.name}")
+    out = dist_base_for(req.backend, "prompts", str(p), req.model)
+    argv = [python_for(req.backend), "-u",
+            *mine_argv(req.backend, str(p), out, req.components, req.model,
+                       req.batch_size)]
+    label = f"encode · {req.backend} · {p.name} ({n} prompts)"
+    job = RUNNER.submit("mine", label, argv, exclusive=True)
+    return JSONResponse({"job_id": job.id, "label": label, "out": out})
+
+
+# --------------------------------------------------------------------------- #
+# Restore: put the sidebar back to what made an image
+# --------------------------------------------------------------------------- #
+# The form half (sidecar -> sidebar values) is frontend/src/params/fromSidecar.ts.
+# What lives here is what only the server can do: find the sidecar that actually
+# recorded the sampling (an upscale's records the upscale), and turn a recorded
+# checkpoint + --dist base back into the picker choices they came from.
+#: Sidecars that say how conditioning was made, as opposed to what was done to it.
+RESTORE_KINDS = ("generate", "explore", "evolve")
+#: What an explore child rendered with itself, whatever its ancestor used.
+EXPLORE_OWN_KEYS = ("model", "dist", "steps", "guidance", "scheduler", "neg_mode",
+                    "negative")
+RESTORE_MAX_HOPS = 16   # a corrupt sidecar must not be able to loop forever
+
+
+def _generation_chain(start: Path) -> list:
+    """``[(image, sidecar), ...]`` from an image back through what it came from."""
+    chain, seen, p = [], set(), start
+    while p is not None and p not in seen and len(chain) < RESTORE_MAX_HOPS:
+        seen.add(p)
+        try:
+            meta = json.loads(p.with_suffix(".json").read_text())
+        except (OSError, ValueError):
+            break
+        chain.append((p, meta))
+        if meta.get("kind") in ("generate", "evolve"):
+            break
+        parent = meta.get("refined_from") or meta.get("parent")
+        try:
+            p = _resolve_output_image(parent) if parent else None
+        except HTTPException:     # the ancestor was deleted; keep what we have
+            p = None
+    return chain
+
+
+def _restore_source(rel: str) -> tuple[Path, dict, list]:
+    """The conditions behind an image: ``(sampled image, params, warnings)``."""
+    start = _resolve_output_image(rel)
+    chain = _generation_chain(start)
+    usable = [(p, m) for p, m in chain if m.get("kind") in RESTORE_KINDS]
+    if not usable:
+        raise HTTPException(400, f"{start.name} records no sampling conditions "
+                                 f"(no sidecar from a generate, explore or evolve run)")
+    source, params = usable[-1][0], dict(usable[-1][1])
+    warnings = []
+    nearest = usable[0][1]
+    if nearest.get("kind") == "explore":
+        # Sampling knobs come from the generating ancestor; the sidebar has no way
+        # to spell the neighbourhood step on top of them, so say that out loud.
+        params.update({k: nearest[k] for k in EXPLORE_OWN_KEYS if k in nearest})
+        if params.get("kind") == "explore":
+            warnings.append("its generating ancestor is gone, so the sampler knobs "
+                            "are at their defaults")
+        else:
+            warnings.append(f"this is a {nearest.get('mode') or 'explore'} step from "
+                            f"{source.name} — restored that image's sampler knobs; "
+                            f"the step itself can't be set in the sidebar")
+    # Older sidecars recorded no size; the pixels are ground truth.
+    if not (params.get("width") and params.get("height")):
+        size = _image_size(source)
+        if size:
+            params["height"], params["width"] = size
+    return source, params, warnings
+
+
+def _restore_model(backend: str, recorded: Optional[str]) -> tuple:
+    """Re-select a recorded checkpoint: ``(sdxl dropdown key, warning)``."""
+    key = None
+    if not recorded:
+        return None, "no checkpoint recorded — kept the current one"
+    with _config_lock:
+        picked = load_model_config()
+        if recorded == "(default)" or recorded == MODEL_DEFAULTS[backend]:
+            picked.pop(backend, None)
+        elif backend == "sdxl" and recorded in SDXL_MODELS.values():
+            picked.pop(backend, None)
+        else:
+            try:
+                picked[backend] = str(validate_model_path(recorded))
+            except HTTPException:
+                return None, f"checkpoint {Path(recorded).name} is gone — kept the current one"
+        save_model_config(picked)
+    if backend == "sdxl":
+        key = next((k for k, v in SDXL_MODELS.items() if v == recorded), None)
+    return key, None
+
+
+def _dist_choice_for_base(backend: str, recorded: str,
+                          model_key: Optional[str]) -> tuple[str, Optional[str]]:
+    """Invert :func:`dist_base_for`: the picker choice a ``--dist`` base came from."""
+    base = Path(_abs_base(recorded)).resolve()
+    if base == Path(_abs_base(BASE_DIST)).resolve():
+        return "base", None
+    if base == Path(_abs_base(EVOLVED_DIST)).resolve():
+        return "evolved", None
+    # A corpus keeps its fit beside itself as <corpus>__<ckpt-slug>. Prefer naming
+    # the corpus: that is how it was picked, and it labels the sidebar properly.
+    if "__" in base.name:
+        corpus = base.with_name(base.name.rsplit("__", 1)[0] + dist_paths.PROMPTS_EXT)
+        if corpus.is_file():
+            mined = dist_base_for(backend, "prompts", str(corpus), model_key)
+            if Path(_abs_base(mined)).resolve() == base:
+                return "prompts", str(corpus)
+    return "file", str(dist_paths.dist_files(base, backend)[0])
+
+
+def _restore_dist(backend: str, recorded: Optional[str],
+                  model_key: Optional[str]) -> Optional[str]:
+    """Re-select a recorded distribution. Returns a warning if it can't be."""
+    if not recorded:
+        return "no distribution recorded — kept the current one"
+    name = Path(recorded).name
+    try:
+        kind, path = _dist_choice_for_base(backend, recorded, model_key)
+        if kind in ("prompts", "file"):
+            path = str(resolve_dist_file(path, kind))
+        ready = describe_dist(backend, kind, path, model_key)["ready"]
+    except HTTPException:
+        ready = False
+    if not ready:
+        return f"distribution {name} is no longer available — kept the current one"
+    with _config_lock:
+        cfg = load_dist_config()
+        cfg[backend] = {"kind": kind, "path": path}
+        save_dist_config(cfg)
+    return None
+
+
+class RestoreRequest(BaseModel):
+    rel: str
+
+
+@app.post("/api/restore")
+def api_restore(req: RestoreRequest) -> JSONResponse:
+    """Select the checkpoint + distribution behind an image, and return its knobs.
+
+    The pickers are server state, so this writes them; the knobs go back to the
+    client to pour into the form. Anything that no longer exists is reported and
+    left as it was rather than failing the rest: a deleted checkpoint shouldn't
+    cost you the sampler settings.
+    """
+    source, params, warnings = _restore_source(req.rel)
+    backend = params.get("backend") or _fit_backend_of(
+        source.relative_to(OUTPUTS.resolve()).as_posix())
+    if backend not in BACKENDS:
+        raise HTTPException(400, f"{source.name}: unknown backend {backend!r}")
+    params["backend"] = backend
+    key, warn = _restore_model(backend, params.get("model"))
+    warnings += [warn] if warn else []
+    # Before the distribution: a prompt corpus resolves per active checkpoint.
+    warn = _restore_dist(backend, params.get("dist"), key)
+    warnings += [warn] if warn else []
+    return JSONResponse({
+        "source": source.relative_to(OUTPUTS.resolve()).as_posix(),
+        "params": params,
+        "sdxl_model": key,
+        "warnings": warnings,
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Selection fits — a distribution fitted to the latents of images you picked
+# --------------------------------------------------------------------------- #
+# The other half of the base-distribution story. A mined fit answers "what does
+# this corpus of PROMPTS look like"; a selection fit answers "what do the images
+# I KEPT look like", using the .npz conditioning every generated image already
+# carries. No text encoder, no GPU — it is a stack-and-fit over files on disk,
+# which is why this can be a couple of seconds rather than a mining run.
+#
+# Everything here is selection plumbing: which images are candidates, which the
+# user picked, and handing that list to scripts/fit_selection.py. The fit itself
+# (and the naming rules the picker then reads back) lives in
+# semantic_anarchy/selection_fit.py.
+FIT_DIR = REPO / fitset.FIT_DIR
+#: Bound on one selection. Well past any hand-picked set; exists so a runaway
+#: client can't ask the server to stack 100k latents into RAM.
+MAX_FIT_IMAGES = 4000
+#: How the candidate list may be ordered.
+FIT_ORDERS = ("new", "old", "score", "distance")
+#: Which images may be fitted, by label score.
+FIT_SCORED = ("any", "labeled", "unlabeled")
+
+
+def _fit_rows(filters: dict, since: Optional[float], until: Optional[float],
+              starred: bool, scored: str, min_score: Optional[int],
+              max_score: Optional[int], latents_only: bool = True,
+              tag: str = "") -> list:
+    """Candidate images for a fit, with their label score and star.
+
+    Deliberately the SAME index the labeling queue is built from
+    (:func:`_label_index`), so "everything from experiment E07 rendered in the
+    last 24h" means one thing in both places. What this adds on top is the label
+    score (the point of labeling being to select with it) and the star.
+    """
+    scores = labeled_scores()
+    favs = load_favs()
+    tag_map = current_tags()
+    keep = _tag_filter(tag_map, (tag or "").strip())
+    out = []
+    for row in _select(_label_index(), filters, since, until):
+        if latents_only and not row.get("latents"):
+            continue
+        if keep is not None and not keep(row["rel"]):
+            continue
+        fav = row["rel"] in favs
+        if starred and not fav:
+            continue
+        score = scores.get(row["rel"])
+        if scored == "labeled" and score is None:
+            continue
+        if scored == "unlabeled" and score is not None:
+            continue
+        # A score threshold only ever admits scored images — "8 and up" cannot
+        # sensibly include the ones nobody has judged.
+        if min_score is not None and (score is None or score < min_score):
+            continue
+        if max_score is not None and (score is None or score > max_score):
+            continue
+        out.append({**row, "score": score, "fav": fav,
+                    "tags": tag_map.get(row["rel"], [])})
+    return out
+
+
+@app.get("/api/fit/candidates")
+def api_fit_candidates(backend: Optional[str] = None, experiment: Optional[str] = None,
+                       ckpt: Optional[str] = None, folder: Optional[str] = None,
+                       size: Optional[str] = None, kind: Optional[str] = None,
+                       sampler: Optional[str] = None, tag: Optional[str] = None,
+                       since: Optional[float] = None, until: Optional[float] = None,
+                       starred: bool = False, scored: str = "any",
+                       min_score: Optional[int] = None,
+                       max_score: Optional[int] = None,
+                       order: str = "new", limit: int = 600) -> JSONResponse:
+    """Which images match a filter, and how many — the `n` in "fit on n samples".
+
+    ``total`` is the whole match; ``rows`` is capped so a 10k-image filter still
+    renders. The count the button shows is over what the user actually selected,
+    which the client tracks — this is what fills the pool to select *from*.
+    """
+    if order not in FIT_ORDERS:
+        raise HTTPException(400, f"bad order {order!r}")
+    if scored not in FIT_SCORED:
+        raise HTTPException(400, f"bad scored {scored!r}")
+    if backend is not None and backend and backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    filters = {
+        "experiment": (experiment or "").strip(),
+        "backend": (backend or "").strip(),
+        "ckpt": (ckpt or "").strip(),
+        "folder": (folder or "").strip(),
+        "size": (size or "").strip(),
+        "kind": (kind or "").strip(),
+        "sampler": (sampler or "").strip(),
+    }
+    rows = _fit_rows(filters, since, until, starred, scored, min_score, max_score,
+                     tag=(tag or "").strip())
+    if order == "old":
+        rows.sort(key=lambda r: r["mtime"])
+    elif order == "score":
+        rows.sort(key=lambda r: (r["score"] if r["score"] is not None else -1,
+                                 r["mtime"]), reverse=True)
+    elif order == "distance":
+        rows.sort(key=lambda r: (r["distance"] if r["distance"] is not None else -1),
+                  reverse=True)
+    else:
+        rows.sort(key=lambda r: r["mtime"], reverse=True)
+    capped = max(1, min(2000, limit))
+    return JSONResponse({
+        "total": len(rows),
+        "shown": min(len(rows), capped),
+        "rows": rows[:capped],
+        "backends": sorted({r["backend"] for r in rows if r["backend"]}),
+    })
+
+
+def _fit_backend_of(rel: str) -> Optional[str]:
+    """Which backend an image came from (sidecar first, filename second)."""
+    b = sidecar_for(rel).get("backend")
+    if b in BACKENDS:
+        return b
+    for name in BACKENDS:
+        if f"anarchy_{name}_" in Path(rel).name:
+            return name
+    return None
+
+
+def _fit_row(base: Path, backend: Optional[str]) -> dict:
+    """One saved fit, told what the picker needs: is it there, and what is in it."""
+    man = fitset.read_manifest(base) or {}
+    b = backend or man.get("backend")
+    files = [str(f) for f in (dist_paths.dist_files(base, b) if b else [])]
+    meta = dist_paths.dist_meta(base, b) if b else None
+    return {
+        "name": man.get("name") or base.name,
+        "base": str(base),
+        "backend": man.get("backend"),
+        "created": man.get("created"),
+        "n_samples": man.get("n_samples"),
+        "note": man.get("note"),
+        "models": man.get("models") or [],
+        "ready": bool(files) and all(Path(f).is_file() for f in files),
+        "files": files,
+        "meta": meta,
+    }
+
+
+@app.get("/api/fit/list")
+def api_fit_list(backend: Optional[str] = None) -> JSONResponse:
+    """Every saved selection fit, newest first (the picker's third section)."""
+    if backend is not None and backend and backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
+    if not FIT_DIR.is_dir():
+        return JSONResponse([])
+    rows = [_fit_row(Path(str(m)[: -len(fitset.MANIFEST_SUFFIX)]), backend or None)
+            for m in FIT_DIR.glob(f"*{fitset.MANIFEST_SUFFIX}")]
+    rows.sort(key=lambda r: r.get("created") or 0, reverse=True)
+    return JSONResponse(rows)
+
+
+class FitRequest(BaseModel):
+    name: str
+    rels: list[str] = []              # outputs-relative image paths
+    backend: Optional[str] = None     # None = inferred from the selection
+    components: Optional[int] = None  # None/0 = the selection's full N-1 rank
+    note: Optional[str] = None
+    overwrite: bool = False
+
+
+def _fit_target(name: str) -> Path:
+    """Sandbox a fit name to the fits directory (no traversal, no absolutes)."""
+    slug = fitset.slug_name(name)
+    if not slug:
+        raise HTTPException(400, "give the fit a name (letters, digits, - and _)")
+    target = (FIT_DIR / slug).resolve()
+    if FIT_DIR.resolve() not in target.parents:
+        raise HTTPException(400, f"bad fit name {name!r}")
+    return target
+
+
+@app.post("/api/fit")
+def api_fit(req: FitRequest) -> JSONResponse:
+    """Fit a distribution to the latents of the picked images.
+
+    The selection travels as a JSON file rather than argv — a few hundred paths
+    is normal here — and every path is resolved through the same outputs/
+    sandbox the rest of the API uses before it is written there.
+    """
+    if req.backend is not None and req.backend and req.backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {req.backend!r}")
+    rels = list(dict.fromkeys(r for r in req.rels if r))   # de-dup, keep order
+    if not rels:
+        raise HTTPException(400, "nothing selected")
+    if len(rels) > MAX_FIT_IMAGES:
+        raise HTTPException(400, f"{len(rels)} images selected — the cap is "
+                                 f"{MAX_FIT_IMAGES}")
+    target = _fit_target(req.name)
+    base = str(target.relative_to(REPO)) if REPO in target.parents else str(target)
+
+    paths, backends = [], {}
+    for rel in rels:
+        p = _resolve_output_image(rel)
+        paths.append(str(p))
+        b = _fit_backend_of(p.relative_to(OUTPUTS.resolve()).as_posix())
+        if b:
+            backends[b] = backends.get(b, 0) + 1
+    backend = req.backend or (max(backends, key=backends.get) if backends else None)
+    if not backend:
+        raise HTTPException(400, "could not tell which backend these images are "
+                                 "from — pick one explicitly")
+    if len(backends) > 1:
+        # Conditioning shapes differ per backend, so the minority would be
+        # dropped by the fit anyway. Say so here instead of in a job log.
+        others = ", ".join(f"{k}×{v}" for k, v in backends.items() if k != backend)
+        raise HTTPException(400, f"the selection mixes backends ({others} alongside "
+                                 f"{backend}×{backends[backend]}) — a fit is per "
+                                 f"backend, so filter to one first")
+    if len(paths) < fitset.MIN_SAMPLES:
+        raise HTTPException(400, f"{len(paths)} image(s) selected — a fit needs at "
+                                 f"least {fitset.MIN_SAMPLES}")
+
+    existing = dist_paths.dist_files(target, backend)
+    if not req.overwrite and any(f.is_file() for f in existing):
+        raise HTTPException(409, f"“{target.name}” already exists — rename it or "
+                                 f"confirm the overwrite")
+
+    FIT_DIR.mkdir(parents=True, exist_ok=True)
+    sources = target.with_name(target.name + ".sources.json")
+    sources.write_text(json.dumps(paths, indent=1))
+
+    argv = [PYTHON, "-u", "scripts/fit_selection.py",
+            "--backend", backend, "--name", target.name,
+            "--dir", str(FIT_DIR.relative_to(REPO)),
+            "--from-file", str(sources)]
+    if req.components:
+        argv += ["--components", str(int(req.components))]
+    if req.note:
+        argv += ["--note", _clean_prompt(req.note)]
+    label = f"fit · {backend} · {target.name} ({len(paths)} images)"
+    job = RUNNER.submit("fit", label, argv)
+    return JSONResponse({
+        "job_id": job.id, "label": label, "name": target.name,
+        "base": base, "backend": backend, "n": len(paths),
+        # What to hand /api/dist once the job lands, so the client can select
+        # the new fit without knowing the naming stack.
+        "file": str(dist_paths.dist_files(target, backend)[0]),
+    })
+
+
+class FitDeleteRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/fit/delete")
+def api_fit_delete(req: FitDeleteRequest) -> JSONResponse:
+    """Delete a saved fit (its .npz set, meta, manifest and source list)."""
+    target = _fit_target(req.name)
+    removed = []
+    # Which backend wrote it isn't recorded in the *filenames* the caller knows,
+    # so sweep every backend's naming stack — a name only ever holds one fit.
+    cands = [target.with_name(target.name + suffix)
+             for suffix in (fitset.MANIFEST_SUFFIX, ".sources.json")]
+    for b in BACKENDS:
+        for f in dist_paths.dist_files(target, b):
+            cands += [f, f.with_suffix(".meta.json")]
+    for f in cands:
+        try:
+            if f.is_file():
+                f.unlink()
+                removed.append(str(f))
+        except OSError as exc:
+            raise HTTPException(500, f"could not delete {f.name}: {exc}")
+    if not removed:
+        raise HTTPException(404, f"no fit named {target.name!r}")
+    return JSONResponse({"deleted": removed})
 
 
 class BrowseRequest(BaseModel):
@@ -2004,9 +3798,21 @@ def api_model_native(req: BrowseRequest) -> JSONResponse:
 
 
 @app.get("/api/fs")
-def api_fs(path: Optional[str] = None) -> JSONResponse:
-    """One directory listing for the in-browser fallback picker: subfolders plus
-    single-file checkpoints, sandboxed to browse_roots()."""
+def api_fs(path: Optional[str] = None, pick: str = "model",
+           backend: Optional[str] = None, model: Optional[str] = None) -> JSONResponse:
+    """One directory listing for the in-browser pickers, sandboxed to
+    browse_roots().
+
+    ``pick=model`` (default) lists subfolders + single-file checkpoints;
+    ``pick=dist`` lists subfolders + prompt corpora (.txt) and saved fits
+    (.npz). In dist mode a ``backend`` marks each corpus ``ready`` when its
+    latents for the active checkpoint already exist — so "needs encoding" is
+    visible while browsing, before anything is picked.
+    """
+    if pick not in ("model", "dist"):
+        raise HTTPException(400, f"unknown pick mode {pick!r}")
+    if backend is not None and backend not in BACKENDS:
+        raise HTTPException(400, f"unknown backend {backend!r}")
     here = resolve_browse_path(path)
     roots = browse_roots()
     entries = []
@@ -2020,8 +3826,16 @@ def api_fs(path: Optional[str] = None) -> JSONResponse:
         try:
             if c.is_dir():
                 entries.append({"name": c.name, "path": str(c), "dir": True,
-                                "kind": path_kind(c), "size": None})
-            elif c.suffix.lower() in CKPT_EXTS:
+                                "kind": None if pick == "dist" else path_kind(c),
+                                "size": None})
+            elif pick == "dist" and c.suffix.lower() in DIST_EXTS:
+                row = {"name": c.name, "path": str(c), "dir": False,
+                       "kind": dist_kind_for(str(c)), "size": c.stat().st_size}
+                if backend and row["kind"] == "prompts":
+                    base = dist_base_for(backend, "prompts", str(c), model)
+                    row["ready"] = dist_paths.dist_ready(_abs_base(base), backend)
+                entries.append(row)
+            elif pick == "model" and c.suffix.lower() in CKPT_EXTS:
                 entries.append({"name": c.name, "path": str(c), "dir": False,
                                 "kind": "ckpt", "size": c.stat().st_size})
         except OSError:
@@ -2149,7 +3963,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div id="ckptHint" class="hint"></div>
     <label title="which learned distribution to sample from">Distribution</label>
     <select id="distSel">
-      <option value="base">base corpus</option>
+      <option value="base">selected distribution (set in the React UI)</option>
       <option value="evolved">evolved ★ branch (from 🧪)</option>
     </select>
 
@@ -2241,11 +4055,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <select id="equalize"><option value="">off</option><option value="1">on (express minor axes)</option></select></div>
       </div>
       <div class="hint">For non-standard subjects: sampler <b>pca</b>, comp-lo ~40–200, equalize <b>on</b>, temp ~1.1–1.4.</div>
-      <label>SDXL neg-mode</label>
+      <label>neg-mode</label>
       <select id="neg_mode">
-        <option value="">auto</option><option value="mean">mean</option>
+        <option value="">auto</option><option value="text">text (house negative)</option>
+        <option value="mean">mean</option>
         <option value="empty">empty</option><option value="zeros">zeros</option>
       </select>
+      <label>negative prompt <span class="hint">(sd15/sd2)</span></label>
+      <textarea id="negative" rows="4" spellcheck="false"
+                style="width:100%;font:inherit;font-size:12px"></textarea>
+      <div class="hint">Prefilled with the house SD1.5 negative — edit freely.
+        Clear the box to fall back to it; use neg-mode <b>empty</b> for no
+        negative text at all.</div>
     </details>
 
     <button class="run" id="runBtn">Run ▶</button>
@@ -2457,6 +4278,8 @@ $("#runBtn").onclick = async () => {
     coherence: numOrNull("coherence"), components: numOrNull("components"),
     truncation: numOrNull("truncation"),
     neg_mode: $("#neg_mode").value || null,
+    // blank = don't pass --negative at all, i.e. keep the script's own default.
+    negative: $("#negative").value.trim() || null,
     dist: $("#distSel").value,
     target_distance: numOrNull("target_distance"),
     temps: $("#temps").value.trim() || null,
@@ -2731,7 +4554,9 @@ async function refineImage(name, btn) {
 const PARAM_ORDER = ["kind","mode","parent","parent_b","distance","anchor_distance","radius","mutate",
   "direction","step","turn","walk_frame","target_distance","elites","base_blend","dist",
   "backend","model","sampler","temperature","coherence",
-  "components","comp_lo","equalize","truncation","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
+  "components","comp_lo","equalize","truncation",
+  "rho","length_mode","length","empirical_head","temp_on","temp_off",
+  "radius_band","radius_scale","steps","guidance","scheduler","neg_mode","height","width","init_image","init_mode","init_strength","ip_scale",
   "batch_seed","image_seed","index","refined_from","cond_from","engine","factor","denoise",
   "denoise_steps","interp","scale","strength","cond_reused","src_size","out_size","seed"];
 let currentRel = null, currentScore = null;
@@ -2912,6 +4737,9 @@ $(".main").addEventListener("scroll", maybeLoadMore, {passive: true});
 
 (async () => {
   try { window._cfg = await (await fetch("/api/config")).json(); } catch(e){}
+  // Show the real negative prompt in the box, not just its name — it's the one
+  // string a "promptless" run still writes, so it should be readable and editable.
+  if (!$("#negative").value) $("#negative").value = (window._cfg || {}).sd15_negative || "";
   populateInitFolders(); syncForm(); refreshImages(); poll(); refreshBand();
   setInterval(refreshBand, 20000);
   setInterval(poll, 1500);
