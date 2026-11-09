@@ -32,90 +32,64 @@ export function SavedFits() {
 
   const rows = fits ?? []
 
+  // One wrapping row of pills: the name is the "use" button, details live in
+  // the tooltip, 🗑 deletes. The list only needs to answer "which fits exist,
+  // which is in use".
   return (
-    <section className="sa-panel shrink-0 px-3 py-2.5">
-      <div className="flex items-baseline gap-2">
-        <h2 className="m-0 text-[12px] uppercase tracking-[0.8px] text-dim">Saved fits</h2>
-        <span className="text-[11px] text-dim">outputs/dist_fits · {rows.length}</span>
-        {del.isError ? (
-          <span className="text-[11px] text-err">{(del.error as Error).message}</span>
-        ) : null}
-      </div>
-
+    <section className="flex shrink-0 flex-wrap items-center gap-1.5 px-1 text-[12px]">
+      <span className="text-dim">Saved fits</span>
       {!rows.length ? (
-        <p className="sa-hint">
-          none yet — pick images above and fit one. It then shows up here and in the
-          sidebar’s “Select base distribution…”.
-        </p>
-      ) : (
-        <div className="mt-1.5 flex flex-col gap-1">
-          {rows.map((f) => {
-            const active = current?.base === f.base || current?.path === f.files[0]
-            return (
-              <div
-                key={f.base}
-                className={cn(
-                  'flex flex-wrap items-center gap-2 rounded-md border px-2 py-1.5 text-[12px]',
-                  active ? 'border-run bg-panel2' : 'border-line',
-                )}
-              >
-                <span className="shrink-0">🧬</span>
-                <span className="min-w-0 flex-1 truncate text-[13px] text-ink" title={f.base}>
-                  {f.name}
-                </span>
-                <span className="shrink-0 text-dim tabular-nums">
-                  {f.n_samples ?? '?'} images
-                </span>
-                {f.backend ? <span className="shrink-0 text-dim">{f.backend}</span> : null}
-                {f.meta ? (
-                  <span className="shrink-0 text-dim">
-                    {f.meta.feature_shape.join('×')}
-                  </span>
-                ) : null}
-                <span className="shrink-0 text-dim">{when(f.created)}</span>
-                {f.note ? (
-                  <span className="min-w-0 basis-full truncate text-dim" title={f.note}>
-                    {f.note}
-                  </span>
-                ) : null}
-                {!f.ready ? (
-                  <span className="shrink-0 text-err">files missing</span>
-                ) : active ? (
-                  <span className="shrink-0 text-run">in use</span>
-                ) : (
-                  <button
-                    className="sa-btn sa-btn-sm shrink-0"
-                    disabled={setDist.isPending || f.backend !== backend}
-                    title={
-                      f.backend !== backend
-                        ? `fitted on ${f.backend} — switch the backend to use it`
-                        : 'sample from this fit'
-                    }
-                    onClick={() =>
-                      setDist.mutate({
-                        backend,
-                        kind: 'file',
-                        path: f.files[0],
-                        model: backend === 'sdxl' ? modelKey : null,
-                      })
-                    }
-                  >
-                    use
-                  </button>
-                )}
-                <button
-                  className="sa-btn sa-btn-sm shrink-0"
-                  title="delete this fit"
-                  disabled={del.isPending}
-                  onClick={() => setPendingDelete(f)}
-                >
-                  🗑
-                </button>
-              </div>
-            )
-          })}
-        </div>
-      )}
+        <span className="text-dim">— none yet; a fit shows up here and in the sidebar’s distribution picker</span>
+      ) : null}
+      {rows.map((f) => {
+        const active = current?.base === f.base || current?.path === f.files[0]
+        const other = f.backend !== backend
+        const info =
+          `${f.n_samples ?? '?'} images · ${f.backend ?? '?'}` +
+          (f.meta ? ` · ${f.meta.feature_shape.join('×')}` : '') +
+          ` · ${when(f.created)}` +
+          (f.note ? `\n${f.note}` : '')
+        return (
+          <span
+            key={f.base}
+            className={cn(
+              'group inline-flex items-center overflow-hidden rounded-full border',
+              active ? 'border-run bg-panel2' : 'border-line',
+            )}
+          >
+            <button
+              className={cn('px-2 py-[2px]', active ? 'text-run' : 'text-ink hover:text-run',
+                (!f.ready || other) && 'cursor-not-allowed opacity-60')}
+              disabled={active || !f.ready || other || setDist.isPending}
+              title={
+                !f.ready ? `files missing — ${info}`
+                  : other ? `fitted on ${f.backend} — switch the backend to use it\n${info}`
+                    : active ? `in use — ${info}` : `sample from this fit — ${info}`
+              }
+              onClick={() =>
+                setDist.mutate({
+                  backend,
+                  kind: 'file',
+                  path: f.files[0],
+                  model: backend === 'sdxl' ? modelKey : null,
+                })
+              }
+            >
+              🧬 {f.name} <span className="tabular-nums text-dim">{f.n_samples ?? '?'}</span>
+              {active ? <span className="ml-1">· in use</span> : null}
+            </button>
+            <button
+              className="border-l border-line px-1.5 py-[2px] text-dim hover:text-err"
+              title="delete this fit"
+              disabled={del.isPending}
+              onClick={() => setPendingDelete(f)}
+            >
+              ×
+            </button>
+          </span>
+        )
+      })}
+      {del.isError ? <span className="text-err">{(del.error as Error).message}</span> : null}
 
       <Confirm
         open={pendingDelete != null}

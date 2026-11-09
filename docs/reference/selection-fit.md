@@ -94,12 +94,17 @@ list, which is what makes "these six, plus everything I starred yesterday" a
 thing you can express.
 
 That persistence is also a trap: picks from an earlier filter stay selected but
-are invisible in the matching grid, so "fit on 90" over 12 checkmarks looked
-like a bug. Hence "select only these N" *replaces* the selection (adding is the
-separate "＋ add them" button), and `FitPage` names any selected images outside
-the current filter with a one-click drop. The universe (`tag`) filter is a chip
+are invisible in the matching grid, and "fit on 90" over 12 checkmarks read as
+a bug. Rule: **the fit uses exactly the checkmarks on screen** (`fitRels` in
+`FitPage`) — in the matching view, picks outside the filter are kept in
+`fitSel` but left out of the fit and named in one dim line ("+N more picked
+under other filters — forget them / show all"); the "all picked" view shows and
+fits all of them. "✓ check all N" only ever adds. The header 🧬 Fit ★ badge
+carries no pick count (next to the ★ it read as "N starred"). The universe (`tag`) filter is a chip
 row on top of `FitFilters`, not a dropdown — fitting one universe is the
-commonest reason to open the tab.
+commonest reason to open the tab. Below it only ★ / keepers / time window are
+always visible; every other facet folds under "more filters" and, while folded,
+shows as a removable chip when active, so folding never hides why a grid is short.
 
 → related: [labeling.md](labeling.md) (where the scores come from),
 [sampler-knobs.md](sampler-knobs.md) (what to do with the fit once you have it)

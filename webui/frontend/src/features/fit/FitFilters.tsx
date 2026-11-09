@@ -7,6 +7,8 @@
  * gallery. What this adds is the two dimensions you select *by* once you have
  * labeled: the star and the label-score band.
  */
+import { useState } from 'react'
+
 import { useLabelFacets } from '../../api/queries'
 import type { FacetCell, FacetDim } from '../../api/types'
 import { UNSET } from '../../api/types'
@@ -92,6 +94,9 @@ export function FitFilters({ matched }: { matched?: number }) {
   const setFit = useUI((s) => s.setFit)
   const reset = useUI((s) => s.resetFitFilters)
   const { data: facets } = useLabelFacets()
+  // Everything but the universe, the star, the keeper band and the time window
+  // folds away: those four are what a fit is usually chosen by.
+  const [more, setMore] = useState(false)
 
   const activeWindow = (() => {
     if (!fit.since && !fit.until) return 'all time'
@@ -103,23 +108,47 @@ export function FitFilters({ matched }: { matched?: number }) {
 
   // Frozen to an absolute instant on click, exactly as the labeling queue does:
   // a `since` that tracked the clock would refetch on every render.
-  const pickWindow = (hours: number | null) => {
-    setFit('since', hours == null ? '' : String(Math.floor(Date.now() / 1000 - hours * 3600)))
+  const pickWindow = (label: string) => {
+    const w = WINDOWS.find((x) => x.label === label)
+    if (!w) return setMore(true) // "custom" lives with the date inputs
+    setFit('since', w.hours == null ? '' : String(Math.floor(Date.now() / 1000 - w.hours * 3600)))
     setFit('until', '')
   }
 
-
+  const keepers = fit.minScore === String(KEEPER_MIN) && !fit.maxScore
   const tagCount = facets?.facets?.tag?.find((c) => c.value === fit.tag)?.count ?? 0
   const otherFilters = ['experiment', ...DIMS.map((d) => d.dim), 'since', 'until', 'starred',
     'minScore', 'maxScore'].some((k) => fit[k]) || fit.scored !== 'any'
   const dirty = !!fit.tag || otherFilters
 
+  // The folded filters that are ON, as removable chips — so folding never hides
+  // why the grid is smaller than the universe.
+  const hidden: { key: string; text: string; clear: () => void }[] = [
+    ...(['experiment', ...DIMS.map((d) => d.dim)] as string[])
+      .filter((k) => fit[k])
+      .map((k) => ({
+        key: k,
+        text: fit[k] === UNSET ? `${k}: none` : fit[k],
+        clear: () => setFit(k, ''),
+      })),
+    ...((fit.minScore || fit.maxScore) && !keepers
+      ? [{
+          key: 'score', text: `score ${fit.minScore || '0'}–${fit.maxScore || '9'}`,
+          clear: () => { setFit('minScore', ''); setFit('maxScore', '') },
+        }]
+      : []),
+    ...(fit.scored !== 'any'
+      ? [{ key: 'scored', text: fit.scored, clear: () => setFit('scored', 'any') }]
+      : []),
+  ]
+
+  const win = activeWindow
   return (
-    <div className="sa-panel shrink-0 px-3 py-2.5">
+    <div className="sa-panel shrink-0 px-3 py-2">
       {/* One click = "the images of this universe". Counts are over the whole
           gallery; the grid below then keeps only those that carry latents. */}
-      <div className="mb-2 flex flex-wrap items-center gap-1.5 border-b border-line pb-2">
-        <span className="mr-1 text-[12px] text-ink">🪐 Universe</span>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="mr-0.5 text-[12px] text-dim">🪐 universe</span>
         <button
           className={cn('sa-btn sa-btn-sm', !fit.tag && 'sa-btn-sel')}
           onClick={() => setFit('tag', '')}
@@ -133,28 +162,82 @@ export function FitFilters({ matched }: { matched?: number }) {
             <button
               key={c.value}
               className={cn('sa-btn sa-btn-sm inline-flex items-center gap-1.5', on && 'sa-btn-sel')}
-              onClick={() => setFit('tag', on ? '' : c.value)}
+              onClick={() => {
+                setFit('tag', on ? '' : c.value)
+                // A name typed for another set would overwrite that fit; let
+                // the placeholder ("<universe>-MMDD-HHMM") take over instead.
+                setFit('name', '')
+              }}
               title={none ? 'images in no universe yet' : `only images in “${c.value}”`}
             >
               {none ? null : (
                 <span className="h-2 w-2 rounded-full" style={{ background: universeColor(c.value) }} />
               )}
-              {none ? '(no universe)' : c.value}
+              {none ? 'no universe' : c.value}
               <span className="tabular-nums text-dim">{c.count}</span>
             </button>
           )
         })}
         {!facets?.facets?.tag?.length ? (
           <span className="text-[12px] text-dim">
-            none yet — tag images into a universe from any card or the viewer
+            no universes yet — tag images from any card or the viewer
           </span>
         ) : null}
-        {/* "abstract 12" but 5 match: say the other filters are why, and offer
-            the one click that shows the whole universe. (Images without latents,
-            e.g. upscales, never match — that part of a gap can't be cleared.) */}
-        {fit.tag && matched != null && otherFilters && matched < tagCount ? (
-          <span className="ml-auto flex items-center gap-1.5 text-[12px] text-dim">
-            {matched} of {tagCount} match with the other filters below
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        <button
+          className={cn('sa-btn sa-btn-sm', fit.starred === '1' && 'sa-btn-sel')}
+          onClick={() => setFit('starred', fit.starred === '1' ? '' : '1')}
+          title="only images you starred"
+        >
+          ★ starred
+        </button>
+        <button
+          className={cn('sa-btn sa-btn-sm', keepers && 'sa-btn-sel')}
+          onClick={() => {
+            setFit('minScore', keepers ? '' : String(KEEPER_MIN))
+            setFit('maxScore', '')
+          }}
+          title={`only images you scored ${KEEPER_MIN} or higher`}
+        >
+          keepers {KEEPER_MIN}+
+        </button>
+        <Select
+          value={win}
+          onChange={pickWindow}
+          options={[
+            ...WINDOWS.map((w) => ({ value: w.label, label: w.label === 'all time' ? 'any time' : `last ${w.label}` })),
+            ...(win === 'custom' ? [{ value: 'custom', label: 'custom range' }] : []),
+          ]}
+          ariaLabel="rendered within"
+          className="!w-[118px] !py-[3px] !text-[12px]"
+        />
+        <button
+          className={cn('sa-btn sa-btn-sm', more && 'sa-btn-sel')}
+          onClick={() => setMore((v) => !v)}
+          aria-expanded={more}
+        >
+          {more ? '▾' : '▸'} more filters
+        </button>
+        {!more
+          ? hidden.map((h) => (
+              <button
+                key={h.key}
+                className="inline-flex items-center gap-1 rounded-full border border-line2 px-2 py-px
+                           text-[11px] text-dim hover:border-err hover:text-ink"
+                onClick={h.clear}
+                title="active filter — click to remove"
+              >
+                {h.text} <span aria-hidden>×</span>
+              </button>
+            ))
+          : null}
+
+        <span className="ml-auto flex items-center gap-2 text-[12px] text-dim">
+          {/* "abstract 12" but 5 match: name the other filters as the reason.
+              (Images without latents, e.g. upscales, never match.) */}
+          {fit.tag && matched != null && otherFilters && matched < tagCount ? (
             <button
               className="sa-btn sa-btn-sm"
               onClick={() => {
@@ -162,143 +245,109 @@ export function FitFilters({ matched }: { matched?: number }) {
                 reset()
                 setFit('tag', tag)
               }}
+              title="the other filters hide part of this universe"
             >
-              clear the others
+              show all {tagCount} in this universe
             </button>
+          ) : null}
+          <span>
+            <span className="tabular-nums text-ink">{matched ?? '…'}</span> match
           </span>
-        ) : null}
+          {dirty ? (
+            <button className="text-dim underline-offset-2 hover:text-ink hover:underline" onClick={reset}>
+              reset
+            </button>
+          ) : null}
+        </span>
       </div>
 
-      <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
-        <div style={{ width: 170 }}>
-          <span className="sa-label !mt-0">Experiment</span>
-          <Select
-            value={fit.experiment}
-            onChange={(v) => setFit('experiment', v)}
-            options={facetOptions(facets?.facets?.experiment, 'any experiment')}
-            ariaLabel="Experiment"
-            className="!py-[5px] !text-[12px]"
-          />
-        </div>
-        {DIMS.map(({ dim, label, any, width }) => (
-          <div key={dim} style={{ width }}>
-            <span className="sa-label !mt-0">{label}</span>
+      {more ? (
+        <div className="mt-2 flex flex-wrap items-end gap-x-3 gap-y-2 border-t border-line pt-2">
+          <div style={{ width: 170 }}>
+            <span className="sa-label !mt-0">Experiment</span>
             <Select
-              value={fit[dim] ?? ''}
-              onChange={(v) => setFit(dim, v)}
-              options={facetOptions(facets?.facets?.[dim], any)}
-              ariaLabel={label}
-              className="!py-[5px] !text-[12px]"
+              value={fit.experiment}
+              onChange={(v) => setFit('experiment', v)}
+              options={facetOptions(facets?.facets?.experiment, 'any experiment')}
+              ariaLabel="Experiment"
+              className="!py-[4px] !text-[12px]"
             />
           </div>
-        ))}
-        <div style={{ width: 140 }}>
-          <span className="sa-label !mt-0">Order</span>
-          <Select
-            value={fit.order}
-            onChange={(v) => setFit('order', v)}
-            options={ORDERS}
-            ariaLabel="order"
-            className="!py-[5px] !text-[12px]"
-          />
+          {DIMS.map(({ dim, label, any, width }) => (
+            <div key={dim} style={{ width }}>
+              <span className="sa-label !mt-0">{label}</span>
+              <Select
+                value={fit[dim] ?? ''}
+                onChange={(v) => setFit(dim, v)}
+                options={facetOptions(facets?.facets?.[dim], any)}
+                ariaLabel={label}
+                className="!py-[4px] !text-[12px]"
+              />
+            </div>
+          ))}
+          <div>
+            <span className="sa-label !mt-0">Label score</span>
+            <div className="flex items-center gap-1">
+              <Select
+                value={fit.minScore}
+                onChange={(v) => setFit('minScore', v)}
+                options={scoreOptions('any')}
+                ariaLabel="minimum label score"
+                className="!w-[70px] !py-[4px] !text-[12px]"
+              />
+              <span className="text-[12px] text-dim">–</span>
+              <Select
+                value={fit.maxScore}
+                onChange={(v) => setFit('maxScore', v)}
+                options={scoreOptions('any')}
+                ariaLabel="maximum label score"
+                className="!w-[70px] !py-[4px] !text-[12px]"
+              />
+              <Select
+                value={fit.scored}
+                onChange={(v) => setFit('scored', v)}
+                options={SCORED}
+                ariaLabel="labeled or not"
+                className="!w-[140px] !py-[4px] !text-[12px]"
+              />
+            </div>
+          </div>
+          <div>
+            <span className="sa-label !mt-0">Rendered between</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="datetime-local"
+                className="sa-input !w-[176px] !py-[3px] !text-[12px]"
+                value={toLocalInput(fit.since)}
+                onChange={(e) => setFit('since', fromLocalInput(e.target.value))}
+              />
+              <span className="text-[12px] text-dim">–</span>
+              <input
+                type="datetime-local"
+                className="sa-input !w-[176px] !py-[3px] !text-[12px]"
+                value={toLocalInput(fit.until)}
+                onChange={(e) => setFit('until', fromLocalInput(e.target.value))}
+              />
+            </div>
+          </div>
+          <div style={{ width: 140 }}>
+            <span className="sa-label !mt-0">Order</span>
+            <Select
+              value={fit.order}
+              onChange={(v) => setFit('order', v)}
+              options={ORDERS}
+              ariaLabel="order"
+              className="!py-[4px] !text-[12px]"
+            />
+          </div>
+          {/* A score band only ever admits scored images. */}
+          {(fit.minScore || fit.maxScore) && fit.scored === 'unlabeled' ? (
+            <span className="basis-full text-[11px] text-err">
+              a score band and “unlabeled only” can never overlap
+            </span>
+          ) : null}
         </div>
-      </div>
-
-      {/* the two taste dimensions: what you starred, and what you scored */}
-      <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-line pt-2">
-        <button
-          className={cn('sa-btn sa-btn-sm', fit.starred === '1' && 'sa-btn-sel')}
-          onClick={() => setFit('starred', fit.starred === '1' ? '' : '1')}
-          title="only images you starred"
-        >
-          ★ starred only
-        </button>
-        <span className="ml-1 text-[12px] text-dim">Label score</span>
-        <Select
-          value={fit.minScore}
-          onChange={(v) => setFit('minScore', v)}
-          options={scoreOptions('any')}
-          ariaLabel="minimum label score"
-          title="lowest label score to include"
-          className="!w-[86px] !py-[4px] !text-[12px]"
-        />
-        <span className="text-[12px] text-dim">to</span>
-        <Select
-          value={fit.maxScore}
-          onChange={(v) => setFit('maxScore', v)}
-          options={scoreOptions('any')}
-          ariaLabel="maximum label score"
-          title="highest label score to include"
-          className="!w-[86px] !py-[4px] !text-[12px]"
-        />
-        <button
-          className={cn('sa-btn sa-btn-sm',
-            fit.minScore === String(KEEPER_MIN) && !fit.maxScore && 'sa-btn-sel')}
-          onClick={() => {
-            setFit('minScore', String(KEEPER_MIN))
-            setFit('maxScore', '')
-          }}
-          title={`the keeper band — score ${KEEPER_MIN} and up`}
-        >
-          keepers {KEEPER_MIN}+
-        </button>
-        <Select
-          value={fit.scored}
-          onChange={(v) => setFit('scored', v)}
-          options={SCORED}
-          ariaLabel="labeled or not"
-          className="!w-[150px] !py-[4px] !text-[12px]"
-        />
-        {/* A score band only ever admits scored images, so say so rather than
-            letting an empty grid look like a bug. */}
-        {(fit.minScore || fit.maxScore) && fit.scored === 'unlabeled' ? (
-          <span className="text-[11px] text-err">
-            a score band and “unlabeled only” can never overlap
-          </span>
-        ) : null}
-      </div>
-
-      <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-line pt-2">
-        <span className="text-[12px] text-dim">Rendered</span>
-        {WINDOWS.map((w) => (
-          <button
-            key={w.label}
-            className={cn('sa-btn sa-btn-sm', activeWindow === w.label && 'sa-btn-sel')}
-            onClick={() => pickWindow(w.hours)}
-          >
-            {w.label}
-          </button>
-        ))}
-        <input
-          type="datetime-local"
-          className="sa-input !w-[180px] !py-[4px] !text-[12px]"
-          value={toLocalInput(fit.since)}
-          onChange={(e) => setFit('since', fromLocalInput(e.target.value))}
-        />
-        <span className="text-[12px] text-dim">to</span>
-        <input
-          type="datetime-local"
-          className="sa-input !w-[180px] !py-[4px] !text-[12px]"
-          value={toLocalInput(fit.until)}
-          onChange={(e) => setFit('until', fromLocalInput(e.target.value))}
-        />
-        <span className="ml-auto text-[12px] text-dim">
-          {matched == null ? '…' : (
-            <>
-              <span className="text-ink tabular-nums">{matched}</span> image
-              {matched === 1 ? '' : 's'} match
-            </>
-          )}
-        </span>
-        <button
-          className="sa-btn sa-btn-sm"
-          onClick={reset}
-          disabled={!dirty}
-          title="clear every filter (keeps the order and the fit’s name)"
-        >
-          clear filters
-        </button>
-      </div>
+      ) : null}
     </div>
   )
 }

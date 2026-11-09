@@ -18,7 +18,6 @@ export function FitLink() {
   const setFit = useUI((s) => s.setFit)
   const backend = useUI((s) => s.params.backend) as BackendId
   const tab = useUI((s) => s.tab)
-  const selected = useUI((s) => s.fitSel.length)
   const { data: fits } = useFitList(backend)
 
   return (
@@ -31,7 +30,8 @@ export function FitLink() {
       }}
     >
       🧬 Fit ★
-      {selected ? <span className="ml-1 text-run tabular-nums">{selected}</span> : null}
+      {/* No pick count here: next to the ★ it read as "90 starred", and the
+          number that matters (what gets fitted) depends on the tab's filter. */}
       {fits?.length ? <span className="ml-1 text-dim">· {fits.length} saved</span> : null}
     </button>
   )

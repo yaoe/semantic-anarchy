@@ -170,6 +170,23 @@ export function FitPage() {
   const byRel = useMemo(() => new Map(rows.map((r) => [r.rel, r])), [rows])
   const picked = useMemo(() => new Set(sel), [sel])
 
+  // The fit uses exactly the checkmarks on screen. The stored selection can
+  // also hold picks made under an EARLIER filter (it is its own persisted
+  // list, fed from cards and the viewer too); in the matching view those are
+  // invisible, so they are left out of the fit — not silently added to it —
+  // and named below. The "all picked" view shows (and fits) every pick.
+  // Only decidable when every match is on screen; past that, all picks count.
+  const complete = data != null && data.total <= rows.length
+  const matchSet = useMemo(() => new Set(rows.map((r) => r.rel)), [rows])
+  const outside = useMemo(
+    () => (view === 'matching' && complete ? sel.filter((r) => !matchSet.has(r)) : []),
+    [view, complete, sel, matchSet],
+  )
+  const fitRels = useMemo(
+    () => (outside.length ? sel.filter((r) => matchSet.has(r)) : sel),
+    [outside, sel, matchSet],
+  )
+
   /**
    * The selection, split by the model that made each image.
    *
@@ -180,41 +197,26 @@ export function FitPage() {
    */
   const byBackend = useMemo(() => {
     const m = new Map<string, string[]>()
-    for (const rel of sel) {
+    for (const rel of fitRels) {
       const b = backendOf(rel) ?? 'unknown'
       m.set(b, [...(m.get(b) ?? []), rel])
     }
     return m
-  }, [sel])
+  }, [fitRels])
   const mixed = byBackend.size > 1
   const keepOnly = (b: string) => removeSel(sel.filter((r) => (backendOf(r) ?? 'unknown') !== b))
   const shownMatching = rows.map((r) => r.rel)
   const allMatchingPicked = shownMatching.length > 0 && shownMatching.every((r) => picked.has(r))
 
-  // Picks made under an EARLIER filter stay selected (the selection is its own
-  // list), and are invisible in the matching grid. Name them, or "fit on 90"
-  // over a grid of 12 checkmarks reads as a bug. Only knowable when every match
-  // is on screen.
-  const complete = data != null && data.total <= rows.length
-  const matchSet = useMemo(() => new Set(rows.map((r) => r.rel)), [rows])
-  const outside = complete ? sel.filter((r) => !matchSet.has(r)) : []
-  const pickedHere = sel.length - outside.length
-
-  /**
-   * Select every match, not just the page on screen — hence the second fetch.
-   * `replace` (the default) makes the selection exactly the matches; otherwise
-   * they are added to what was already picked.
-   */
-  async function selectAll(replace = true) {
+  /** Check every match, not just the page on screen — hence the second fetch. */
+  async function selectAll() {
     setNote(null)
     if ((data?.total ?? 0) <= rows.length) {
-      if (replace) clearSel()
       return addSel(shownMatching)
     }
     setSelectingAll(true)
     try {
       const all = await api.fitCandidates({ ...query, limit: SELECT_ALL_LIMIT })
-      if (replace) clearSel()
       addSel(all.rows.map((r) => r.rel))
       if (all.total > all.rows.length) {
         setNote(`selected the first ${all.rows.length} of ${all.total} matches — narrow the filter to reach the rest`)
@@ -235,7 +237,7 @@ export function FitPage() {
     create.mutate(
       {
         name,
-        rels: sel,
+        rels: fitRels,
         note: fit.note.trim() || null,
         components: numOrNull(fit.components),
         overwrite: force,
@@ -266,7 +268,8 @@ export function FitPage() {
   }
 
   const conflict = create.isError && (create.error as Error).message.includes('already exists')
-  const tooFew = sel.length < MIN_SAMPLES
+  const tooFew = fitRels.length < MIN_SAMPLES
+  const nFit = fitRels.length
   const busy = create.isPending || fitting != null
 
   const gallery = view === 'selected' ? sel : shownMatching
@@ -285,70 +288,49 @@ export function FitPage() {
     <div className="flex flex-col gap-3 pb-4">
       <FitFilters matched={data?.total} />
 
-      {/* what will be fitted, and the button that does it */}
-      <section className="sa-panel shrink-0 px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-2">
+      {/* what will be fitted, and the button that does it — one row, plus one
+          dim line of context */}
+      <section className="sa-panel shrink-0 px-3 py-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {/* Checking never forgets picks made under other filters: they are
+              simply not in this view's fit (see `fitRels`). */}
           <button
             className={cn('sa-btn sa-btn-sm', !allMatchingPicked && rows.length > 0 && 'sa-btn-sel')}
-            disabled={selectingAll || !rows.length || (allMatchingPicked && !outside.length)}
-            onClick={() => selectAll(true)}
-            title="make the selection exactly the images matching the filter"
+            disabled={selectingAll || !rows.length || allMatchingPicked}
+            onClick={selectAll}
+            title="check every image matching the filter"
           >
-            ✓ select only these {data?.total ?? 0}
+            ✓ check all {data?.total ?? 0}
           </button>
-          {sel.length && !(allMatchingPicked && complete) ? (
-            <button
-              className="sa-btn sa-btn-sm"
-              disabled={selectingAll || !rows.length}
-              onClick={() => selectAll(false)}
-              title="keep what is already selected and add these matches to it"
-            >
-              ＋ add them to the {sel.length} selected
-            </button>
-          ) : null}
           <button
             className="sa-btn sa-btn-sm"
             disabled={!allMatchingPicked && !shownMatching.some((r) => picked.has(r))}
             onClick={() => removeSel(shownMatching)}
-            title="drop the images on screen from the selection"
+            title="uncheck the images on screen"
           >
-            − deselect these
+            uncheck
           </button>
-          <button
-            className="sa-btn sa-btn-sm"
-            disabled={!sel.length}
-            onClick={clearSel}
-            title="empty the selection"
-          >
-            clear selection
-          </button>
-          <div className="ml-1 flex overflow-hidden rounded-md border border-line">
+          <div className="flex overflow-hidden rounded-md border border-line">
             {(['matching', 'selected'] as const).map((v) => (
               <button
                 key={v}
-                className={cn('px-2 py-[5px] text-[12px]',
+                className={cn('px-2 py-[3px] text-[12px]',
                   view === v ? 'bg-panel2 text-ink' : 'text-dim hover:text-ink')}
                 onClick={() => setView(v)}
+                title={v === 'matching' ? 'the images this filter matches' : 'every image you have picked, under any filter'}
               >
-                {v === 'matching'
-                  ? `matching ${data?.total ?? 0}`
-                  : `selected ${sel.length}`}
+                {v === 'matching' ? `matching ${data?.total ?? 0}` : `all picked ${sel.length}`}
               </button>
             ))}
           </div>
 
+          <span className="ml-auto" />
           <input
-            className="sa-input ml-auto !w-[190px] !py-[5px] !text-[12px]"
+            className="sa-input !w-[200px] !py-[4px] !text-[12px]"
             placeholder={defaultName(fit.tag)}
             value={fit.name}
             onChange={(e) => setFit('name', e.target.value)}
             title="what the fit is called on disk (outputs/dist_fits/<name>)"
-          />
-          <input
-            className="sa-input !w-[220px] !py-[5px] !text-[12px]"
-            placeholder="note — what this set is (optional)"
-            value={fit.note}
-            onChange={(e) => setFit('note', e.target.value)}
           />
           <button
             className={cn('sa-btn', conflict ? 'border-err text-danger' : 'sa-btn-sel')}
@@ -356,10 +338,10 @@ export function FitPage() {
             onClick={() => submit(conflict)}
             title={
               mixed
-                ? 'the selection mixes models — a distribution is per backend'
+                ? 'the checked images mix models — a distribution is per backend'
                 : tooFew
-                  ? `select at least ${MIN_SAMPLES} images`
-                  : 'fit a distribution to these latents (no GPU — a few seconds)'
+                  ? `check at least ${MIN_SAMPLES} images`
+                  : `fit a distribution to these ${nFit} latents (no GPU — a few seconds)`
             }
           >
             {fitting != null
@@ -368,97 +350,74 @@ export function FitPage() {
                 ? '🧬 one model at a time'
                 : conflict
                   ? '↻ Overwrite that fit?'
-                  : `🧬 Fit latent distribution on ${sel.length} selected sample${sel.length === 1 ? '' : 's'}`}
+                  : `🧬 Fit ${nFit} checked`}
           </button>
         </div>
 
-        {outside.length ? (
-          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-err">
-            <span>
-              {outside.length} of the {sel.length} selected are <b>not</b> in this filter (picked
-              earlier) — only {pickedHere} of them are the checkmarks below.
+        {/* One dim line: what the fit will be, what happens after, and any
+            picks the fit is leaving out. */}
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-dim">
+          <span
+            className={cn(tooFew && 'text-err')}
+            title={
+              'a fit gets its own mean, spread and (N−1)-axis PCA subspace. Sample it with ' +
+              'sampler = pca to stay inside the span of what you picked ("more like these"); ' +
+              'diagonal on a small set goes off-manifold. Only images carrying conditioning ' +
+              'are offered — an upscale carries none.'
+            }
+          >
+            {tooFew
+              ? `a fit needs at least ${MIN_SAMPLES} checked images`
+              : nFit < THIN_SAMPLES
+                ? `${nFit} checked — a thin fit (${nFit - 1} directions); samples stay close to these`
+                : `${nFit} checked → ${nFit - 1}-axis fit · sample it with sampler = pca`}
+          </span>
+          <label
+            className="flex items-center gap-1"
+            title={current ? `sets the base distribution, replacing “${current.label}”` : 'sets the base distribution'}
+          >
+            <input type="checkbox" checked={useAfter} onChange={(e) => setUseAfter(e.target.checked)} />
+            use it once fitted
+          </label>
+          <input
+            className="sa-input !w-[240px] !py-[2px] !text-[12px]"
+            placeholder="note (optional)"
+            value={fit.note}
+            onChange={(e) => setFit('note', e.target.value)}
+            title="what this set is — shown with the saved fit"
+          />
+          {outside.length ? (
+            <span className="flex items-center gap-1.5">
+              + {outside.length} picked under other filters, not in this fit
+              <button className="sa-btn sa-btn-sm" onClick={() => setView('selected')}>
+                show
+              </button>
+              <button className="sa-btn sa-btn-sm" onClick={() => removeSel(outside)}>
+                forget
+              </button>
             </span>
-            <button className="sa-btn sa-btn-sm" onClick={() => removeSel(outside)}>
-              drop those {outside.length}
+          ) : null}
+          {view === 'selected' && sel.length ? (
+            <button className="sa-btn sa-btn-sm" onClick={clearSel} title="uncheck every pick, under any filter">
+              clear all picks
             </button>
-            <button className="sa-btn sa-btn-sm" onClick={() => setView('selected')}>
-              show all selected
-            </button>
-          </div>
-        ) : null}
-
-        {sel.length ? (
-          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px]">
-            <span className="text-dim">selection:</span>
-            {[...byBackend.entries()].map(([b, rels]) => (
-              <span
-                key={b}
-                className={cn(
-                  'rounded-full border px-2 py-px',
-                  mixed ? 'border-err text-danger' : 'border-line2 text-ink',
-                )}
-                title={`${rels.length} image${rels.length === 1 ? '' : 's'} from ${b}`}
-              >
-                {b} × {rels.length}
-              </span>
-            ))}
-            {mixed
-              ? [...byBackend.keys()].map((b) => (
-                  <button
-                    key={b}
-                    className="sa-btn sa-btn-sm"
-                    onClick={() => keepOnly(b)}
-                    title={`drop everything that isn't ${b} from the selection`}
-                  >
-                    keep only {b}
-                  </button>
-                ))
-              : null}
-          </div>
-        ) : null}
+          ) : null}
+        </div>
 
         {mixed ? (
-          <p className="sa-hint text-err">
-            a fit is per model: sd15 conditioning is (77, 768) where sdxl's is
-            (77, 2048) plus a pooled vector, so one distribution cannot span both.
-            Keep one model above — or use the Backend filter to browse them apart.
-          </p>
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-err">
+            a fit is per model (sd15 conditioning is 77×768, sdxl's 77×2048 + pooled):
+            {[...byBackend.entries()].map(([b, rels]) => (
+              <button key={b} className="sa-btn sa-btn-sm" onClick={() => keepOnly(b)}>
+                keep only {b} ({rels.length})
+              </button>
+            ))}
+          </div>
         ) : null}
-
-        <p className="sa-hint">
-          {tooFew ? (
-            <>
-              a fit needs at least {MIN_SAMPLES} images — {sel.length} selected.
-            </>
-          ) : sel.length < THIN_SAMPLES ? (
-            <>
-              {sel.length} selected — that works, but the fit spans only{' '}
-              {sel.length - 1} directions, so samples will stay close to these few.
-            </>
-          ) : (
-            <>
-              {sel.length} selected — the fit gets its own mean, spread and{' '}
-              {sel.length - 1}-axis PCA subspace. Sample it with{' '}
-              <b>sampler = pca</b>: those draws stay inside the span of the latents
-              you picked, which is what “more like these” means. (diagonal on a
-              small selection goes off-manifold, same as on the corpus.)
-            </>
-          )}
-          {' '}Only images carrying conditioning are offered — an upscale carries none.
-        </p>
         {note ? <p className="sa-hint text-err">{note}</p> : null}
         {create.isError && !conflict ? (
           <p className="sa-hint text-err">{(create.error as Error).message}</p>
         ) : null}
-        <label className="mt-1 flex items-center gap-1.5 text-[12px] text-dim">
-          <input
-            type="checkbox"
-            checked={useAfter}
-            onChange={(e) => setUseAfter(e.target.checked)}
-          />
-          sample from it once it’s fitted (sets the base distribution
-          {current ? `, replacing “${current.label}”` : ''})
-        </label>
       </section>
 
       <SavedFits />
