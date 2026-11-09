@@ -93,5 +93,13 @@ function of the filters. The + box button on any gallery card adds to that same
 list, which is what makes "these six, plus everything I starred yesterday" a
 thing you can express.
 
+That persistence is also a trap: picks from an earlier filter stay selected but
+are invisible in the matching grid, so "fit on 90" over 12 checkmarks looked
+like a bug. Hence "select only these N" *replaces* the selection (adding is the
+separate "＋ add them" button), and `FitPage` names any selected images outside
+the current filter with a one-click drop. The universe (`tag`) filter is a chip
+row on top of `FitFilters`, not a dropdown — fitting one universe is the
+commonest reason to open the tab.
+
 → related: [labeling.md](labeling.md) (where the scores come from),
 [sampler-knobs.md](sampler-knobs.md) (what to do with the fit once you have it)

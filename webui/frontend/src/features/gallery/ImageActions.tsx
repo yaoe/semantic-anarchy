@@ -95,8 +95,28 @@ export function ImageActions({
 
   const about = feedback && current && feedback.rel !== current ? ` (${basename(feedback.rel)})` : ''
   return (
-    <div className="flex flex-wrap items-center gap-1.5 font-sans">
-      {actions.filter((a) => !a.menu).map((a) => (
+    <div className="flex min-w-0 flex-wrap items-center gap-1 font-sans">
+      {actions.map((a) =>
+        a.menu === 'universe' ? (
+          // Same slot as on the card. The full universe editor is also under
+          // "details" (key t); this is the quick one-click picker.
+          current ? (
+            <Popover
+              key={a.id}
+              title={a.title}
+              width={270}
+              triggerClassName={cn('sa-btn sa-btn-sm inline-flex max-w-[220px] items-center gap-1.5', toneClass(a))}
+              trigger={
+                <>
+                  <a.Icon size={13} />
+                  <span className="hidden truncate 2xl:inline">{a.label}</span>
+                </>
+              }
+            >
+              {() => <UniversePicker rels={[current]} />}
+            </Popover>
+          ) : null
+        ) : (
         <Tip
           key={a.id}
           side="top"
@@ -118,11 +138,14 @@ export function ImageActions({
             aria-keyshortcuts={a.hotkey}
           >
             <a.Icon size={13} fill={a.id === 'fav' && a.on ? 'currentColor' : 'none'} />
-            {a.label}
+            {/* Labels only where the bar has room for them; narrower, the
+                icon + key stay and the name is in the tooltip. */}
+            <span className="hidden 2xl:inline">{a.label}</span>
             {a.hotkey ? <span className="text-[10px] text-dim">{a.hotkey}</span> : null}
           </button>
         </Tip>
-      ))}
+        ),
+      )}
       {feedback ? (
         <span
           className={cn('basis-full text-[12px]', feedback.ok ? 'text-run' : 'text-err')}

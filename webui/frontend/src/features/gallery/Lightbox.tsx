@@ -15,7 +15,7 @@ import {
 } from '../../api/queries'
 import type { ImageItem, ImageMeta } from '../../api/types'
 import { BreedIcon } from '../../components/ui/actionIcons'
-import { basename, imgSrc } from '../../lib/utils'
+import { basename, cn, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
 import { ScoreStrip } from '../labeling/ScoreStrip'
 import { TagStrip } from '../labeling/TagStrip'
@@ -155,6 +155,10 @@ export function Lightbox() {
   // than the one that flips `open`, so an effect keyed on `open` would still see
   // a null ref and never attach the observer.
   const [panelEl, setPanelEl] = useState<HTMLDivElement | null>(null)
+  // The params / CLI / prompts / universe editor fold away by default so the
+  // image gets the screen. Lightbox is mounted once, so the choice holds for
+  // the session across opens.
+  const [details, setDetails] = useState(false)
   const [panelH, setPanelH] = useState(0)
   useEffect(() => {
     if (!panelEl) return
@@ -253,7 +257,13 @@ export function Lightbox() {
         scoreRef.current(Number(key))
       } else if (key === 't') {
         e.preventDefault()      // else the 't' lands in the box we just focused
-        tagInputRef.current?.focus()
+        // The universe box lives in the folded panel: unfold, then focus it
+        // once it has mounted.
+        setDetails(true)
+        requestAnimationFrame(() => tagInputRef.current?.focus())
+      } else if (key === 'i') {
+        e.preventDefault()
+        setDetails((v) => !v)
       } else {
         // Every per-image action carries its own key (s star, e explore, …).
         // A held key must not queue the same job over and over.
@@ -296,7 +306,7 @@ export function Lightbox() {
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/[.92]" />
         <Dialog.Content
-          className="fixed inset-0 z-50 flex items-center justify-center p-5 outline-none"
+          className="fixed inset-0 z-50 flex items-center justify-center p-1.5 outline-none"
           style={{ paddingBottom: panelH }}
           onClick={(e) => {
             if (e.target === e.currentTarget) close()
@@ -307,9 +317,12 @@ export function Lightbox() {
             Generation parameters, per-image actions and navigation for the selected image.
           </Dialog.Description>
 
+          {/* The arrows sit ON the image's edges rather than beside it, so the
+              image can take the full width; faint until hovered. */}
           <button
-            className="fixed left-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
-                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink disabled:opacity-30"
+            className="fixed left-1.5 top-1/2 z-[60] -translate-y-1/2 rounded-lg bg-black/30 px-2.5 py-3
+                       text-[24px] leading-none text-ink opacity-40 transition-opacity hover:opacity-100
+                       disabled:invisible"
             title="previous (←)"
             disabled={at <= 0}
             onClick={() => move(-1)}
@@ -317,8 +330,9 @@ export function Lightbox() {
             ‹
           </button>
           <button
-            className="fixed right-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
-                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink disabled:opacity-30"
+            className="fixed right-1.5 top-1/2 z-[60] -translate-y-1/2 rounded-lg bg-black/30 px-2.5 py-3
+                       text-[24px] leading-none text-ink opacity-40 transition-opacity hover:opacity-100
+                       disabled:invisible"
             title="next (→)"
             disabled={at >= items.length - 1}
             onClick={() => move(1)}
@@ -326,149 +340,161 @@ export function Lightbox() {
             ›
           </button>
 
-          {/* 80% of the free area (viewport minus the param panel): object-contain
-              scales the image up or down until whichever axis hits the box first. */}
+          {/* All of the free area (viewport minus the bottom bar, less the thin
+              padding): object-contain scales the image until either axis fills. */}
           {src ? (
             <img
               src={src}
               alt={rel ?? ''}
-              className="w-[80vw] object-contain"
-              style={{ height: `calc((100vh - ${panelH}px) * 0.8)` }}
+              className="h-full w-full object-contain"
+              style={{ maxHeight: `calc(100vh - ${panelH}px - 12px)` }}
             />
           ) : null}
 
           <div
             ref={setPanelEl}
-            className="fixed inset-x-0 bottom-0 max-h-[42vh] overflow-auto border-t border-line
-                       bg-logbg/[.92] px-4 py-2.5 font-mono text-[12px] leading-[1.6] text-[#cfd3dc]"
+            className="fixed inset-x-0 bottom-0 max-h-[50vh] overflow-auto border-t border-line
+                       bg-logbg/[.92] px-3 py-1.5 font-mono text-[12px] leading-[1.6] text-[#cfd3dc]"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* The gallery card's actions, labelled, with their keys. A queued
-                job is confirmed right here; the viewer stays open. */}
-            <div className="mb-2">
-              <ImageActions variant="viewer" actions={actions} feedback={feedback} current={rel} />
-              {breedParent ? (
-                <div className="mt-1 font-sans text-[12px] text-dim">
-                  <BreedIcon size={12} className="mr-1 inline" />
-                  breed parent A = <b className="text-ink">{basename(breedParent)}</b>
-                  {breedParent === rel
-                    ? ' — move to a second image (same backend) and press b, or b here again to cancel'
-                    : ' — press b to cross it with this image'}
-                </div>
-              ) : null}
-            </div>
-
-            {/* Judge without leaving the gallery: the same strips the 🏷 label
-                page uses, on the same keys. The star lives in the toolbar above. */}
-            <div className="mb-2 flex flex-col gap-2 font-sans">
-              <ScoreStrip score={labelScore} fav={fav} onPick={pickScore} disabled={!rel} />
-              <TagStrip
-                tags={labelTags}
-                vocabulary={vocab?.tags ?? []}
-                onSet={applyTags}
-                inputRef={tagInputRef}
-                disabled={!rel}
-              />
-            </div>
-
-            <div className="mb-1 text-run">
-              {rel}
+            {/* The always-visible bar: every action, the 0–9 score, where you
+                are in the list, and the fold toggle. One line on a wide screen. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div className="min-w-0 flex-1">
+                <ImageActions variant="viewer" actions={actions} feedback={feedback} current={rel} />
+              </div>
+              <ScoreStrip compact score={labelScore} fav={fav} onPick={pickScore} disabled={!rel} />
               {items.length > 1 && !pinned ? (
-                <span className="ml-2.5 text-dim">
+                <span className="font-sans text-[12px] tabular-nums text-dim">
                   {at + 1} / {items.length}
                 </span>
               ) : null}
-              {score != null ? (
-                <span className="ml-2.5 text-score" title="LAION aesthetic model">
-                  aesthetic {score.toFixed(2)}
-                </span>
-              ) : null}
+              <button
+                className={cn('sa-btn sa-btn-sm font-sans', details && 'sa-btn-sel')}
+                onClick={() => setDetails((v) => !v)}
+                title="params, CLI, prompts and the universe editor (i)"
+                aria-expanded={details}
+              >
+                {details ? '▾' : '▸'} details <span className="text-[10px] text-dim">i</span>
+              </button>
             </div>
 
-            {meta && ordered.length === 0 ? (
-              <span className="text-dim">no params recorded (pre-dates param logging)</span>
+            {breedParent ? (
+              <div className="mt-1 font-sans text-[12px] text-dim">
+                <BreedIcon size={12} className="mr-1 inline" />
+                breed parent A = <b className="text-ink">{basename(breedParent)}</b>
+                {breedParent === rel
+                  ? ' — move to a second image (same backend) and press b, or b here again to cancel'
+                  : ' — press b to cross it with this image'}
+              </div>
             ) : null}
 
-            {ordered.map((k) => (
-              <span key={k} className="mr-3.5 inline-block">
-                <span className="text-dim">{k}</span>{' '}
-                {LINKED.has(k) && typeof meta?.[k] === 'string' ? (
-                  <button
-                    className="text-link hover:underline"
-                    onClick={() => setPinned(`generated/${String(meta[k])}`)}
-                  >
-                    {String(meta[k])}
-                  </button>
-                ) : (
-                  String(meta?.[k])
-                )}
-              </span>
-            ))}
+            {details ? (
+              <div className="mt-2 border-t border-line pt-2">
+                <div className="mb-2 font-sans">
+                  <TagStrip
+                    tags={labelTags}
+                    vocabulary={vocab?.tags ?? []}
+                    onSet={applyTags}
+                    inputRef={tagInputRef}
+                    disabled={!rel}
+                  />
+                </div>
 
-            {cli ? <div className="mt-1.5 text-score">{cli}</div> : null}
+                <div className="mb-1 text-run">
+                  {rel}
+                  {score != null ? (
+                    <span className="ml-2.5 text-score" title="LAION aesthetic model">
+                      aesthetic {score.toFixed(2)}
+                    </span>
+                  ) : null}
+                </div>
+                {meta && ordered.length === 0 ? (
+                  <span className="text-dim">no params recorded (pre-dates param logging)</span>
+                ) : null}
 
-            {/* discovered hard prompts (PEZ / native inversion) */}
-            <div className="mt-1.5 flex flex-wrap items-center gap-2">
-              {meta?.inverted_prompt !== undefined ? (
-                <span className="text-pez">
-                  🔤 “{meta.inverted_prompt}”{' '}
-                  <span className="text-dim">
-                    CLIP's eyes (PEZ, {meta.inverted_tokens} tok, sim {meta.inverted_sim})
+                {ordered.map((k) => (
+                  <span key={k} className="mr-3.5 inline-block">
+                    <span className="text-dim">{k}</span>{' '}
+                    {LINKED.has(k) && typeof meta?.[k] === 'string' ? (
+                      <button
+                        className="text-link hover:underline"
+                        onClick={() => setPinned(`generated/${String(meta[k])}`)}
+                      >
+                        {String(meta[k])}
+                      </button>
+                    ) : (
+                      String(meta?.[k])
+                    )}
                   </span>
-                  <button
-                    className="sa-btn sa-btn-sm ml-2"
-                    disabled={genprompt.isPending}
-                    onClick={() => runGenPrompt('inverted')}
-                  >
-                    🎨 generate from it
-                  </button>
-                </span>
-              ) : (
-                <button
-                  className="sa-btn sa-btn-sm"
-                  disabled={invert.isPending}
-                  onClick={() => runInvert('clip')}
-                >
-                  🔤 reveal nearest prompt
-                </button>
-              )}
+                ))}
 
-              {meta?.native_prompt !== undefined ? (
-                <span className="text-native">
-                  🔡 “{meta.native_prompt}”{' '}
-                  <span className="text-dim">
-                    model's own encoder (native, cond-cos {meta.native_sim})
-                  </span>
-                  <button
-                    className="sa-btn sa-btn-sm ml-2"
-                    disabled={genprompt.isPending}
-                    onClick={() => runGenPrompt('native')}
-                  >
-                    🎨 generate from it
-                  </button>
-                </span>
-              ) : nativeable ? (
-                <button
-                  className="sa-btn sa-btn-sm"
-                  disabled={invert.isPending}
-                  onClick={() => runInvert('native')}
-                >
-                  🔡 native prompt
-                </button>
-              ) : null}
-            </div>
+                {cli ? <div className="mt-1.5 text-score">{cli}</div> : null}
 
-            {invert.isError ? (
-              <div className="text-err">{(invert.error as Error).message}</div>
-            ) : null}
-            {genprompt.isError ? (
-              <div className="text-err">{(genprompt.error as Error).message}</div>
+                {/* discovered hard prompts (PEZ / native inversion) */}
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  {meta?.inverted_prompt !== undefined ? (
+                    <span className="text-pez">
+                      🔤 “{meta.inverted_prompt}”{' '}
+                      <span className="text-dim">
+                        CLIP's eyes (PEZ, {meta.inverted_tokens} tok, sim {meta.inverted_sim})
+                      </span>
+                      <button
+                        className="sa-btn sa-btn-sm ml-2"
+                        disabled={genprompt.isPending}
+                        onClick={() => runGenPrompt('inverted')}
+                      >
+                        🎨 generate from it
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      className="sa-btn sa-btn-sm"
+                      disabled={invert.isPending}
+                      onClick={() => runInvert('clip')}
+                    >
+                      🔤 reveal nearest prompt
+                    </button>
+                  )}
+
+                  {meta?.native_prompt !== undefined ? (
+                    <span className="text-native">
+                      🔡 “{meta.native_prompt}”{' '}
+                      <span className="text-dim">
+                        model's own encoder (native, cond-cos {meta.native_sim})
+                      </span>
+                      <button
+                        className="sa-btn sa-btn-sm ml-2"
+                        disabled={genprompt.isPending}
+                        onClick={() => runGenPrompt('native')}
+                      >
+                        🎨 generate from it
+                      </button>
+                    </span>
+                  ) : nativeable ? (
+                    <button
+                      className="sa-btn sa-btn-sm"
+                      disabled={invert.isPending}
+                      onClick={() => runInvert('native')}
+                    >
+                      🔡 native prompt
+                    </button>
+                  ) : null}
+                </div>
+
+                {invert.isError ? (
+                  <div className="text-err">{(invert.error as Error).message}</div>
+                ) : null}
+                {genprompt.isError ? (
+                  <div className="text-err">{(genprompt.error as Error).message}</div>
+                ) : null}
+              </div>
             ) : null}
           </div>
 
           <Dialog.Close
-            className="fixed right-3.5 top-3.5 z-[60] rounded-[10px] border border-line bg-panel/75
-                       px-3 py-1.5 text-[14px] text-ink"
+            className="fixed right-1.5 top-1.5 z-[60] rounded-lg bg-black/40 px-2.5 py-1 text-[14px]
+                       text-ink opacity-50 transition-opacity hover:opacity-100"
             title="close (Esc)"
           >
             ✕

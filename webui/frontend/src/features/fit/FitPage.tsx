@@ -30,6 +30,7 @@ import {
   useSetDist,
 } from '../../api/queries'
 import type { BackendId, FitCandidate, FitOrder, FitQueryParams, FitScored } from '../../api/types'
+import { UNSET } from '../../api/types'
 import { backendOf, cn, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
 import { stubItem, useViewerList } from '../gallery/viewerLists'
@@ -68,11 +69,13 @@ function toQuery(fit: Record<string, string>): FitQueryParams {
   }
 }
 
-/** "selection-0804-1530" — a name you can tell apart a week later. */
-function defaultName(): string {
+/** "selection-0804-1530" (or "abstract-0804-1530" while a universe filter is
+ *  on) — a name you can tell apart a week later. */
+function defaultName(universe?: string): string {
   const d = new Date()
   const p = (n: number) => String(n).padStart(2, '0')
-  return `selection-${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
+  const head = universe && universe !== UNSET ? universe : 'selection'
+  return `${head}-${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
 }
 
 function Tile({
@@ -188,13 +191,30 @@ export function FitPage() {
   const shownMatching = rows.map((r) => r.rel)
   const allMatchingPicked = shownMatching.length > 0 && shownMatching.every((r) => picked.has(r))
 
-  /** Select every match, not just the page on screen — hence the second fetch. */
-  async function selectAll() {
+  // Picks made under an EARLIER filter stay selected (the selection is its own
+  // list), and are invisible in the matching grid. Name them, or "fit on 90"
+  // over a grid of 12 checkmarks reads as a bug. Only knowable when every match
+  // is on screen.
+  const complete = data != null && data.total <= rows.length
+  const matchSet = useMemo(() => new Set(rows.map((r) => r.rel)), [rows])
+  const outside = complete ? sel.filter((r) => !matchSet.has(r)) : []
+  const pickedHere = sel.length - outside.length
+
+  /**
+   * Select every match, not just the page on screen — hence the second fetch.
+   * `replace` (the default) makes the selection exactly the matches; otherwise
+   * they are added to what was already picked.
+   */
+  async function selectAll(replace = true) {
     setNote(null)
-    if ((data?.total ?? 0) <= rows.length) return addSel(shownMatching)
+    if ((data?.total ?? 0) <= rows.length) {
+      if (replace) clearSel()
+      return addSel(shownMatching)
+    }
     setSelectingAll(true)
     try {
       const all = await api.fitCandidates({ ...query, limit: SELECT_ALL_LIMIT })
+      if (replace) clearSel()
       addSel(all.rows.map((r) => r.rel))
       if (all.total > all.rows.length) {
         setNote(`selected the first ${all.rows.length} of ${all.total} matches — narrow the filter to reach the rest`)
@@ -210,7 +230,7 @@ export function FitPage() {
    *  same tick it is granted, and a setState wouldn't have landed yet. */
   function submit(force = false) {
     setNote(null)
-    const name = fit.name.trim() || defaultName()
+    const name = fit.name.trim() || defaultName(fit.tag)
     if (!fit.name.trim()) setFit('name', name)
     create.mutate(
       {
@@ -269,13 +289,23 @@ export function FitPage() {
       <section className="sa-panel shrink-0 px-3 py-2.5">
         <div className="flex flex-wrap items-center gap-2">
           <button
-            className="sa-btn sa-btn-sm"
-            disabled={selectingAll || !rows.length}
-            onClick={selectAll}
-            title="add every image matching the filter to the selection"
+            className={cn('sa-btn sa-btn-sm', !allMatchingPicked && rows.length > 0 && 'sa-btn-sel')}
+            disabled={selectingAll || !rows.length || (allMatchingPicked && !outside.length)}
+            onClick={() => selectAll(true)}
+            title="make the selection exactly the images matching the filter"
           >
-            ＋ select all {data?.total ?? 0} matching
+            ✓ select only these {data?.total ?? 0}
           </button>
+          {sel.length && !(allMatchingPicked && complete) ? (
+            <button
+              className="sa-btn sa-btn-sm"
+              disabled={selectingAll || !rows.length}
+              onClick={() => selectAll(false)}
+              title="keep what is already selected and add these matches to it"
+            >
+              ＋ add them to the {sel.length} selected
+            </button>
+          ) : null}
           <button
             className="sa-btn sa-btn-sm"
             disabled={!allMatchingPicked && !shownMatching.some((r) => picked.has(r))}
@@ -309,7 +339,7 @@ export function FitPage() {
 
           <input
             className="sa-input ml-auto !w-[190px] !py-[5px] !text-[12px]"
-            placeholder={defaultName()}
+            placeholder={defaultName(fit.tag)}
             value={fit.name}
             onChange={(e) => setFit('name', e.target.value)}
             title="what the fit is called on disk (outputs/dist_fits/<name>)"
@@ -341,6 +371,21 @@ export function FitPage() {
                   : `🧬 Fit latent distribution on ${sel.length} selected sample${sel.length === 1 ? '' : 's'}`}
           </button>
         </div>
+
+        {outside.length ? (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px] text-err">
+            <span>
+              {outside.length} of the {sel.length} selected are <b>not</b> in this filter (picked
+              earlier) — only {pickedHere} of them are the checkmarks below.
+            </span>
+            <button className="sa-btn sa-btn-sm" onClick={() => removeSel(outside)}>
+              drop those {outside.length}
+            </button>
+            <button className="sa-btn sa-btn-sm" onClick={() => setView('selected')}>
+              show all selected
+            </button>
+          </div>
+        ) : null}
 
         {sel.length ? (
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[12px]">

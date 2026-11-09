@@ -94,7 +94,9 @@ export function Popover({
             >
               {children(() => setOpen(false))}
             </div>,
-            document.body,
+            // Inside a modal (the fullscreen viewer) the dialog makes everything
+            // outside it inert, so the panel has to live in the dialog itself.
+            btn.current?.closest<HTMLElement>('[role="dialog"]') ?? document.body,
           )
         : null}
     </>

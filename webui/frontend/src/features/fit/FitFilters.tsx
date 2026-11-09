@@ -14,6 +14,7 @@ import { Select } from '../../components/ui/Select'
 import type { Option } from '../../params/schema'
 import { cn } from '../../lib/utils'
 import { useUI } from '../../store'
+import { universeColor } from '../universes/universes'
 
 /** `labels.KEEPER_MIN` — the score at which a batch counts as a keeper. */
 export const KEEPER_MIN = 7
@@ -25,10 +26,9 @@ const DIMS: { dim: FacetDim; label: string; any: string; width: number }[] = [
   { dim: 'folder', label: 'Folder', any: 'any folder', width: 140 },
   { dim: 'kind', label: 'Made by', any: 'any source', width: 130 },
   { dim: 'sampler', label: 'Sampler', any: 'any sampler', width: 130 },
-  // Fitting a distribution to ONE aesthetic universe is the point of tagging:
-  // pick the universe here and --sampler pca on the result means "more of that".
-  { dim: 'tag', label: 'Universe', any: 'any universe', width: 160 },
 ]
+// The universe ('tag') is NOT a dropdown here: fitting one aesthetic universe
+// is the commonest reason to open this tab, so it gets its own chip row on top.
 
 const SCORED: Option[] = [
   { value: 'any', label: 'labeled or not' },
@@ -108,11 +108,67 @@ export function FitFilters({ matched }: { matched?: number }) {
     setFit('until', '')
   }
 
-  const dirty = ['experiment', ...DIMS.map((d) => d.dim), 'since', 'until', 'starred',
+
+  const tagCount = facets?.facets?.tag?.find((c) => c.value === fit.tag)?.count ?? 0
+  const otherFilters = ['experiment', ...DIMS.map((d) => d.dim), 'since', 'until', 'starred',
     'minScore', 'maxScore'].some((k) => fit[k]) || fit.scored !== 'any'
+  const dirty = !!fit.tag || otherFilters
 
   return (
     <div className="sa-panel shrink-0 px-3 py-2.5">
+      {/* One click = "the images of this universe". Counts are over the whole
+          gallery; the grid below then keeps only those that carry latents. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5 border-b border-line pb-2">
+        <span className="mr-1 text-[12px] text-ink">🪐 Universe</span>
+        <button
+          className={cn('sa-btn sa-btn-sm', !fit.tag && 'sa-btn-sel')}
+          onClick={() => setFit('tag', '')}
+        >
+          any
+        </button>
+        {(facets?.facets?.tag ?? []).map((c) => {
+          const on = fit.tag === c.value
+          const none = c.value === UNSET
+          return (
+            <button
+              key={c.value}
+              className={cn('sa-btn sa-btn-sm inline-flex items-center gap-1.5', on && 'sa-btn-sel')}
+              onClick={() => setFit('tag', on ? '' : c.value)}
+              title={none ? 'images in no universe yet' : `only images in “${c.value}”`}
+            >
+              {none ? null : (
+                <span className="h-2 w-2 rounded-full" style={{ background: universeColor(c.value) }} />
+              )}
+              {none ? '(no universe)' : c.value}
+              <span className="tabular-nums text-dim">{c.count}</span>
+            </button>
+          )
+        })}
+        {!facets?.facets?.tag?.length ? (
+          <span className="text-[12px] text-dim">
+            none yet — tag images into a universe from any card or the viewer
+          </span>
+        ) : null}
+        {/* "abstract 12" but 5 match: say the other filters are why, and offer
+            the one click that shows the whole universe. (Images without latents,
+            e.g. upscales, never match — that part of a gap can't be cleared.) */}
+        {fit.tag && matched != null && otherFilters && matched < tagCount ? (
+          <span className="ml-auto flex items-center gap-1.5 text-[12px] text-dim">
+            {matched} of {tagCount} match with the other filters below
+            <button
+              className="sa-btn sa-btn-sm"
+              onClick={() => {
+                const tag = fit.tag
+                reset()
+                setFit('tag', tag)
+              }}
+            >
+              clear the others
+            </button>
+          </span>
+        ) : null}
+      </div>
+
       <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
         <div style={{ width: 170 }}>
           <span className="sa-label !mt-0">Experiment</span>

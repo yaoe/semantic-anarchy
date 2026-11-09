@@ -22,6 +22,7 @@ export function ScoreStrip({
   onPick,
   onStar,
   disabled,
+  compact = false,
 }: {
   /** The score that currently stands, or null when unjudged. */
   score: number | null
@@ -30,7 +31,32 @@ export function ScoreStrip({
   /** Omit to drop the star button (the viewer has it in its action toolbar). */
   onStar?: () => void
   disabled?: boolean
+  /** One small fixed-width row (the fullscreen viewer's bar), no caption. */
+  compact?: boolean
 }) {
+  if (compact) {
+    return (
+      <div className="flex shrink-0 items-center gap-0.5" role="group" aria-label="score 0–9">
+        {Array.from({ length: 10 }, (_, s) => (
+          <button
+            key={s}
+            disabled={disabled}
+            onClick={() => onPick(s)}
+            title={`score ${s} (key ${s})`}
+            className={cn(
+              'h-[26px] w-[22px] rounded border text-[12px] tabular-nums transition-colors',
+              'disabled:opacity-40',
+              score === s
+                ? 'border-accent bg-accent text-white'
+                : 'border-line bg-panel2/80 text-dim hover:border-line2 hover:text-ink',
+            )}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+    )
+  }
   return (
     <div className="flex shrink-0 items-stretch gap-2">
       <div className="grid flex-1 grid-cols-10 gap-2">
