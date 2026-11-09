@@ -34,6 +34,12 @@ themselves sit at corpus-distance 1.38, `pca` draws from their selection fit at
 toward the corpus centre, the fit doesn't. `tests/test_selection_fit.py` pins the
 span property.
 
+**For "more images in this look", don't sample the fit — use
+`scripts/sample_collection.py`** ([collection-sampling.md](collection-sampling.md)):
+members are statistically independent, so a fit draw is a superposition of all of
+them rendered with the sidebar's settings (measured 0–3/40 in-universe vs 32/40
+for member-anchored slerp). The fit stays useful as a distribution to explore *from*.
+
 **Tell people to sample it with `--sampler pca`.** `diagonal` on a 40-image fit
 is per-coordinate independent noise around the taste centre — off-manifold for
 the same reason it is off-manifold on the corpus, only now with a much thinner

@@ -132,7 +132,7 @@ def main(argv=None) -> int:
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,
             "negative": effective_negative(backend, args.neg_mode),
             "batch_seed": seed, "image_seed": seed + i, "index": i,
-            "distance": round(backend.distance(dists, one), 3),
+            "distance": round(backend.weirdness(dists, one), 3),
         }
         path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
         print(f"[evolve] saved {path}")

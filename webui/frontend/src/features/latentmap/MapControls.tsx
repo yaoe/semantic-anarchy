@@ -44,6 +44,7 @@ const FOCUS = [
 ] as const
 const PAINT = [
   ['region', 'Region', 'clusters of the look layout, in every space'],
+  ['universe', 'Universe', 'each image in the colour of its aesthetic universe (🏷 tag); untagged grey'],
   ['origin', 'Sampler', 'what produced the image'],
   ['taste', 'Taste', 'predicted from your ★ (run by the resonance step)'],
   ['age', 'Age', 'oldest to newest'],

@@ -234,6 +234,12 @@ class Backend:
         vals = [dists[k].distance(named_one[k]) for k in dists]
         return float(np.mean(vals))
 
+    def weirdness(self, dists, named_one) -> float:
+        """:meth:`distance` in the ROOT corpus frame (see
+        :meth:`EmbeddingDistribution.weirdness`) -- the gauge sidecars record."""
+        vals = [dists[k].weirdness(named_one[k]) for k in dists]
+        return float(np.mean(vals))
+
     def _tensor_prefix(self, prefix: Path, name: str) -> Path:
         """Per-tensor save prefix. Use a ``__`` separator (not a dot) so the tensor
         name can't be mistaken for a path suffix by ``Path.with_suffix``."""

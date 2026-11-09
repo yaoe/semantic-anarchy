@@ -14,5 +14,6 @@ export {
   SquareCheck as FitSelectedIcon,
   SquarePlus as FitAddIcon,
   Star as StarIcon,
+  Tag as UniverseIcon,
   Trash2 as DeleteIcon,
 } from 'lucide-react'

@@ -32,6 +32,7 @@ import {
 import type { BackendId, FitCandidate, FitOrder, FitQueryParams, FitScored } from '../../api/types'
 import { backendOf, cn, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
+import { stubItem, useViewerList } from '../gallery/viewerLists'
 import { FitFilters } from './FitFilters'
 import { SavedFits } from './SavedFits'
 
@@ -79,45 +80,60 @@ function Tile({
   row,
   picked,
   onToggle,
+  onOpen,
 }: {
   rel: string
   row?: FitCandidate
   picked: boolean
   onToggle: () => void
+  /** Open the fullscreen viewer here (a click on the tile toggles the pick). */
+  onOpen: () => void
 }) {
   return (
-    <button
-      className={cn(
-        'group relative block overflow-hidden rounded-md border bg-black text-left',
-        picked ? 'border-run ring-1 ring-run' : 'border-line hover:border-line2',
-      )}
-      onClick={onToggle}
-      title={rel}
-    >
-      <img
-        loading="lazy"
-        src={imgSrc(`/img?path=${rel}`, row?.mtime ?? 0)}
-        alt={rel}
-        className={cn('aspect-square w-full object-contain',
-          !picked && 'opacity-80 group-hover:opacity-100')}
-      />
-      <span
+    <div className="group relative">
+      <button
         className={cn(
-          'absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded border',
-          'text-[11px] leading-none',
-          picked ? 'border-run bg-run text-black' : 'border-line bg-black/70 text-dim',
+          'relative block w-full overflow-hidden rounded-md border bg-black text-left',
+          picked ? 'border-run ring-1 ring-run' : 'border-line hover:border-line2',
         )}
-        aria-hidden
+        onClick={onToggle}
+        title={rel}
       >
-        {picked ? '✓' : ''}
-      </span>
-      <span className="absolute right-1 top-1 flex gap-1 text-[10px]">
-        {row?.fav ? <span className="text-star">★</span> : null}
-        {row?.score != null ? (
-          <span className="rounded bg-black/70 px-1 text-score tabular-nums">{row.score}</span>
-        ) : null}
-      </span>
-    </button>
+        <img
+          loading="lazy"
+          src={imgSrc(`/img?path=${rel}`, row?.mtime ?? 0)}
+          alt={rel}
+          className={cn('aspect-square w-full object-contain',
+            !picked && 'opacity-80 group-hover:opacity-100')}
+        />
+        <span
+          className={cn(
+            'absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded border',
+            'text-[11px] leading-none',
+            picked ? 'border-run bg-run text-black' : 'border-line bg-black/70 text-dim',
+          )}
+          aria-hidden
+        >
+          {picked ? '✓' : ''}
+        </span>
+        <span className="absolute right-1 top-1 flex gap-1 text-[10px]">
+          {row?.fav ? <span className="text-star">★</span> : null}
+          {row?.score != null ? (
+            <span className="rounded bg-black/70 px-1 text-score tabular-nums">{row.score}</span>
+          ) : null}
+        </span>
+      </button>
+      <button
+        className="absolute bottom-1 right-1 flex h-5 w-5 items-center justify-center rounded border
+                   border-line bg-black/70 text-[12px] leading-none text-ink opacity-0
+                   transition-opacity hover:border-line2 focus:opacity-100 group-hover:opacity-100"
+        title="view full size, with every per-image action"
+        aria-label="view full size"
+        onClick={onOpen}
+      >
+        ⤢
+      </button>
+    </div>
   )
 }
 
@@ -126,6 +142,7 @@ export function FitPage() {
   const setFit = useUI((s) => s.setFit)
   const sel = useUI((s) => s.fitSel)
   const toggleSel = useUI((s) => s.toggleFitSel)
+  const openLightbox = useUI((s) => s.openLightbox)
   const addSel = useUI((s) => s.addFitSel)
   const removeSel = useUI((s) => s.removeFitSel)
   const clearSel = useUI((s) => s.clearFitSel)
@@ -233,6 +250,16 @@ export function FitPage() {
   const busy = create.isPending || fitting != null
 
   const gallery = view === 'selected' ? sel : shownMatching
+  // The fullscreen viewer walks the pool in the order it is drawn (the
+  // selected view is grouped by backend).
+  const viewerItems = useMemo(
+    () =>
+      (view === 'selected' ? [...byBackend.values()].flat() : rows.map((r) => r.rel)).map((rel) =>
+        stubItem(rel, { mtime: byRel.get(rel)?.mtime ?? 0, fav: byRel.get(rel)?.fav ?? false }),
+      ),
+    [view, byBackend, rows, byRel],
+  )
+  useViewerList('fit', viewerItems)
 
   return (
     <div className="flex flex-col gap-3 pb-4">
@@ -430,6 +457,7 @@ export function FitPage() {
                       row={byRel.get(rel)}
                       picked={picked.has(rel)}
                       onToggle={() => toggleSel(rel)}
+                      onOpen={() => openLightbox(rel, 'fit')}
                     />
                   ))}
                 </div>
@@ -447,6 +475,7 @@ export function FitPage() {
                   row={byRel.get(rel)}
                   picked={picked.has(rel)}
                   onToggle={() => toggleSel(rel)}
+                  onOpen={() => openLightbox(rel, 'fit')}
                 />
               ))}
             </div>

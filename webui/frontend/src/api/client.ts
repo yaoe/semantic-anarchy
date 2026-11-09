@@ -6,6 +6,8 @@
 import type {
   AnimateRequest,
   BackendId,
+  CollectionSampleRequest,
+  CollectionSampleResponse,
   Config,
   DistConfig,
   DistKind,
@@ -160,6 +162,8 @@ export const api = {
   resonance: () => post<RunResponse>('/api/resonance'),
   score: () => post<RunResponse>('/api/score'),
   film: (body: FilmRequest) => post<FilmResponse>('/api/film', body),
+  sampleCollection: (body: CollectionSampleRequest) =>
+    post<CollectionSampleResponse>('/api/collection/sample', body),
   keyframes: (images: string[]) =>
     post<KeyframeRow[]>('/api/keyframes', { images }),
   invert: (body: InvertRequest) => post<RunResponse>('/api/invert', body),

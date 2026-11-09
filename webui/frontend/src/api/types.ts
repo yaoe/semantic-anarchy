@@ -378,6 +378,10 @@ export interface DistRow {
     note: string | null
     created: number | null
     models: string[] | null
+    /** The root corpus weirdness is measured against (null = the fit's own frame). */
+    reference?: string | null
+    /** Median weirdness of the picked images — "more like these" on the weirdness knob. */
+    member_weirdness?: number | null
   } | null
   /** The checkpoint that encodes (or encoded) this corpus. */
   model: { path: string; name: string; slug: string }
@@ -575,6 +579,8 @@ export interface RunRequest {
   model?: string | null
   sampler: SamplerId
   temperature?: number | null
+  /** Reach as distance from the ROOT prompt corpus; the server solves the temperature. */
+  weirdness?: number | null
   n?: number | null
   seed?: number | null
   steps?: number | null
@@ -678,6 +684,31 @@ export interface GenPromptRequest {
 export interface RunResponse {
   job_id: number
   label?: string
+}
+
+/**
+ * POST /api/collection/sample — "more like these": new images that belong with
+ * a set of real images (a universe, a map selection, the Fit selection).
+ * scripts/sample_collection.py owns the method; each new image is rendered with
+ * its anchor member's own settings and lands in outputs/generated.
+ */
+export interface CollectionSampleRequest {
+  rels: string[]
+  /** 'auto' (default) lets the script choose. */
+  method?: string
+  /** 0 = stay on the members, 1 = the collection's own diversity, >1 = beyond its edges. 0..4 */
+  spread: number
+  /** 1..64 */
+  n: number
+  /** the universe's name, for the job label */
+  name?: string | null
+  experiment?: string | null
+  hypothesis?: string | null
+}
+
+export interface CollectionSampleResponse extends RunResponse {
+  /** members that carried conditioning (the rest were skipped) */
+  n_members: number
 }
 
 /** What 🧹 Wipe should delete. Every field is ANDed with the others. */

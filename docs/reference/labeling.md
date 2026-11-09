@@ -183,6 +183,14 @@ filters (nothing here interprets a user-supplied expression), path sandboxing on
 every write, no computation, no torch. The sidecar cache it reads through
 (`sidecar_for`, keyed on mtime) is shared with the gallery's distance column.
 
+## Universes outside the label page
+
+The same tags, one shared model in `webui/frontend/src/features/universes/`: `universes.ts` (`useUniverses` = vocabulary + members from the cached gallery rows; colour per **name** from a 10-colour palette, with clashes inside the current vocabulary probed to a free slot), `UniverseBar.tsx`, `UniversePicker.tsx`, `SampleControls.tsx`, `BatchNotice.tsx`.
+
+- **The universe bar** above the gallery (grid tabs) is the one list of universes: click = the gallery's tag filter (it replaced the dropdown in `Filters.tsx`), 🪐 = sample more like it, "+ new universe" = name it and fill it from the 🧬 Fit selection, the 🌌 map selection, ★ stars or the current view.
+- **Bulk tagging** is `useBulkTag` in `api/queries.ts`: it reads each image's current set from the cached row (or `/api/meta` when uncached) and posts the complete set per image, sequentially, so other universes are never stripped. There is no bulk endpoint.
+- **Per-image**: the card's tag button (`universe` in `useImageActions`, flagged `menu` so the card renders the picker popover; the viewer skips it because its TagStrip sits right below).
+
 ## The report card
 
 `python scripts/experiment_report.py [ids…]` → a self-contained

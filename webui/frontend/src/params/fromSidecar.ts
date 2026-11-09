@@ -48,6 +48,7 @@ export function paramsFromSidecar(
   const reach =
     m.target_distance != null ? 'shell'
     : m.radius_band != null || m.radius_scale != null ? 'band'
+    : m.weirdness != null ? 'weirdness'
     : 'temperature'
 
   // Which file an image started from is random per image, so what can come back
@@ -65,6 +66,7 @@ export function paramsFromSidecar(
     scheduler: pick('scheduler', m.scheduler, warnings),
     reach,
     temperature: sampler === 'split' ? '' : str(m.temperature),
+    weirdness: str(m.weirdness),
     temp_on: sampler === 'split' ? scaled(m.temp_on) : '',
     temp_off: sampler === 'split' ? scaled(m.temp_off) : '',
     target_distance: str(m.target_distance),

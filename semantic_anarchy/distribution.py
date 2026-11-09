@@ -236,6 +236,13 @@ class EmbeddingDistribution:
     lengths: Optional[np.ndarray] = None
     pca_head: Optional[np.ndarray] = None
     corpus_distance: Optional[np.ndarray] = None
+    # ---- the weirdness frame ------------------------------------------------
+    # The (mean, std) of the ROOT prompt corpus this fit descends from. A mined
+    # corpus has None here (it IS its own root); a fit made from generated images
+    # (selection fits, evolved branches) carries its root's, so "how weird" means
+    # the same number whatever is being sampled -- see :meth:`temperature_for`.
+    ref_mean: Optional[np.ndarray] = None
+    ref_std: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ fit ---
     @classmethod
@@ -935,6 +942,76 @@ class EmbeddingDistribution:
         z = (np.asarray(embedding, dtype=np.float64) - self.mean) / _floor_std(self.std)
         return float(np.sqrt(np.mean(z * z)))
 
+    # ----------------------------------------------------------- weirdness ---
+    def reference_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(mean, std)`` weirdness is measured in: the root corpus's, else ours."""
+        if self.ref_mean is not None and self.ref_std is not None:
+            return self.ref_mean, self.ref_std
+        return self.mean, self.std
+
+    def set_reference(self, root: "EmbeddingDistribution") -> None:
+        """Adopt ``root``'s weirdness frame (or the frame ``root`` itself inherited)."""
+        m, s = root.reference_frame()
+        if np.shape(m) != np.shape(self.mean):
+            raise ValueError(f"reference shape {np.shape(m)} != fit shape {np.shape(self.mean)}")
+        self.ref_mean = np.asarray(m, dtype=np.float32).copy()
+        self.ref_std = np.asarray(s, dtype=np.float32).copy()
+
+    def weirdness(self, embedding: np.ndarray) -> float:
+        """:meth:`distance`, but always in the ROOT corpus frame.
+
+        On a mined corpus the two are identical. On a fit of generated images
+        :meth:`distance` is relative to that fit's own (already inflated) spread,
+        so the same picture would read 1.0 there and 1.7 against the corpus; this
+        reads 1.7 everywhere -- the number on the gallery card.
+        """
+        m, s = self.reference_frame()
+        z = (np.asarray(embedding, dtype=np.float64) - m) / _floor_std(s)
+        return float(np.sqrt(np.mean(z * z)))
+
+    def temperature_for(self, weirdness: float, n_probe: Optional[int] = None,
+                        seed: int = 0, **sample_kw) -> tuple[float, dict]:
+        """The temperature at which a batch lands at ``weirdness`` on average.
+
+        ``temperature`` is an ABSOLUTE multiplier on *this* distribution's
+        spread, so it compounds: images drawn from the corpus at T=1.7 already
+        carry that spread, a fit to them inherits it, and T=1.7 on the fit lands
+        near 1.7 x 1.7. Weirdness is the RMS z-distance from the root corpus (see
+        :meth:`weirdness`) -- one scale for every distribution, the same one the
+        gallery shows as ``d`` -- and this solves for the T that reaches it.
+
+        A sample is ``mu + T*dev``; in the root frame the cross term vanishes in
+        expectation, so ``E[w^2] = a + T^2 b`` with ``a`` the centre's squared
+        weirdness and ``b`` a unit draw's. Both are measured on a probe batch
+        drawn with the caller's exact sampler knobs (so pca/blend/split/length
+        conditioning are all accounted for) from a private rng -- the caller's
+        stream is untouched. A target below the centre's own weirdness gives
+        T=0 (the centre) and says so in ``info``.
+        """
+        if sample_kw.get("sampler") == "hybrid":
+            raise ValueError("hybrid draws real corpus chords, not a scaled deviation; "
+                             "weirdness can't steer it -- use temperature")
+        sample_kw.pop("rng", None)
+        sample_kw.pop("temperature", None)
+        d = int(np.prod(self.feature_shape))
+        n_probe = n_probe or (32 if d < WIDE_FEATURES else 4)
+        lengths = sample_kw.pop("lengths", None)
+        if lengths is not None:
+            lengths = np.resize(np.asarray(lengths), n_probe)
+        s0 = self.sample(n_probe, temperature=0.0, rng=np.random.default_rng(seed),
+                         lengths=lengths, **sample_kw).astype(np.float64)
+        s1 = self.sample(n_probe, temperature=1.0, rng=np.random.default_rng(seed),
+                         lengths=lengths, **sample_kw).astype(np.float64)
+        m, sd = self.reference_frame()
+        inv = 1.0 / _floor_std(sd).astype(np.float64)
+        a = float(np.mean(((s0 - m) * inv) ** 2))
+        b = float(np.mean(((s1 - s0) * inv) ** 2))
+        target = max(float(weirdness), 0.0) ** 2
+        t = float(np.sqrt(max(target - a, 0.0) / b)) if b > 0 else 0.0
+        info = {"center": round(float(np.sqrt(a)), 4), "unit": round(float(np.sqrt(b)), 4),
+                "temperature": round(t, 4), "clamped": target < a}
+        return t, info
+
     def neighborhood(
         self,
         anchor: np.ndarray,
@@ -1076,13 +1153,15 @@ class EmbeddingDistribution:
         std = elites.std(axis=0)
         std = base_blend * self.std + (1 - base_blend) * std
         std = np.maximum(std, std_floor_frac * self.std)
-        return EmbeddingDistribution(
+        child = EmbeddingDistribution(
             mean=mean.astype(np.float32),
             std=std.astype(np.float32),
             feature_shape=self.feature_shape,
             per_token=self.per_token,
             n_samples=int(elites.shape[0]),
         )
+        child.set_reference(self)     # weirdness stays in the parent's root frame
+        return child
 
     # --------------------------------------------------------------- io -------
     @staticmethod
@@ -1118,7 +1197,7 @@ class EmbeddingDistribution:
         # N-vectors -- negligible beside the PCA basis, and each one is what makes
         # a correction available at sample time rather than needing a re-mine.
         for key in ("mean_content", "std_content", "mean_pad", "std_pad",
-                    "lengths", "pca_head", "corpus_distance"):
+                    "lengths", "pca_head", "corpus_distance", "ref_mean", "ref_std"):
             val = getattr(self, key)
             if val is not None:
                 arrays[key] = val
@@ -1132,6 +1211,7 @@ class EmbeddingDistribution:
             "has_corpus": self.corpus_embeddings is not None,
             "has_length_stats": self.has_length_stats,
             "has_radius_band": self.corpus_distance is not None,
+            "has_reference": self.ref_mean is not None,
             "noise_floor_axes": self.noise_floor_axes(),
         }
         self._meta_path(path).write_text(json.dumps(meta, indent=2))
@@ -1157,7 +1237,7 @@ class EmbeddingDistribution:
             # is exactly what `has_length_stats` / `sample_radii` report on.
             **{k: (data[k] if k in data else None)
                for k in ("mean_content", "std_content", "mean_pad", "std_pad",
-                         "lengths", "pca_head", "corpus_distance")},
+                         "lengths", "pca_head", "corpus_distance", "ref_mean", "ref_std")},
         )
 
     def pca_variance_fraction(self) -> float:
@@ -1169,7 +1249,7 @@ class EmbeddingDistribution:
     def summary(self) -> dict:
         skip = ("mean", "std", "pca_components", "pca_std", "corpus_embeddings",
                 "mean_content", "std_content", "mean_pad", "std_pad", "lengths",
-                "pca_head", "corpus_distance")
+                "pca_head", "corpus_distance", "ref_mean", "ref_std")
         lens = self.lengths
         return {
             **{k: v for k, v in asdict(self).items() if k not in skip},

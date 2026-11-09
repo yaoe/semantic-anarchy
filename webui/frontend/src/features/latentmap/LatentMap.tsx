@@ -3,11 +3,15 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useExplore, useImages, useLatentMap, useResonance } from '../../api/queries'
 import type { BackendId, ImageItem, LatentMap as MapDoc, MapSpace } from '../../api/types'
 import { cn } from '../../lib/utils'
-import { Lightbox } from '../gallery/Lightbox'
+import { useViewerList } from '../gallery/viewerLists'
 import { useUI } from '../../store'
+import { BatchNotice } from '../universes/BatchNotice'
+import { universeColor, useSampleBatches, useUniverses } from '../universes/universes'
 import { MapControls, Pill } from './MapControls'
 import { ORIGIN_COLORS, RAMPS, UNCLAIMED, originOf, regionColor, shortPrompt } from './palette'
 import { LatentScene, type Hit, type SceneData } from './scene'
+import { SelectionPanel, Thumb } from './SelectionPanel'
+import { CIRCLE_MAX, CIRCLE_MIN, SelectTool, type MapTool, type SelectMode } from './SelectTool'
 
 const COLOR = new Map<string, [number, number, number]>()
 /** any CSS colour -> sRGB 0..1 (the node shader writes colour straight out). */
@@ -66,23 +70,18 @@ function alikeLabel(v: number | null | undefined) {
   return { word: 'barely', good: false }
 }
 
-/** One image out of the atlas, as CSS: no extra request per thumbnail. */
-function Thumb({ cell, cols, url, size, className }: {
-  cell: number; cols: number; url: string; size: number; className?: string
-}) {
-  return (
-    <div
-      className={cn('shrink-0 rounded-[4px] bg-black', className)}
-      style={{
-        width: size,
-        height: size,
-        backgroundImage: cell >= 0 ? `url(${url})` : undefined,
-        backgroundSize: `${cols * size}px ${cols * size}px`,
-        backgroundPosition: `${-(cell % cols) * size}px ${-Math.floor(cell / cols) * size}px`,
-      }}
-    />
-  )
-}
+const TOOLS: { id: MapTool; key: string; label: string; title: string }[] = [
+  { id: 'orbit', key: 'o', label: '✥ Orbit', title: 'drag to orbit, right-drag to pan, wheel to zoom · ⇧-click selects one image · ⇧-drag lassos (o)' },
+  { id: 'lasso', key: 'l', label: '◌ Lasso', title: 'drag a shape around images to select them · ⇧ adds · ctrl removes · right-drag still pans (l)' },
+  {
+    id: 'circle', key: 'c', label: '◯ Region', title:
+      'a circle you move over the map: press and drag, and the selection becomes the images under it · ' +
+      'wheel or [ ] resizes · ⇧-drag paints, ctrl erases (c)',
+  },
+]
+
+/** How many nearest images "select around this spot" takes. */
+const SPOT_K = [8, 16, 32] as const
 
 /** What a click on the map chose: an image, or a spot whose nearest image anchors it. */
 type Pick =
@@ -101,6 +100,16 @@ export function LatentMap({ busy }: { busy: boolean }) {
   const timeline = useUI((s) => s.timeline)
   const addKeyframe = useUI((s) => s.addKeyframe)
   const openLightbox = useUI((s) => s.openLightbox)
+  const lightboxOpen = useUI((s) => s.lightboxRel !== null)
+  const mapSel = useUI((s) => s.mapSel)
+  const setMapSel = useUI((s) => s.setMapSel)
+  const toggleMapSel = useUI((s) => s.toggleMapSel)
+  const addMapSel = useUI((s) => s.addMapSel)
+  const removeMapSel = useUI((s) => s.removeMapSel)
+  const mapUniverses = useUI((s) => s.mapUniverses)
+  const setMapUniverses = useUI((s) => s.setMapUniverses)
+  const { list: universes } = useUniverses()
+  const lastBatchAt = useSampleBatches((s) => s.batches[0]?.queuedAt ?? 0)
   const { data: images } = useImages(busy)
   const { data, error, isFetching } = useLatentMap(backend, map.focus, busy)
   const explore = useExplore()
@@ -113,6 +122,11 @@ export function LatentMap({ busy }: { busy: boolean }) {
   const [pick, setPick] = useState<Pick | null>(null)
   const [region, setRegion] = useState<number | null>(null)
   const [sampledAt, setSampledAt] = useState(0)
+  const [tool, setTool] = useState<MapTool>('orbit')
+  const [circleR, setCircleR] = useState(90)
+  // A lasso/circle gesture still in progress: drawn as the selection, not yet stored.
+  const [preview, setPreview] = useState<{ idx: number[]; mode: SelectMode } | null>(null)
+  const freshAt = Math.max(sampledAt, lastBatchAt)
 
   const doc: MapDoc | undefined = data?.backend === backend ? data : undefined
   const nodes = useMemo(() => doc?.nodes ?? [], [doc])
@@ -139,7 +153,23 @@ export function LatentMap({ busy }: { busy: boolean }) {
     return m
   }, [images])
 
-  // The lightbox walks the map's nodes in time order.
+  // rel -> scene index, for the selection and the universes.
+  const sceneOf = useMemo(() => new Map(shown.map((ni, i) => [nodes[ni].rel, i])), [shown, nodes])
+  const cellOf = useMemo(() => {
+    const m = new Map(nodes.map((n) => [n.rel, n.a]))
+    return (rel: string) => m.get(rel) ?? -1
+  }, [nodes])
+  const onMap = useMemo(() => new Set(nodes.map((n) => n.rel)), [nodes])
+  // Universes with their members on THIS map (this backend, placed).
+  const mapUnis = useMemo(
+    () => universes.map((u, i) => ({ ...u, key: i, here: u.rels.filter((r) => sceneOf.has(r)) })),
+    [universes, sceneOf],
+  )
+  const shownUnis = useMemo(() => new Set(mapUniverses.map((t) => t.toLocaleLowerCase())), [mapUniverses])
+  // The stored selection, minus images this map doesn't place (another backend, not embedded yet).
+  const selHere = useMemo(() => mapSel.filter((r) => onMap.has(r)), [mapSel, onMap])
+
+  // The app-level viewer walks the map's nodes in time order.
   const items: ImageItem[] = useMemo(
     () =>
       nodes.map(
@@ -152,23 +182,31 @@ export function LatentMap({ busy }: { busy: boolean }) {
       ),
     [nodes, byRel, favs],
   )
+  useViewerList('map', items)
 
   // Stable callbacks into the scene (it is created once).
   const handlers = useRef<{
     pick: (i: number, e: { shiftKey: boolean }) => void
-    empty: (p: [number, number, number]) => void
+    empty: (p: [number, number, number], e: { shiftKey: boolean }) => void
     open: (i: number) => void
   }>({ pick: () => {}, empty: () => {}, open: () => {} })
   handlers.current.pick = (i, e) => {
     const ni = nodeIndexOf(i)
     const n = nodes[ni]
-    if (!n) return
+    if (!n || tool === 'circle') return // the circle selected on press
     if (e.shiftKey) {
-      addKeyframe(n.rel)
-      setFlash(`added ${n.name} to the 🎬 timeline`)
-    } else setPick({ kind: 'node', index: ni })
+      toggleMapSel(n.rel)
+    } else {
+      // A click on an image opens THE viewer (every per-image action lives
+      // there); the pick stays behind it, so the sampling panel is waiting
+      // when the viewer closes.
+      setPick({ kind: 'node', index: ni })
+      openLightbox(n.rel, 'map')
+    }
   }
-  handlers.current.empty = (at) => {
+  handlers.current.empty = (at, e) => {
+    // ⇧ is the selection modifier; a ⇧-click that missed every image is a no-op.
+    if (tool === 'circle' || e.shiftKey) return
     // Sampling needs an image to start from: the one nearest the clicked spot.
     let best = -1
     let bestD = Infinity
@@ -185,14 +223,14 @@ export function LatentMap({ busy }: { busy: boolean }) {
   }
   handlers.current.open = (i) => {
     const n = nodes[nodeIndexOf(i)]
-    if (n) openLightbox(n.rel)
+    if (n) openLightbox(n.rel, 'map')
   }
 
   useEffect(() => {
     const s = new LatentScene(hostRef.current!, {
       hover: setHover,
       pick: (i, e) => handlers.current.pick(i, e),
-      pickEmpty: (p) => handlers.current.empty(p),
+      pickEmpty: (p, e) => handlers.current.empty(p, e),
       open: (i) => handlers.current.open(i),
     })
     sceneRef.current = s
@@ -251,6 +289,12 @@ export function LatentMap({ busy }: { busy: boolean }) {
     // Taste scores bunch in a narrow band (0.26-0.65 on the real gallery): stretch
     // that band over the ramp, or every image paints the same colour.
     const scores = shown.map((ni) => byRel.get(nodes[ni].rel)?.res ?? 0).sort((p, q) => p - q)
+    // The first universe an image wears that is highlighted (or, painting by
+    // universe, the first it wears at all).
+    const uniOf = (rel: string, only: boolean) => {
+      for (const t of byRel.get(rel)?.tags ?? []) if (!only || shownUnis.has(t.toLocaleLowerCase())) return t
+      return null
+    }
     const resLo = scores[Math.floor(scores.length * 0.05)] ?? 0
     const resHi = scores[Math.floor(scores.length * 0.95)] ?? 1
     shown.forEach((ni, i) => {
@@ -259,16 +303,19 @@ export function LatentMap({ busy }: { busy: boolean }) {
       positions.set(space === 'corpus' ? squash(v) : [v[0], v[1], v[2]], i * 3)
       const fav = favs.has(nd.rel)
       const res = byRel.get(nd.rel)?.res ?? 0
+      const uni = shownUnis.size ? uniOf(nd.rel, true) : map.paint === 'universe' ? uniOf(nd.rel, false) : null
       colors.set(
-        map.paint === 'origin' ? rgb(ORIGIN_COLORS[originOf(nd)] ?? '#c9ccd6')
+        uni ? rgb(universeColor(uni))
+          : map.paint === 'universe' ? rgb(UNCLAIMED)
+          : map.paint === 'origin' ? rgb(ORIGIN_COLORS[originOf(nd)] ?? '#c9ccd6')
           : map.paint === 'taste' ? ramp(RAMPS.taste, resHi > resLo ? (res - resLo) / (resHi - resLo) : 0.5)
             : map.paint === 'age' ? ramp(RAMPS.age, tHi > tLo ? (nd.t - tLo) / (tHi - tLo) : 0.5)
               : map.paint === 'fav' ? rgb(fav ? '#ffcf4d' : UNCLAIMED)
                 : rgb(regionColor(nd.r)),
         i * 3,
       )
-      const fresh = sampledAt > 0 && nd.t > sampledAt
-      const inFocus = region == null || nd.r === region
+      const fresh = freshAt > 0 && nd.t > freshAt
+      const inFocus = (region == null || nd.r === region) && (!shownUnis.size || uni != null)
       // Faded images also shrink: at full size they would block the view of the
       // region from in front of it.
       sizes[i] = base * (fav ? 1.25 : 1) * (fresh ? 2 : 1) * (inFocus ? 1 : 0.3)
@@ -307,7 +354,7 @@ export function LatentMap({ busy }: { busy: boolean }) {
     s.setAtlas(thumbs ? atlasUrl : null, doc.atlas.cols)
     s.update(scene)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doc, nodes, shown, favs, byRel, timeline, map.paint, map.thumbs, map.edges, map.corpus, map.path, viewKey, region, sampledAt])
+  }, [doc, nodes, shown, favs, byRel, timeline, map.paint, map.thumbs, map.edges, map.corpus, map.path, viewKey, region, freshAt, shownUnis])
 
   useEffect(() => {
     sceneRef.current?.setNodeScale(Number(map.size) || 1)
@@ -319,6 +366,108 @@ export function LatentMap({ busy }: { busy: boolean }) {
   useEffect(() => {
     sceneRef.current?.setHover(hover?.kind === 'node' ? hover.index : null)
   }, [hover])
+
+  // The selection as drawn: the stored one, with a gesture in progress applied.
+  const selIdx = useMemo(() => {
+    const stored = selHere.map((r) => sceneOf.get(r)!).filter((i) => i != null)
+    if (!preview) return stored
+    if (preview.mode === 'replace') return preview.idx
+    if (preview.mode === 'add') return [...new Set([...stored, ...preview.idx])]
+    const drop = new Set(preview.idx)
+    return stored.filter((i) => !drop.has(i))
+  }, [selHere, sceneOf, preview])
+
+  // Typical gap between images in this layout (world units): the halo's floor.
+  const gap = useMemo(() => {
+    let sum = 0
+    shown.forEach((ni) => {
+      const v = nodes[ni][key] as number[]
+      sum += v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+    })
+    return Math.sqrt(sum / Math.max(1, shown.length)) / Math.cbrt(Math.max(1, shown.length))
+  }, [shown, nodes, key])
+  const spread = Math.max(0, Number(map.spread) || 0)
+
+  useEffect(() => {
+    const s = sceneRef.current
+    if (!s) return
+    s.setSelection(selIdx)
+    // Halo = an illustration of the spread, scaled by how far apart the
+    // selected images sit HERE: at spread 1 each halo reaches the selection's
+    // own RMS radius, so a group's halos merge into one region; at 0 they hug
+    // the images. Not a region of conditioning space (see SelectionPanel).
+    const pts = selIdx.map((i) => s.positionOf(i)).filter((p): p is [number, number, number] => !!p)
+    let rms = 0
+    if (pts.length > 1) {
+      const c = [0, 1, 2].map((k) => pts.reduce((a, p) => a + p[k], 0) / pts.length)
+      rms = Math.sqrt(pts.reduce((a, p) => a + (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2, 0) / pts.length)
+    }
+    s.setHalo(gap * 0.7 + spread * Math.max(rms, gap * 2), pts.length > 0)
+  }, [selIdx, gap, spread, doc])
+
+  const commitSelection = (idx: number[], mode: SelectMode) => {
+    const rels = idx.map((i) => nodes[shownRef.current[i]]?.rel).filter((r): r is string => !!r)
+    if (mode === 'add') addMapSel(rels)
+    else if (mode === 'remove') removeMapSel(rels)
+    else setMapSel(rels)
+    if (rels.length || mode === 'replace')
+      setFlash(mode === 'remove' ? `dropped ${rels.length}` : `${mode === 'add' ? 'added' : 'selected'} ${rels.length} image${rels.length === 1 ? '' : 's'}`)
+  }
+
+  const flyToRels = (rels: string[]) => {
+    const pts = rels.flatMap((r) => {
+      const i = sceneOf.get(r)
+      const p = i != null ? sceneRef.current?.positionOf(i) : null
+      return p ? [p] : []
+    })
+    if (!pts.length) return
+    const c = [0, 1, 2].map((k) => pts.reduce((a, p) => a + p[k], 0) / pts.length) as [number, number, number]
+    const r = Math.max(...pts.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2])))
+    sceneRef.current?.flyTo(c, Math.max(r * 1.3, 0.8))
+  }
+
+  const toggleUniverse = (tag: string) => {
+    const low = tag.toLocaleLowerCase()
+    const on = shownUnis.has(low)
+    const next = on ? mapUniverses.filter((t) => t.toLocaleLowerCase() !== low) : [...mapUniverses, tag]
+    setMapUniverses(next)
+    if (!on) flyToRels(mapUnis.find((u) => u.tag === tag)?.here ?? [])
+    else if (!next.length) sceneRef.current?.resetView()
+  }
+
+  // Map keys. Not while the viewer is up (it owns digits and letters) or typing.
+  const keyState = useRef({ mapUnis, toggleUniverse, tool, selHere, mapUniverses })
+  keyState.current = { mapUnis, toggleUniverse, tool, selHere, mapUniverses }
+  useEffect(() => {
+    if (lightboxOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const k = keyState.current
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key
+      const toolHit = TOOLS.find((x) => x.key === key)
+      if (toolHit && !e.shiftKey) {
+        setTool(toolHit.id)
+      } else if (/^[1-9]$/.test(key) && !e.shiftKey) {
+        const u = k.mapUnis[Number(key) - 1]
+        if (u) k.toggleUniverse(u.tag)
+      } else if (key === '0') {
+        setMapUniverses([])
+      } else if (key === '[' || key === ']') {
+        setCircleR((r) => Math.min(CIRCLE_MAX, Math.max(CIRCLE_MIN, Math.round(r * (key === ']' ? 1.2 : 1 / 1.2)))))
+      } else if (key === 'Escape') {
+        // Peel one layer at a time: tool, then selection, then highlights.
+        if (k.tool !== 'orbit') setTool('orbit')
+        else if (k.selHere.length) setMapSel([])
+        else if (k.mapUniverses.length) setMapUniverses([])
+        else return
+      } else return
+      e.preventDefault()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightboxOpen, setMapSel, setMapUniverses])
 
   // A pick is a node index; a rebuild can reorder nothing but may drop images.
   const picked = pick ? nodes[pick.index] : undefined
@@ -341,6 +490,17 @@ export function LatentMap({ busy }: { busy: boolean }) {
       explore.mutate({ src: rel, mode: 'neighborhood', radius: Number(reach), n: each, stay_local: true }),
     )
     setFlash(`queued ${each * rels.length} new image${each * rels.length > 1 ? 's' : ''}; they appear on the map when done`)
+  }
+
+  /** The k images nearest a spot, in the current space: a region of real images. */
+  const selectAround = (at: [number, number, number], k: number) => {
+    const d = shown.map((ni, i) => {
+      const p = sceneRef.current?.positionOf(i)
+      return { rel: nodes[ni].rel, d: p ? Math.hypot(p[0] - at[0], p[1] - at[1], p[2] - at[2]) : Infinity }
+    })
+    d.sort((a, b) => a.d - b.d)
+    setMapSel(d.slice(0, k).map((x) => x.rel))
+    setPick(null)
   }
 
   const chooseRegion = (id: number) => {
@@ -374,6 +534,15 @@ export function LatentMap({ busy }: { busy: boolean }) {
       }}
     >
       <div ref={hostRef} className="absolute inset-0" />
+      <SelectTool
+        host={hostRef}
+        scene={sceneRef}
+        tool={tool}
+        radius={circleR}
+        setRadius={setCircleR}
+        onCommit={commitSelection}
+        onPreview={(idx, mode) => setPreview(idx ? { idx, mode } : null)}
+      />
 
       {/* status + regions, left */}
       <div className="pointer-events-none absolute bottom-14 left-4 top-3 flex w-[248px] flex-col gap-2 text-[12px] leading-relaxed text-[#e9dccb]/80">
@@ -402,8 +571,64 @@ export function LatentMap({ busy }: { busy: boolean }) {
           ) : null}
         </div>
 
+        {mapUnis.length ? (
+          <div className="pointer-events-auto flex max-h-[42%] shrink-0 flex-col gap-1 overflow-y-auto pr-1">
+            <div className="flex items-center text-[10px] uppercase tracking-[2px] text-[#e9dccb]/55">
+              universes
+              <span className="ml-auto normal-case tracking-normal text-[#e9dccb]/40">1–9 show · 0 none</span>
+            </div>
+            {mapUnis.map((u) => {
+              const on = shownUnis.has(u.tag.toLocaleLowerCase())
+              return (
+                <div
+                  key={u.tag}
+                  className={cn(
+                    'flex items-center gap-1.5 rounded-[7px] border bg-black/40 py-[3px] pl-1.5 pr-1 transition-colors',
+                    on ? 'border-transparent' : 'border-white/10 hover:border-white/30',
+                  )}
+                  style={on ? { boxShadow: `inset 0 0 0 1px ${u.color}` } : undefined}
+                >
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    onClick={() => toggleUniverse(u.tag)}
+                    title={`show “${u.tag}” on the map: its images in its colour, the rest faded${u.key < 9 ? ` (${u.key + 1})` : ''}`}
+                  >
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: u.color }} />
+                    {u.key < 9 ? <span className="text-[10px] tabular-nums text-[#e9dccb]/45">{u.key + 1}</span> : null}
+                    <span className={cn('truncate', on ? 'text-[#fff1dc]' : '')}>{u.tag}</span>
+                    <span
+                      className="ml-auto shrink-0 text-[10.5px] tabular-nums text-[#e9dccb]/60"
+                      title={`${u.here.length} on this map · ${u.count} overall`}
+                    >
+                      {u.here.length}
+                      {u.here.length !== u.count ? <span className="opacity-60">/{u.count}</span> : null}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!u.here.length}
+                    onClick={(e) => {
+                      if (e.shiftKey) addMapSel(u.here)
+                      else setMapSel(u.here)
+                      flyToRels(u.here)
+                    }}
+                    title="select its images on the map (⇧ adds to the selection) — then sample more like them"
+                    className="shrink-0 rounded-[5px] border border-white/10 px-1 text-[10.5px] text-[#6fffd0]/85 hover:border-[#6fffd0]/50 disabled:opacity-30"
+                  >
+                    select
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        ) : null}
+
         {doc?.regions.length ? (
           <div className="pointer-events-auto min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="mb-1 text-[10px] uppercase tracking-[2px] text-[#e9dccb]/55" title="clusters of the look layout, found automatically">
+              regions
+            </div>
             <div className="flex flex-col gap-1">
               {doc.regions.map((r) => (
                 <button
@@ -428,9 +653,22 @@ export function LatentMap({ busy }: { busy: boolean }) {
         ) : null}
       </div>
 
-      {/* sampling, right */}
+      {/* selection + sampling, right */}
+      <div className="absolute right-3 top-3 flex max-h-[calc(100%-150px)] w-[272px] flex-col gap-2 overflow-y-auto">
+      <BatchNotice tone="map" className="rounded-[10px] border border-white/10 bg-black/60 px-2 py-1.5 backdrop-blur-md empty:hidden" />
+      {selHere.length || (preview && selIdx.length) ? (
+        <SelectionPanel
+          rels={preview ? selIdx.map((i) => nodes[shown[i]]?.rel).filter((r): r is string => !!r) : selHere}
+          cellOf={cellOf}
+          byRel={byRel}
+          atlasUrl={atlasUrl}
+          cols={cols}
+          onSampled={() => setFlash('queued — the new images grow on the map as they land')}
+          onFly={() => flyToRels(selHere)}
+        />
+      ) : null}
       {picked || regionRow ? (
-        <div className="absolute right-3 top-3 w-[256px] rounded-[12px] border border-white/10 bg-black/60 p-2.5 text-[12px] text-[#efe6da] backdrop-blur-md">
+        <div className="relative shrink-0 rounded-[12px] border border-white/10 bg-black/60 p-2.5 text-[12px] text-[#efe6da] backdrop-blur-md">
           <button
             type="button"
             className="absolute right-2.5 top-1.5 text-[#e9dccb]/50 hover:text-[#e9dccb]"
@@ -448,7 +686,7 @@ export function LatentMap({ busy }: { busy: boolean }) {
               <div className="mb-1.5 text-[11px] text-[#e9dccb]/70">
                 {pick?.kind === 'spot' ? 'Empty spot. Samples start from the nearest image:' : 'Selected image'}
               </div>
-              <button type="button" className="block w-full" onClick={() => openLightbox(picked.rel)} title="open full size">
+              <button type="button" className="block w-full" onClick={() => openLightbox(picked.rel, 'map')} title="open full size">
                 <img
                   src={`/img?path=${encodeURIComponent(picked.rel)}&t=${Math.floor(picked.t)}`}
                   alt=""
@@ -461,6 +699,39 @@ export function LatentMap({ busy }: { busy: boolean }) {
             <div className="mb-2 text-[11px] text-[#e9dccb]/70">
               Region · {regionRow.count} images. Samples from its {Math.min(4, regionRow.faces.length)} most typical.
             </div>
+          ) : null}
+
+          {/* Turn the pick into a selection of REAL images: the region the
+              universe sampler (selection panel) draws from. */}
+          {picked && pick?.kind === 'node' ? (
+            <button
+              type="button"
+              onClick={() => toggleMapSel(picked.rel)}
+              className="mb-2 w-full rounded-[8px] border border-[#6fffd0]/35 px-3 py-1 text-[11.5px] text-[#6fffd0] hover:border-[#6fffd0]/70"
+              title="⇧-click on the map does the same"
+            >
+              {mapSel.includes(picked.rel) ? '− drop from selection' : '＋ add to selection'}
+            </button>
+          ) : picked && pick?.kind === 'spot' ? (
+            <div className="mb-2 flex items-center gap-1 text-[11px] text-[#e9dccb]/70" title="select the images nearest this spot ON THE MAP, then sample from them as a group">
+              select nearest
+              {SPOT_K.map((k) => (
+                <Pill key={k} onClick={() => selectAround(pick.at, k)} className="!px-2 !py-[2px]">
+                  {k}
+                </Pill>
+              ))}
+            </div>
+          ) : regionRow ? (
+            <button
+              type="button"
+              onClick={() => {
+                const rels = nodes.filter((n) => n.r === regionRow.id && sceneOf.has(n.rel)).map((n) => n.rel)
+                setMapSel(rels)
+              }}
+              className="mb-2 w-full rounded-[8px] border border-[#6fffd0]/35 px-3 py-1 text-[11.5px] text-[#6fffd0] hover:border-[#6fffd0]/70"
+            >
+              ＋ select all {regionRow.count} → sample as a group
+            </button>
           ) : null}
 
           <div className="mb-1 text-[10px] uppercase tracking-[2px] text-[#e9dccb]/50">how far</div>
@@ -487,7 +758,7 @@ export function LatentMap({ busy }: { busy: boolean }) {
             }
             className="w-full rounded-[8px] bg-[#f3c27a] px-3 py-1.5 text-[12.5px] font-medium text-[#1b130c] hover:bg-[#ffd594] disabled:opacity-50"
           >
-            Sample {count} here
+            {pick?.kind === 'spot' || regionRow ? `Sample ${count} here` : `Sample ${count} around this image`}
           </button>
           {picked ? (
             <button
@@ -500,6 +771,21 @@ export function LatentMap({ busy }: { busy: boolean }) {
           ) : null}
         </div>
       ) : null}
+      </div>
+
+      {/* selection tools, top centre */}
+      <div className="absolute left-1/2 top-3 flex -translate-x-1/2 items-center gap-1 rounded-[10px] border border-white/10 bg-black/50 p-1 backdrop-blur-md">
+        {TOOLS.map((t) => (
+          <Pill key={t.id} on={tool === t.id} onClick={() => setTool(t.id)} title={t.title} className="!py-[3px]">
+            {t.label}
+          </Pill>
+        ))}
+        {tool === 'circle' ? (
+          <span className="px-1 text-[10.5px] text-[#e9dccb]/55">wheel / [ ] resize</span>
+        ) : tool === 'lasso' ? (
+          <span className="px-1 text-[10.5px] text-[#e9dccb]/55">⇧ add · ctrl remove</span>
+        ) : null}
+      </div>
 
       {error ? (
         <div className="absolute inset-0 flex items-center justify-center p-8 text-center text-[13px] text-[#e9dccb]/80">
@@ -541,13 +827,13 @@ export function LatentMap({ busy }: { busy: boolean }) {
       ) : null}
 
       {flash ? (
-        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-white/15 bg-black/70 px-3 py-1 text-[12px] text-[#efe6da]">
+        <div className="pointer-events-none absolute left-1/2 top-14 -translate-x-1/2 rounded-full border border-white/15 bg-black/70 px-3 py-1 text-[12px] text-[#efe6da]">
           {flash}
         </div>
       ) : null}
 
       <div className="pointer-events-none absolute bottom-3 left-4 text-[11px] text-[#e9dccb]/45">
-        click: sample there · double-click: open · ⇧-click: 🎬
+        click: open · ⇧-click: select · ⇧-drag: lasso · empty space: sample there · 1–9: universes · Esc: clear
       </div>
 
       <MapControls
@@ -555,8 +841,6 @@ export function LatentMap({ busy }: { busy: boolean }) {
         pathLen={timeline.filter((r) => nodes.some((n) => n.rel === r)).length}
         onResetView={() => sceneRef.current?.resetView()}
       />
-
-      <Lightbox items={items} />
     </div>
   )
 }

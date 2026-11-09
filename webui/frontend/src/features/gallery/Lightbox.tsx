@@ -4,25 +4,24 @@ import { useQueryClient } from '@tanstack/react-query'
 
 import {
   qk,
-  useAnimate,
-  useDeleteImage,
-  useFavorite,
   useGenPrompt,
+  useImages,
   useInvert,
   useJobWatcher,
   useMeta,
-  useRestoreConditions,
   useScoreImage,
   useTagImage,
   useTags,
 } from '../../api/queries'
-import type { ImageItem, ImageMeta, MotionLora } from '../../api/types'
-import { AnimateIcon, DeleteIcon, RestoreIcon, TimelineIcon } from '../../components/ui/actionIcons'
-import { imgSrc, numOr } from '../../lib/utils'
-import { ANIM_DENOISE, ANIM_MAX_FRAMES, WAN_FRAMES } from '../animate/AnimateBar'
+import type { ImageItem, ImageMeta } from '../../api/types'
+import { BreedIcon } from '../../components/ui/actionIcons'
+import { basename, imgSrc } from '../../lib/utils'
 import { useUI } from '../../store'
 import { ScoreStrip } from '../labeling/ScoreStrip'
 import { TagStrip } from '../labeling/TagStrip'
+import { ImageActions } from './ImageActions'
+import { useImageActions } from './useImageActions'
+import { stubItem, useViewerLists } from './viewerLists'
 
 /** Field order of the param dump, copied from the legacy PARAM_ORDER. */
 const PARAM_ORDER = [
@@ -77,11 +76,37 @@ function buildCli(m: ImageMeta): string {
   return ''
 }
 
-export function Lightbox({ items }: { items: ImageItem[] }) {
+
+const NO_ITEMS: ImageItem[] = []
+
+/**
+ * THE fullscreen image viewer — mounted once, in App, and opened from anywhere
+ * with `openLightbox(rel, source)`. ←/→ walk the list registered under that
+ * source (features/gallery/viewerLists.ts); the per-image actions are the same
+ * `useImageActions` set the gallery card renders, with hotkeys.
+ */
+export function Lightbox() {
   const cursor = useUI((s) => s.lightboxRel)
+  const source = useUI((s) => s.lightboxSource)
   const openLightbox = useUI((s) => s.openLightbox)
   const close = useUI((s) => s.closeLightbox)
   const open = cursor !== null
+  const listed = useViewerLists((s) => (source ? s.lists[source] : undefined))
+
+  // The live gallery rows, so whatever list the viewer was opened from (a map
+  // node, a timeline keyframe) shows the current star / scores. No polling of
+  // its own: the gallery's observer already refreshes this query.
+  const { data: images } = useImages(false)
+  const byRel = useMemo(() => {
+    const m = new Map<string, ImageItem>()
+    for (const list of Object.values(images ?? {})) for (const it of list) if (!m.has(it.rel)) m.set(it.rel, it)
+    return m
+  }, [images])
+  const items = useMemo(() => {
+    // Opened without a registered list: a one-image viewer.
+    const base = listed ?? (cursor ? [stubItem(cursor)] : NO_ITEMS)
+    return base.map((im) => byRel.get(im.rel) ?? im)
+  }, [listed, cursor, byRel])
 
   // Where the open image sits in the view RIGHT NOW. The view reorders under us
   // (new renders land at the front), so the position is looked up, never stored.
@@ -118,12 +143,10 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
     [items, at, openLightbox],
   )
 
-  const rel = pinned ?? item?.rel ?? null
-  const src = pinned
-    ? `/img?path=${encodeURIComponent(pinned)}`
-    : item
-      ? imgSrc(item.url, item.mtime)
-      : ''
+  // The image on screen: the pinned parent, else the cursor's row.
+  const viewed = pinned ? (byRel.get(pinned) ?? stubItem(pinned)) : (item ?? null)
+  const rel = viewed?.rel ?? null
+  const src = viewed ? imgSrc(viewed.url, viewed.mtime) : ''
 
   // The param panel is fixed to the bottom and its height depends on how much
   // metadata a given image carries, so measure it and treat the viewport above
@@ -141,30 +164,30 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
     return () => ro.disconnect()
   }, [panelEl])
 
-  const addKeyframe = useUI((s) => s.addKeyframe)
-  const inTimeline = useUI((s) => s.timeline.filter((r) => r === rel).length)
-
   const { data: meta } = useMeta(open ? rel : null)
   const qc = useQueryClient()
   const invert = useInvert()
   const genprompt = useGenPrompt()
   const watch = useJobWatcher()
 
+  // Same actions, same hook as the gallery card. Restore closes the viewer:
+  // the sidebar it just changed is behind this overlay.
+  // The viewer shows `feedback` whether it is a queued job or an error.
+  const { actions, feedback, breedParent } = useImageActions(viewed, {
+    onRestored: close,
+    onDeleted: () => setPinned(null),
+  })
+
   // The judgement comes from /api/meta rather than the gallery row, because a
   // parent link can pin an image that isn't in the current view at all -- and
   // toggling a universe needs the CURRENT set, not an empty fallback.
   const { data: vocab } = useTags(open)
-  const tools = useUI((s) => s.tools)
-  const animate = useAnimate()
-  const favorite = useFavorite()
-  const del = useDeleteImage()
-  const restore = useRestoreConditions()
   const scoreImage = useScoreImage()
   const tagImage = useTagImage()
   const tagInputRef = useRef<HTMLInputElement>(null)
   const labelScore = meta?.label_score ?? null
   const labelTags = meta?.label_tags ?? []
-  const fav = item?.fav ?? false
+  const fav = viewed?.fav ?? false
 
   const pickScore = useCallback(
     (n: number) => {
@@ -172,9 +195,6 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
     },
     [rel, scoreImage],
   )
-  const toggleStar = useCallback(() => {
-    if (rel) favorite.mutate({ rel, on: !fav })
-  }, [rel, fav, favorite])
   const applyTags = useCallback(
     (tags: string[]) => {
       if (rel) tagImage.mutate({ rel, tags })
@@ -185,17 +205,17 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
   // Held in refs for the same reason the label page does it: the listener is
   // attached once per open, not re-bound on every score or cursor move.
   const scoreRef = useRef(pickScore)
-  const starRef = useRef(toggleStar)
   const tagRef = useRef(applyTags)
   const tagsRef = useRef(labelTags)
   const vocabRef = useRef(vocab?.tags)
   const moveRef = useRef(move)
+  const actionsRef = useRef(actions)
   moveRef.current = move
   scoreRef.current = pickScore
-  starRef.current = toggleStar
   tagRef.current = applyTags
   tagsRef.current = labelTags
   vocabRef.current = vocab?.tags
+  actionsRef.current = actions
 
   useEffect(() => {
     if (!open) return
@@ -221,60 +241,32 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
         return
       }
       if (e.shiftKey) return
-      if (e.key === 'ArrowLeft') {
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key
+      if (key === 'ArrowLeft') {
         e.preventDefault()
         moveRef.current(-1)
-      } else if (e.key === 'ArrowRight') {
+      } else if (key === 'ArrowRight') {
         e.preventDefault()
         moveRef.current(1)
-      } else if (e.key >= '0' && e.key <= '9') {
+      } else if (key >= '0' && key <= '9' && key.length === 1) {
         e.preventDefault()
-        scoreRef.current(Number(e.key))
-      } else if (e.key === 's') {
-        e.preventDefault()
-        starRef.current()
-      } else if (e.key === 't') {
+        scoreRef.current(Number(key))
+      } else if (key === 't') {
         e.preventDefault()      // else the 't' lands in the box we just focused
         tagInputRef.current?.focus()
+      } else {
+        // Every per-image action carries its own key (s star, e explore, …).
+        // A held key must not queue the same job over and over.
+        const a = actionsRef.current.find((x) => x.hotkey === key)
+        if (a) {
+          e.preventDefault()
+          if (!a.disabled && !e.repeat) a.run()
+        }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [open])
-
-  const wanEngine = tools.anEngine === 'wan'
-  const doAnimate = () => {
-    if (!rel) return
-    animate.mutate(
-      wanEngine
-        ? {
-            src: rel,
-            engine: 'wan',
-            wan_model: (tools.wnModel || '2.2-a14b') as '2.2-a14b' | '2.1-14b',
-            frames: numOr(tools.wnFrames, WAN_FRAMES),
-            // blank = the engine's own default (6 with Lightning, 30 without)
-            steps: (tools.wnSteps ?? '').trim() === '' ? null : Number(tools.wnSteps),
-            lightning: tools.wnLightning === '1',
-            size: (tools.wnSize ?? '').trim() === '' ? null : Number(tools.wnSize),
-            quant: (tools.wnQuant || 'nf4') as 'nf4' | 'fp8',
-            guidance: numOr(tools.wnGuidance, 1),
-            prompt: (tools.wnPrompt ?? '').trim() || null,
-            seed: (tools.wnSeed ?? '').trim() === '' ? null : Number(tools.wnSeed),
-            smooth_fps: numOr(tools.anSmooth, 0),
-          }
-        : {
-            src: rel,
-            engine: 'animatediff',
-            strength: tools.anSource === 'cond' ? 0 : numOr(tools.anDenoise, ANIM_DENOISE),
-            frames: numOr(tools.anFrames, ANIM_MAX_FRAMES),
-            smooth_fps: numOr(tools.anSmooth, 0),
-            motion_lora: (tools.anLora || 'none') as MotionLora,
-            prompt: (tools.anPrompt ?? '').trim() || null,
-            // Pixels mode truncates the denoise schedule; FreeInit needs all of it.
-            free_init: tools.anSource === 'cond' ? numOr(tools.anFreeInit, 0) : 0,
-          },
-    )
-  }
 
   const runInvert = (space: 'clip' | 'native') => {
     if (!rel) return
@@ -292,7 +284,7 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
     )
   }
 
-  const score = item?.score ?? null
+  const score = viewed?.score ?? null
   const nativeable = rel ? /anarchy_(sd15|sdxl)_/.test(rel) : false
   const ordered = meta
     ? PARAM_ORDER.filter((k) => k in meta && meta[k] !== null)
@@ -312,21 +304,23 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
         >
           <Dialog.Title className="sr-only">{rel ?? 'image'}</Dialog.Title>
           <Dialog.Description className="sr-only">
-            Generation parameters and navigation for the selected image.
+            Generation parameters, per-image actions and navigation for the selected image.
           </Dialog.Description>
 
           <button
             className="fixed left-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
-                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink"
+                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink disabled:opacity-30"
             title="previous (←)"
+            disabled={at <= 0}
             onClick={() => move(-1)}
           >
             ‹
           </button>
           <button
             className="fixed right-3.5 top-1/2 z-[60] -translate-y-1/2 rounded-[10px] border border-line
-                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink"
+                       bg-panel/75 px-4 py-3.5 text-[26px] leading-none text-ink disabled:opacity-30"
             title="next (→)"
+            disabled={at >= items.length - 1}
             onClick={() => move(1)}
           >
             ›
@@ -345,20 +339,29 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
           <div
             ref={setPanelEl}
-            className="fixed inset-x-0 bottom-0 max-h-[38vh] overflow-auto border-t border-line
+            className="fixed inset-x-0 bottom-0 max-h-[42vh] overflow-auto border-t border-line
                        bg-logbg/[.92] px-4 py-2.5 font-mono text-[12px] leading-[1.6] text-[#cfd3dc]"
             onClick={(e) => e.stopPropagation()}
           >
+            {/* The gallery card's actions, labelled, with their keys. A queued
+                job is confirmed right here; the viewer stays open. */}
+            <div className="mb-2">
+              <ImageActions variant="viewer" actions={actions} feedback={feedback} current={rel} />
+              {breedParent ? (
+                <div className="mt-1 font-sans text-[12px] text-dim">
+                  <BreedIcon size={12} className="mr-1 inline" />
+                  breed parent A = <b className="text-ink">{basename(breedParent)}</b>
+                  {breedParent === rel
+                    ? ' — move to a second image (same backend) and press b, or b here again to cancel'
+                    : ' — press b to cross it with this image'}
+                </div>
+              ) : null}
+            </div>
+
             {/* Judge without leaving the gallery: the same strips the 🏷 label
-                page uses, on the same keys. */}
+                page uses, on the same keys. The star lives in the toolbar above. */}
             <div className="mb-2 flex flex-col gap-2 font-sans">
-              <ScoreStrip
-                score={labelScore}
-                fav={fav}
-                onPick={pickScore}
-                onStar={toggleStar}
-                disabled={!rel}
-              />
+              <ScoreStrip score={labelScore} fav={fav} onPick={pickScore} disabled={!rel} />
               <TagStrip
                 tags={labelTags}
                 vocabulary={vocab?.tags ?? []}
@@ -370,6 +373,11 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
             <div className="mb-1 text-run">
               {rel}
+              {items.length > 1 && !pinned ? (
+                <span className="ml-2.5 text-dim">
+                  {at + 1} / {items.length}
+                </span>
+              ) : null}
               {score != null ? (
                 <span className="ml-2.5 text-score" title="LAION aesthetic model">
                   aesthetic {score.toFixed(2)}
@@ -399,57 +407,8 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
 
             {cli ? <div className="mt-1.5 text-score">{cli}</div> : null}
 
-            {/* discovered hard prompts (PEZ / native inversion) + timeline */}
+            {/* discovered hard prompts (PEZ / native inversion) */}
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
-              {rel && /anarchy_/.test(rel) ? (
-                <button
-                  className="sa-btn sa-btn-sm"
-                  title="reset the sidebar to the conditions that generated this image, then close this view"
-                  disabled={restore.isPending}
-                  // Closed on success: the sidebar it just changed is behind this overlay.
-                  onClick={() => restore.mutate(rel, { onSuccess: close })}
-                >
-                  <RestoreIcon size={12} className="mr-1 inline" />
-                  use these settings
-                </button>
-              ) : null}
-              {rel && (wanEngine ? /anarchy_/.test(rel) : /anarchy_(sd15|sd2)_/.test(rel)) ? (
-                <button
-                  className="sa-btn sa-btn-sm"
-                  title={
-                    wanEngine
-                      ? 'animate with Wan 2.1 (minutes) — lands in the 🎞 Films tab'
-                      : 'animate with AnimateDiff (~20s) — lands in the 🎞 Films tab'
-                  }
-                  disabled={animate.isPending}
-                  onClick={doAnimate}
-                >
-                  <AnimateIcon size={12} className="mr-1 inline" />
-                  animate{wanEngine ? ' (Wan)' : ''}
-                </button>
-              ) : null}
-              {rel && /anarchy_/.test(rel) ? (
-                <button
-                  className="sa-btn sa-btn-sm"
-                  title="add as a keyframe to the 🎬 Timeline"
-                  onClick={() => addKeyframe(rel)}
-                >
-                  <TimelineIcon size={12} className="mr-1 inline" />
-                  add to timeline{inTimeline > 0 ? ` (${inTimeline})` : ''}
-                </button>
-              ) : null}
-              {rel ? (
-                <button
-                  className="sa-btn sa-btn-sm hover:border-err hover:text-err"
-                  title="delete image + latents from disk (no undo)"
-                  disabled={del.isPending}
-                  onClick={() => del.mutate(rel, { onSuccess: () => setPinned(null) })}
-                >
-                  <DeleteIcon size={12} className="mr-1 inline" />
-                  delete
-                </button>
-              ) : null}
-
               {meta?.inverted_prompt !== undefined ? (
                 <span className="text-pez">
                   🔤 “{meta.inverted_prompt}”{' '}
@@ -499,12 +458,6 @@ export function Lightbox({ items }: { items: ImageItem[] }) {
               ) : null}
             </div>
 
-            {del.isError ? (
-              <div className="text-err">{(del.error as Error).message}</div>
-            ) : null}
-            {restore.isError ? (
-              <div className="text-err">{(restore.error as Error).message}</div>
-            ) : null}
             {invert.isError ? (
               <div className="text-err">{(invert.error as Error).message}</div>
             ) : null}

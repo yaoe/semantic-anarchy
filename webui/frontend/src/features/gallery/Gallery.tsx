@@ -8,7 +8,7 @@ import { FilmList } from '../timeline/FilmList'
 import { Timeline } from '../timeline/Timeline'
 import { useUI, type SortKey } from '../../store'
 import { Card } from './Card'
-import { Lightbox } from './Lightbox'
+import { useViewerList } from './viewerLists'
 
 // three.js is ~600 kB -- only fetched when the 🌌 tab is first opened.
 const LatentMap = lazy(() =>
@@ -86,6 +86,8 @@ export function Gallery({ busy }: { busy: boolean }) {
     () => sortItems(filterByTag(list, tagFilter), sortBy),
     [list, tagFilter, sortBy],
   )
+  // The fullscreen viewer (mounted once, in App) walks exactly this view.
+  useViewerList('gallery', view)
 
   const parentRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
@@ -175,7 +177,7 @@ export function Gallery({ busy }: { busy: boolean }) {
         </div>
       ) : null}
       {tab === 'map' ? (
-        // The map fills the pane and brings its own lightbox (over map nodes).
+        // The map fills the pane; its images open in the same app-level viewer.
         <Suspense fallback={<div className="p-8 text-center text-dim">loading map…</div>}>
           <LatentMap busy={busy} />
         </Suspense>
@@ -243,7 +245,6 @@ export function Gallery({ busy }: { busy: boolean }) {
           </div>
         </>
       )}
-      {tab !== 'map' ? <Lightbox items={view} /> : null}
     </div>
   )
 }

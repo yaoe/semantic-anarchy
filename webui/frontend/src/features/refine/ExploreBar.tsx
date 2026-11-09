@@ -27,6 +27,21 @@ export function ExploreBar() {
         width="w-[110px]"
       />
       <Tool id="exN" label="Children" type="number" placeholder="6" width="w-[70px]" />
+      <Tool
+        id="exKeep"
+        label="Noise"
+        tooltip={
+          'fresh: every child gets new noise — new compositions in the parent’s style. ' +
+          'parent’s: every child re-uses the parent’s noise — the same composition, with the ' +
+          'meaning nudged by the radius. Either way the child is rendered with the parent’s ' +
+          'own checkpoint, size, steps, CFG and negative.'
+        }
+        width="w-[110px]"
+        options={[
+          { value: '', label: 'fresh' },
+          { value: '1', label: 'parent’s' },
+        ]}
+      />
       <WalkTool />
       {breedParent ? (
         <span className="sa-hint mb-1.5 min-w-[220px] max-w-[520px] flex-1 basis-0">

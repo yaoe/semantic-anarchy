@@ -29,7 +29,7 @@ from semantic_anarchy.io_utils import (IMAGE_EXTS, image_ext, save_image,
 from semantic_anarchy.cli_args import (
     add_backend_args, add_experiment_args, record_experiment, resolve_gen_defaults,
     load_backend, effective_negative, dist_prefix, sampler_kwargs, resolve_lengths,
-    warn_sampler_args,
+    warn_sampler_args, apply_weirdness,
 )
 
 
@@ -42,6 +42,12 @@ def main(argv=None) -> int:
     parser.add_argument("--n", type=int, default=8, help="how many images to generate")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help=">1 = wilder/less typical, <1 = closer to the bland center")
+    parser.add_argument("--weirdness", type=float, default=None,
+                        help="reach as an ABSOLUTE distance from the root prompt corpus "
+                             "(the gallery's d number) instead of a multiplier: the "
+                             "temperature is solved per distribution, so 1.7 means the "
+                             "same on the corpus and on a fit of images that were "
+                             "themselves drawn at 1.7. Overrides --temperature.")
     parser.add_argument("--min-distance", type=float, default=None,
                         help="floor: rescale any sample whose distance gauge falls "
                              "below this up onto it (avoid the bland corpus core).")
@@ -103,6 +109,11 @@ def main(argv=None) -> int:
 
     warn_sampler_args(args, dists)
     lengths = resolve_lengths(args, backend, dists, args.n, rng)
+    if args.weirdness is not None:
+        if args.target_distance is not None or args.radius_band:
+            print("[gen] WARNING: --weirdness sets a temperature, and the radius pin "
+                  "cancels any temperature exactly -- the pin wins")
+        apply_weirdness(args, dists, lengths)
     named = backend.sample(dists, n=args.n, temperature=args.temperature, rng=rng,
                            **sampler_kwargs(args, lengths))
 
@@ -211,6 +222,7 @@ def main(argv=None) -> int:
             "executor": backend.executor,
             "model": args.ckpt or args.model or "(default)",
             "sampler": args.sampler, "temperature": args.temperature,
+            "weirdness": args.weirdness,
             "coherence": args.coherence if args.sampler == "blend" else None,
             "components": args.components, "comp_lo": args.comp_lo,
             "equalize": args.equalize, "truncation": args.truncation,
@@ -231,7 +243,9 @@ def main(argv=None) -> int:
             "height": args.height, "width": args.width,
             "batch_seed": seed, "image_seed": seed + i, "index": i,
             "dist": str(args.dist),
-            "distance": round(backend.distance(dists, one), 3),
+            # In the ROOT corpus frame (see EmbeddingDistribution.weirdness), so a
+            # card's d means the same whatever distribution drew the image.
+            "distance": round(backend.weirdness(dists, one), 3),
             "target_distance": args.target_distance,
             "min_distance": args.min_distance,
             "init_image": (init_names[i] if init_names else None),

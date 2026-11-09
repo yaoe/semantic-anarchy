@@ -4,9 +4,14 @@
  * here knows about the API or the store.
  *
  * Layers, back to front: a faint starfield, the corpus "dust", lineage edges,
- * the timeline path, the sampling probe, and the images themselves -- point
- * sprites that draw either a thumbnail out of one atlas texture or a lit bead.
- * Node positions tween when the layout changes.
+ * the timeline path, the sampling probe, the selection halos, and the images
+ * themselves -- point sprites that draw either a thumbnail out of one atlas
+ * texture or a lit bead. Node positions tween when the layout changes.
+ *
+ * Selection is React's: it hands over scene indexes (`setSelection`) and asks
+ * where every node is on screen (`projectAll`) to lasso or circle-select. The
+ * halos are an ILLUSTRATION of a sampling spread around the selected images,
+ * not a region of conditioning space (a UMAP has no inverse).
  */
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
@@ -44,7 +49,7 @@ interface Callbacks {
   hover: (hit: Hit | null) => void
   pick: (index: number, e: { shiftKey: boolean }) => void
   /** a click that hit no image: the point on the ray nearest what is around it */
-  pickEmpty: (p: [number, number, number]) => void
+  pickEmpty: (p: [number, number, number], e: { shiftKey: boolean }) => void
   open: (index: number) => void
 }
 
@@ -57,6 +62,7 @@ const TWEEN_MS = 750
 const NODE_VERT = /* glsl */ `
   attribute float size;
   attribute float highlight;
+  attribute float sel;
   attribute float tile;
   attribute float fade;
   attribute vec3 color;
@@ -65,26 +71,31 @@ const NODE_VERT = /* glsl */ `
   uniform float uDepth;
   varying vec3 vColor;
   varying float vHi;
+  varying float vSel;
   varying float vTile;
   varying float vFade;
   void main() {
     vColor = color;
     vHi = highlight;
+    vSel = sel;
     vTile = tile;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mv;
     // Depth cue: what is behind the orbit centre recedes.
-    vFade = fade * clamp(1.25 - 0.08 * max(-mv.z - uDepth, 0.0), 0.4, 1.0);
-    gl_PointSize = max(3.0, size * uScale * (1.0 + 0.8 * highlight) * uProj / -mv.z);
+    vFade = max(fade, sel) * clamp(1.25 - 0.08 * max(-mv.z - uDepth, 0.0), 0.4, 1.0);
+    gl_PointSize = max(3.0, size * uScale * (1.0 + 0.8 * highlight + 0.3 * sel) * uProj / -mv.z);
   }
 `
 // uThumb = 1: the image, rounded, with its colour as a border. 0: a lit bead.
+// A selected node (vSel) wears a thick mint border / ring instead.
+const SEL_RGB = 'vec3(0.435, 1.0, 0.816)'
 const NODE_FRAG = /* glsl */ `
   uniform sampler2D uAtlas;
   uniform float uCols;
   uniform float uThumb;
   varying vec3 vColor;
   varying float vHi;
+  varying float vSel;
   varying float vTile;
   varying float vFade;
   void main() {
@@ -93,21 +104,45 @@ const NODE_FRAG = /* glsl */ `
       vec2 q = abs(uv - 0.5);
       float corner = length(max(q - 0.40, 0.0));
       if (corner > 0.10) discard;
-      float border = max(q.x, q.y) > (0.44 - 0.06 * vHi) ? 1.0 : 0.0;
+      float border = max(q.x, q.y) > (0.44 - 0.06 * vHi - 0.04 * vSel) ? 1.0 : 0.0;
       vec2 cell = vec2(mod(vTile, uCols), floor(vTile / uCols));
       vec3 img = texture2D(uAtlas, (cell + uv) / uCols).rgb;
-      vec3 c = mix(img, mix(vColor, vec3(1.0), vHi), border);
+      vec3 edge = mix(mix(vColor, vec3(1.0), vHi), ${SEL_RGB}, vSel);
+      vec3 c = mix(img, edge, border);
       gl_FragColor = vec4(c * vFade, 1.0);
       return;
     }
     float d = length(uv - 0.5);
     if (d > 0.5) discard;
     float core = smoothstep(0.17, 0.10, d);
-    float ring = smoothstep(0.035, 0.0, abs(d - 0.30)) * (0.55 + 0.45 * vHi);
+    float ring = smoothstep(0.035 + 0.04 * vSel, 0.0, abs(d - 0.30 - 0.1 * vSel)) * (0.55 + 0.45 * max(vHi, vSel));
     float halo = exp(-d * d * 26.0) * 0.55;
     vec3 c = mix(vColor, vec3(1.0), core * 0.55 + vHi * 0.25);
+    c = mix(c, ${SEL_RGB}, ring * vSel);
     float a = clamp(core + ring + halo, 0.0, 1.0) * vFade;
     gl_FragColor = vec4(c * a, a);
+  }
+`
+
+// Selection halos: soft discs whose world size tracks the spread.
+const HALO_VERT = /* glsl */ `
+  uniform float uProj;
+  uniform float uSize;
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    gl_PointSize = min(2048.0, uSize * uProj / -mv.z);
+  }
+`
+const HALO_FRAG = /* glsl */ `
+  uniform float uAlpha;
+  void main() {
+    float d = length(gl_PointCoord - 0.5) * 2.0;
+    if (d > 1.0) discard;
+    // A flat disc with a soft edge: under MAX blending the union of many reads
+    // as one region rather than a stack of rings.
+    float a = (1.0 - smoothstep(0.55, 1.0, d)) * uAlpha;
+    gl_FragColor = vec4(${SEL_RGB} * a, a);
   }
 `
 
@@ -194,6 +229,9 @@ export class LatentScene {
   private probeMark: THREE.Sprite
   private probeAt: [number, number, number] | null = null
   private probeTo: number[] = []
+  private halo: THREE.Points
+  private haloMat: THREE.ShaderMaterial
+  private sel: number[] = []
   private atlasUrl: string | null = null
   private wantThumbs = false
   private selected: number | null = null
@@ -206,7 +244,8 @@ export class LatentScene {
   private cur = new Float32Array(0)
   private t0 = 0
   private data: SceneData | null = null
-  private down: { x: number; y: number } | null = null
+  /** Where the button went down, and whether the pointer has since wandered (a drag, not a click). */
+  private down: { x: number; y: number; moved: boolean } | null = null
   private hoverQueued: PointerEvent | null = null
 
   private host: HTMLElement
@@ -304,6 +343,24 @@ export class LatentScene {
     this.probe.renderOrder = 5
     this.scene.add(this.probe)
 
+    this.haloMat = new THREE.ShaderMaterial({
+      vertexShader: HALO_VERT,
+      fragmentShader: HALO_FRAG,
+      uniforms: { uProj: { value: 500 }, uSize: { value: 1 }, uAlpha: { value: 0.2 } },
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      // MAX, not additive: overlapping halos read as their union (one soft
+      // region) instead of piling up into a white blob over a big selection.
+      blending: THREE.CustomBlending,
+      blendEquation: THREE.MaxEquation,
+    })
+    this.halo = new THREE.Points(new THREE.BufferGeometry(), this.haloMat)
+    this.halo.renderOrder = 3
+    this.halo.visible = false
+    this.halo.frustumCulled = false
+    this.scene.add(this.halo)
+
     const el = this.renderer.domElement
     el.addEventListener('pointermove', this.onMove)
     el.addEventListener('pointerdown', this.onDown)
@@ -332,6 +389,8 @@ export class LatentScene {
     g.setAttribute('position', new THREE.BufferAttribute(this.cur, 3))
     if (!sameCount || !g.getAttribute('highlight'))
       g.setAttribute('highlight', new THREE.BufferAttribute(new Float32Array(n), 1))
+    if (!sameCount || !g.getAttribute('sel'))
+      g.setAttribute('sel', new THREE.BufferAttribute(new Float32Array(n), 1))
     g.setAttribute('color', new THREE.BufferAttribute(d.colors, 3))
     g.setAttribute('size', new THREE.BufferAttribute(d.sizes, 1))
     g.setAttribute('tile', new THREE.BufferAttribute(d.tiles, 1))
@@ -362,6 +421,7 @@ export class LatentScene {
     this.buildAxes(d)
     this.writePositions()
     this.paintHighlight()
+    this.paintSelection()
     if (d.refit) this.fit(this.to)
   }
 
@@ -373,6 +433,57 @@ export class LatentScene {
   setSelected(index: number | null) {
     this.selected = index
     this.paintHighlight()
+  }
+
+  /** Scene indexes drawn as selected (mint border + halo). */
+  setSelection(idx: number[]) {
+    this.sel = idx
+    this.paintSelection()
+  }
+
+  /**
+   * Halo around each selected image, `radius` world units. Illustrative only:
+   * it shows how far the spread reaches relative to the selection's own extent
+   * ON THIS MAP, which is not where new images will land.
+   */
+  setHalo(radius: number, visible: boolean) {
+    this.haloMat.uniforms.uSize.value = Math.max(0, radius * 2)
+    this.halo.visible = visible && radius > 0 && this.sel.length > 0
+  }
+
+  /** While a selection tool is dragging, left-drag must not also orbit. */
+  setOrbitEnabled(on: boolean) {
+    this.controls.enabled = on
+  }
+
+  /**
+   * Every node's position on screen (CSS px from the canvas' top-left), x,y
+   * pairs; NaN for nodes behind the camera. What lasso / circle select test.
+   */
+  projectAll(): Float32Array {
+    const n = this.cur.length / 3
+    const out = new Float32Array(n * 2)
+    const w = this.host.clientWidth
+    const h = this.host.clientHeight
+    this.camera.updateMatrixWorld()
+    const m = new THREE.Matrix4().multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
+    const e = m.elements
+    for (let i = 0; i < n; i++) {
+      const x = this.cur[i * 3]
+      const y = this.cur[i * 3 + 1]
+      const z = this.cur[i * 3 + 2]
+      const cw = e[3] * x + e[7] * y + e[11] * z + e[15]
+      if (cw <= 1e-6) {
+        out[i * 2] = NaN
+        out[i * 2 + 1] = NaN
+        continue
+      }
+      const cx = (e[0] * x + e[4] * y + e[8] * z + e[12]) / cw
+      const cy = (e[1] * x + e[5] * y + e[9] * z + e[13]) / cw
+      out[i * 2] = (cx * 0.5 + 0.5) * w
+      out[i * 2 + 1] = (-cy * 0.5 + 0.5) * h
+    }
+    return out
   }
 
   /** The sampling marker, tied by lines to the images it would draw from. */
@@ -564,6 +675,26 @@ export class LatentScene {
     a.needsUpdate = true
   }
 
+  private paintSelection() {
+    const a = this.nodes.geometry.getAttribute('sel') as THREE.BufferAttribute | undefined
+    if (a) {
+      const v = a.array as Float32Array
+      v.fill(0)
+      for (const i of this.sel) if (i < a.count) v[i] = 1
+      a.needsUpdate = true
+    }
+    this.writeHalo()
+  }
+
+  private writeHalo() {
+    const n = this.cur.length / 3
+    const idx = this.sel.filter((i) => i < n)
+    const p = new Float32Array(idx.length * 3)
+    idx.forEach((ni, k) => p.set(this.cur.subarray(ni * 3, ni * 3 + 3), k * 3))
+    this.halo.geometry.setAttribute('position', new THREE.BufferAttribute(p, 3))
+    if (!idx.length) this.halo.visible = false
+  }
+
   private writeProbe() {
     if (!this.probeAt) return
     const [x, y, z] = this.probeAt
@@ -597,6 +728,7 @@ export class LatentScene {
     pp.needsUpdate = true
     if (d.path.length > 1) this.path.computeLineDistances()
     this.writeProbe()
+    if (this.sel.length) this.writeHalo()
   }
 
   private loop = () => {
@@ -634,6 +766,7 @@ export class LatentScene {
     // world-size -> pixels at unit depth, for the node sprites
     this.nodeMat.uniforms.uProj.value =
       (h * this.renderer.getPixelRatio()) / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)))
+    this.haloMat.uniforms.uProj.value = this.nodeMat.uniforms.uProj.value
   }
 
   // ------------------------------------------------------------- picking ---
@@ -667,19 +800,23 @@ export class LatentScene {
 
   private onMove = (e: PointerEvent) => {
     this.hoverQueued = e
+    // A drag that comes back to where it started (a closed lasso, an orbit
+    // there and back) is still a drag: judge by the furthest it went.
+    const d = this.down
+    if (d && !d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) d.moved = true
   }
   private onLeave = () => this.cb.hover(null)
   private onDown = (e: PointerEvent) => {
-    this.down = { x: e.clientX, y: e.clientY }
+    this.down = { x: e.clientX, y: e.clientY, moved: false }
   }
   private onUp = (e: PointerEvent) => {
     const d = this.down
     this.down = null
-    if (!d || e.button !== 0 || Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) return
+    if (!d || e.button !== 0 || d.moved || Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) return
     this.ray(e)
     const i = this.nearest(this.nodes)
     if (i != null) this.cb.pick(i, { shiftKey: e.shiftKey })
-    else this.cb.pickEmpty(this.emptyPoint())
+    else this.cb.pickEmpty(this.emptyPoint(), { shiftKey: e.shiftKey })
   }
 
   private onDouble = (e: MouseEvent) => {

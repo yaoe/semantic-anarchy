@@ -1,10 +1,11 @@
-import { useState, type DragEvent } from 'react'
+import { useMemo, useState, type DragEvent } from 'react'
 
 import { useFilm, useKeyframes } from '../../api/queries'
 import type { EasingId, InterpId, KeyframeRow } from '../../api/types'
 import { Tool } from '../../components/ui/Tool'
 import { cn } from '../../lib/utils'
 import { useUI } from '../../store'
+import { stubItem, useViewerList } from '../gallery/viewerLists'
 import { FilmList } from './FilmList'
 
 const num = (v: string | undefined, dflt: number) =>
@@ -61,6 +62,7 @@ function Keyframe({
 }) {
   const remove = useUI((s) => s.removeKeyframe)
   const move = useUI((s) => s.moveKeyframe)
+  const openLightbox = useUI((s) => s.openLightbox)
   const name = rel.split('/').pop() ?? rel
 
   return (
@@ -70,7 +72,7 @@ function Keyframe({
       onDragEnd={onDragEnd}
       onDragOver={onDragOver}
       onDrop={onDrop}
-      title={`${rel}\n(drag to reorder)`}
+      title={`${rel}\n(drag to reorder, click to view full size)`}
       className={cn(
         'relative w-[132px] shrink-0 cursor-grab rounded-lg border border-line bg-panel p-1.5',
         'active:cursor-grabbing',
@@ -83,7 +85,8 @@ function Keyframe({
         src={`/img?path=${encodeURIComponent(rel)}`}
         alt={name}
         draggable={false}
-        className="aspect-square w-full rounded-md bg-black object-contain"
+        className="aspect-square w-full cursor-zoom-in rounded-md bg-black object-contain"
+        onClick={() => openLightbox(rel, 'timeline')}
       />
       <span className="absolute left-2.5 top-2.5 rounded bg-black/70 px-1.5 text-[10px] text-ink">
         {index + 1}
@@ -152,6 +155,10 @@ function Strip({
   const timeline = useUI((s) => s.timeline)
   const move = useUI((s) => s.moveKeyframe)
   const [from, setFrom] = useState<number | null>(null)
+  // The fullscreen viewer walks the keyframes in film order — once each, since
+  // a round trip (A → B → A) repeats a rel and the viewer navigates by rel.
+  const viewerItems = useMemo(() => [...new Set(timeline)].map((r) => stubItem(r)), [timeline])
+  useViewerList('timeline', viewerItems)
   const [over, setOver] = useState<number | null>(null)
 
   // Splice semantics: the dragged keyframe takes the slot it was dropped on,

@@ -161,11 +161,12 @@ def test_cancelling_a_job_waiting_at_the_gate_frees_it(app):
 
 
 # ---- 🌌 map: sampling that stays local ---------------------------------------
-def _explore_argv(app, monkeypatch, tmp_path, **body):
+def _explore_argv(app, monkeypatch, tmp_path, ckpt_on_disk=True, **body):
     """argv /api/explore would queue for a real source image with this sidecar."""
     import json as _json
     ckpt = tmp_path / "source_model.safetensors"
-    ckpt.write_bytes(b"")
+    if ckpt_on_disk:
+        ckpt.write_bytes(b"")
     src = tmp_path / "anarchy_sd15_1_000.jpg"
     src.write_bytes(b"")
     src.with_suffix(".npz").write_bytes(b"")
@@ -194,9 +195,19 @@ def test_stay_local_renders_with_the_sources_checkpoint(app, monkeypatch, tmp_pa
     assert argv[argv.index("--ckpt") + 1] == ckpt
 
 
-def test_plain_explore_still_uses_the_selected_checkpoint(app, monkeypatch, tmp_path):
-    argv, _ = _explore_argv(app, monkeypatch, tmp_path)
+def test_plain_explore_renders_with_the_sources_checkpoint_too(app, monkeypatch, tmp_path):
+    # A child rendered through another checkpoint than its parent stops looking
+    # like it, so explore follows the source, not the sidebar's pick.
+    argv, ckpt = _explore_argv(app, monkeypatch, tmp_path)
     assert "--stay-local" not in argv
+    assert argv[argv.index("--ckpt") + 1] == ckpt
+    # ...and forces no render knob of its own: explore.py copies them from src.
+    assert "--scheduler" not in argv and "--steps" not in argv
+
+
+def test_explore_falls_back_to_the_selected_checkpoint_when_the_sources_is_gone(
+        app, monkeypatch, tmp_path):
+    argv, _ = _explore_argv(app, monkeypatch, tmp_path, ckpt_on_disk=False)
     assert argv[argv.index("--ckpt") + 1] == "selected.safetensors"
 
 

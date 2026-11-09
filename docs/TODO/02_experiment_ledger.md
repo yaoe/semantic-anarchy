@@ -41,5 +41,16 @@ Template — copy, don't edit in place:
 - **Suggests next** — the follow-up, scheduled before the enthusiasm decays.
 -->
 
-_No experiments run yet. Phase 0 (instrumentation) shipped; E00 · baseline
-census is the first entry that belongs here._
+### E-replay · why explore children didn't look like their parent (2026-11-08, agent)
+- **Hypothesis** — the `.npz` replays fine; the render settings around it don't.
+- **Ran** — 10 random recent sd15 images × {same seed, 3 fresh seeds, ±0.3 perturbation, the dashboard's old explore}, then a one-factor ablation on 4 of them. No labels (agent-judged).
+- **Numbers** — same-seed replay MAE 0–1.8/255. Old explore: 0/10 seeds kept their look, all drifted to one shared saturated look.
+- **Learned** — checkpoint ≫ size ≈ CFG negative ≫ scheduler. Children must replay the parent's settings → [reference/render-replay.md](../reference/render-replay.md).
+- **Suggests next** — label a batch of explore children with `--stay-local` vs fresh noise; which reads as "more of this"?
+
+### E-universe · sampling inside a hand-curated universe (2026-11-08, agent)
+- **Hypothesis** — a fitted Gaussian can't make "more of" a curated set; member-anchored sampling can.
+- **Ran** — 5 pseudo-universes (7–11 members) + the 53 ★ favourites; 9 strategies × 8 renders each; eye count + CLIP proxies. Pool of 500 renders kept out of the gallery.
+- **Numbers** — eye in-look out of 40: fit T1.7 sidebar 0, fit T1 anchor-settings 17, slerp 0.5 anchor-seed 32. CLIP nn-member share .39 → .78 (members .83).
+- **Learned** — members are independent directions; a fit draw is near none of them. The noise seed carries as much look as the conditioning (CLIP 0.67 fresh vs 0.99 same seed). → [reference/collection-sampling.md](../reference/collection-sampling.md)
+- **Suggests next** — the human label: run 🪐 on a real tagged universe at spread 0.3 / 0.5 / 1.0 / 1.5 with one experiment id each and score them; does the keeper-rate fall off with spread, or do the wide ones find new pockets?

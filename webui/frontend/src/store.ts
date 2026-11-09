@@ -13,6 +13,7 @@ import { createJSONStorage, persist } from 'zustand/middleware'
 import { serverPrefsStorage } from './lib/prefs'
 import { DEFAULT_VALUES, aspectDims, type Values } from './params/schema'
 import type { TabKey } from './api/types'
+import type { ViewerSource } from './features/gallery/viewerLists'
 
 export type SortKey = 'new' | 'score' | 'dist' | 'dist_asc' | 'nov' | 'res'
 
@@ -32,6 +33,7 @@ export const DEFAULT_TOOLS: Record<string, string> = {
   rfPrompt: '',
   exRadius: '',
   exN: '',
+  exKeep: '',
   wkStep: '',
   wkDir: 'outward',
   wkTurn: '',
@@ -95,6 +97,10 @@ export const DEFAULT_MAP: Record<string, string> = {
   spin: '',
   reach: '0.2',
   count: '6',
+  // 🪐 "sample more like these" (POST /api/collection/sample), shared by the
+  // map's selection panel and the universe bar so one setting follows you.
+  spread: '0.5',
+  sampleN: '8',
 }
 
 /**
@@ -213,6 +219,20 @@ interface UIState {
   removeFitSel: (rels: string[]) => void
   clearFitSel: () => void
 
+  /**
+   * 🌌 Map selection: real images picked on the map (⇧-click, lasso, circle),
+   * the thing "sample more like these" / "add to universe" act on. A set, in
+   * pick order. Persisted like `fitSel`: picking 200 images is work.
+   */
+  mapSel: string[]
+  setMapSel: (rels: string[]) => void
+  toggleMapSel: (rel: string) => void
+  addMapSel: (rels: string[]) => void
+  removeMapSel: (rels: string[]) => void
+  /** Universes (tag names) highlighted on the map; members keep their colour, the rest fade. */
+  mapUniverses: string[]
+  setMapUniverses: (tags: string[]) => void
+
   label: Record<string, string>
   setLabel: (id: string, value: string) => void
   /** Clear every facet + the time window, leaving scope/order/knobs alone. */
@@ -243,7 +263,12 @@ interface UIState {
    * that must not change which image is on screen.
    */
   lightboxRel: string | null
-  openLightbox: (rel: string) => void
+  /**
+   * Which registered list (features/gallery/viewerLists.ts) the viewer walks.
+   * Omitting `source` keeps the current one — that is how ←/→ navigate.
+   */
+  lightboxSource: ViewerSource | null
+  openLightbox: (rel: string, source?: ViewerSource) => void
   closeLightbox: () => void
 
   /** rel-path of the first-clicked 🧬 breed parent, or null. */
@@ -273,6 +298,8 @@ const partialize = (s: UIState) => ({
   label: s.label,
   fit: s.fit,
   fitSel: s.fitSel,
+  mapSel: s.mapSel,
+  mapUniverses: s.mapUniverses,
 })
 type Persisted = ReturnType<typeof partialize>
 
@@ -349,10 +376,30 @@ export const useUI = create<UIState>()(
         }),
       clearFitSel: () => set({ fitSel: [] }),
 
+      mapSel: [],
+      setMapSel: (rels) => set({ mapSel: [...new Set(rels)] }),
+      toggleMapSel: (rel) =>
+        set((s) => ({
+          mapSel: s.mapSel.includes(rel) ? s.mapSel.filter((r) => r !== rel) : [...s.mapSel, rel],
+        })),
+      addMapSel: (rels) =>
+        set((s) => {
+          const have = new Set(s.mapSel)
+          return { mapSel: [...s.mapSel, ...rels.filter((r) => !have.has(r) && have.add(r))] }
+        }),
+      removeMapSel: (rels) =>
+        set((s) => {
+          const drop = new Set(rels)
+          return { mapSel: s.mapSel.filter((r) => !drop.has(r)) }
+        }),
+      mapUniverses: [],
+      setMapUniverses: (mapUniverses) => set({ mapUniverses }),
+
       forgetImage: (rel) =>
         set((s) => ({
           timeline: s.timeline.filter((r) => r !== rel),
           fitSel: s.fitSel.filter((r) => r !== rel),
+          mapSel: s.mapSel.filter((r) => r !== rel),
           breedParent: s.breedParent === rel ? null : s.breedParent,
         })),
       forgetImages: (rels) => {
@@ -360,6 +407,7 @@ export const useUI = create<UIState>()(
         set((s) => ({
           timeline: s.timeline.filter((r) => !gone.has(r)),
           fitSel: s.fitSel.filter((r) => !gone.has(r)),
+          mapSel: s.mapSel.filter((r) => !gone.has(r)),
           breedParent: s.breedParent && gone.has(s.breedParent) ? null : s.breedParent,
         }))
       },
@@ -398,7 +446,9 @@ export const useUI = create<UIState>()(
       setTagFilter: (tagFilter) => set({ tagFilter }),
 
       lightboxRel: null,
-      openLightbox: (lightboxRel) => set({ lightboxRel }),
+      lightboxSource: null,
+      openLightbox: (lightboxRel, source) =>
+        set((s) => ({ lightboxRel, lightboxSource: source ?? s.lightboxSource })),
       closeLightbox: () => set({ lightboxRel: null }),
 
       breedParent: null,
@@ -406,7 +456,7 @@ export const useUI = create<UIState>()(
     }),
     {
       name: 'semantic-anarchy-ui',
-      version: 5,
+      version: 6,
       // Persisted SERVER-side (config.json -> "ui"), so the sidebar comes back
       // the same on every device that opens this dashboard. Asynchronous, hence
       // one render at the schema defaults before the stored blob lands.
@@ -431,7 +481,8 @@ export const useUI = create<UIState>()(
         // (it was eating half the labeling page). Drop the stored flag so the
         // new default applies instead of a stale "open" outliving the change.
         if (from < 4 && out.label) {
-          const { queueOpen: _drop, ...rest } = out.label
+          const rest = { ...out.label }
+          delete (rest as { queueOpen?: unknown }).queueOpen
           out = { ...out, label: rest }
         }
         // v4 -> v5: neg-mode and prompt-length got new schema defaults (mean /
@@ -443,6 +494,20 @@ export const useUI = create<UIState>()(
           const params = { ...out.params }
           if (params.neg_mode === '') delete params.neg_mode
           if (params.length_mode === 'off') delete params.length_mode
+          out = { ...out, params }
+        }
+        // v5 -> v6: reach got a fourth mode, Weirdness (distance from the root
+        // corpus, temperature solved per distribution), and it is the new
+        // default — the raw multiplier compounds on fits of generated images.
+        // Someone on plain temperature moves over at the same number: on the
+        // mined corpus a diagonal draw at T lands at weirdness ≈ T anyway.
+        if (from < 6 && out.params) {
+          const params = { ...out.params }
+          if ((params.reach ?? 'temperature') === 'temperature') {
+            params.reach = 'weirdness'
+            const t = (params.temperature ?? '').trim()
+            if (t && Number(t) > 0) params.weirdness = t
+          }
           out = { ...out, params }
         }
         return out as Persisted
@@ -466,6 +531,8 @@ export const useUI = create<UIState>()(
           fit: { ...DEFAULT_FIT, ...(p.fit ?? {}) },
           timeline: p.timeline ?? [],
           fitSel: p.fitSel ?? [],
+          mapSel: p.mapSel ?? [],
+          mapUniverses: p.mapUniverses ?? [],
         }
       },
     },

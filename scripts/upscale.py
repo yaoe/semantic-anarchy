@@ -71,6 +71,37 @@ def _load_cond(npz, backend: str):
     return data["embeds"]
 
 
+def _original_negative(backend, backend_name: str, ometa: dict, cond) -> dict:
+    """``negative=`` for refine_image: the CFG negative the ORIGINAL used (sd15/sd2).
+
+    Recorded as ``neg_mode`` (+ the ``negative`` text). ``mean`` needs the
+    distribution the original was drawn from; if that's gone, say so and fall back
+    to the model's default rather than fail the upscale.
+    """
+    import numpy as np
+
+    mode = ometa.get("neg_mode")
+    if backend_name == "sdxl" or not mode:
+        return {}
+    model = getattr(backend, "model", None)
+    if mode == "text":
+        if ometa.get("negative") is not None and model is not None:
+            model.negative_prompt = ometa["negative"] or None
+            model._neg = None
+        return {}
+    dists = None
+    if mode == "mean" and ometa.get("dist"):
+        try:
+            from semantic_anarchy.dist_paths import backend_prefix
+            dists = backend.load_dists(backend_prefix(str(ometa["dist"]), backend_name))
+        except Exception as exc:   # noqa: BLE001 -- any unreadable fit: fall back
+            print(f"[upscale] can't read {ometa['dist']} for the mean negative ({exc}); "
+                  "using the default negative", flush=True)
+            return {}
+    neg = backend._negative({"embeds": np.asarray(cond)[None]}, dists, mode)
+    return {} if neg is None else {"negative": neg}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_backend_args(parser)   # --backend/--model/--ckpt/--device/--steps/--guidance/...
@@ -139,6 +170,12 @@ def main(argv=None) -> int:
     print(f"[upscale] {w}x{h} -> {tw}x{th} (x{args.factor}, {args.interp}, /{LATENT_MULTIPLE}) "
           f"denoise={denoise} -> last {eff}/{steps} steps, guidance={guidance}, "
           f"scheduler={scheduler}, seed={seed}", flush=True)
+    # Same model: the checkpoint that drew the original, when it's still on
+    # disk and the caller didn't name one. A different checkpoint re-renders the
+    # same latents as a different picture.
+    recorded = ometa.get("model")
+    if not (args.ckpt or args.model) and recorded and Path(str(recorded)).is_file():
+        args.ckpt = str(recorded)
     print(f"[upscale] loading {backend_name} model "
           f"{args.ckpt or args.model or '(default)'} ...", flush=True)
     backend = load_backend(args, remote_ok=False)   # drives backend.model directly
@@ -146,7 +183,7 @@ def main(argv=None) -> int:
     out_img = backend.model.refine_image(
         img, size=(tw, th), interp=args.interp, num_inference_steps=steps,
         strength=denoise, guidance_scale=guidance, seed=seed, cond=cond,
-        scheduler=scheduler)
+        scheduler=scheduler, **_original_negative(backend, backend_name, ometa, cond))
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     tag = f"hires{str(args.factor).replace('.', 'p')}"
@@ -158,6 +195,8 @@ def main(argv=None) -> int:
         "factor": args.factor, "denoise": denoise, "interp": args.interp,
         "steps": steps, "denoise_steps": eff, "guidance": guidance,
         "scheduler": scheduler, "seed": seed,
+        "model": args.ckpt or args.model or "(default)",
+        "neg_mode": ometa.get("neg_mode"), "negative": ometa.get("negative"),
         "cond_reused": True, "scale": args.factor, "strength": denoise,
         "src_size": [w, h], "out_size": list(out_img.size),
     }, indent=2))

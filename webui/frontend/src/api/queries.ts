@@ -17,6 +17,7 @@ import { api } from './client'
 import type {
   AnimateRequest,
   BackendId,
+  CollectionSampleRequest,
   DistKind,
   ImageMeta,
   EvolveRequest,
@@ -318,6 +319,57 @@ export function useTagImage() {
 }
 
 /**
+ * Put many images into (or take them out of) ONE universe, keeping every other
+ * universe they wear. /api/tag takes an image's complete set, so each image's
+ * current set comes from the cached gallery row, or from /api/meta when the
+ * row isn't cached — never assumed empty, which would strip its other tags.
+ *
+ * Sequential on purpose: each call appends to labels/tags.jsonl and a few
+ * hundred small requests take seconds, which is not worth racing the writer.
+ */
+export function useBulkTag() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ rels, tag, on }: { rels: string[]; tag: string; on: boolean }) => {
+      const want = tag.trim()
+      if (!want) throw new Error('a universe needs a name')
+      const low = want.toLocaleLowerCase()
+      const rows = new Map<string, string[]>()
+      for (const items of Object.values(qc.getQueryData<Images>(qk.images) ?? {}))
+        for (const it of items) if (!rows.has(it.rel)) rows.set(it.rel, it.tags ?? [])
+      let changed = 0
+      for (const rel of rels) {
+        const have = rows.get(rel) ?? (await api.meta(rel)).label_tags ?? []
+        const wears = have.some((t) => t.toLocaleLowerCase() === low)
+        if (wears === on) continue
+        const tags = on ? [...have, want] : have.filter((t) => t.toLocaleLowerCase() !== low)
+        await api.setTags(rel, tags)
+        rows.set(rel, tags)
+        changed++
+        qc.setQueryData<Images>(qk.images, (old) =>
+          old
+            ? (Object.fromEntries(
+                Object.entries(old).map(([k, items]) => [
+                  k,
+                  items.map((it) => (it.rel === rel ? { ...it, tags } : it)),
+                ]),
+              ) as Images)
+            : old,
+        )
+        qc.setQueryData<ImageMeta>(qk.meta(rel), (old) => (old ? { ...old, label_tags: tags } : old))
+      }
+      return { changed, tag: want }
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: qk.tags })
+      qc.invalidateQueries({ queryKey: qk.labelFacets })
+      qc.invalidateQueries({ queryKey: ['labelQueue'] })
+      qc.invalidateQueries({ queryKey: ['fitCandidates'] })
+    },
+  })
+}
+
+/**
  * Animate one image (AnimateDiff). Queued like every other GPU action, so it
  * takes its turn behind whatever is running rather than fighting it for VRAM.
  * The result lands in outputs/films/, which is why this refreshes the film list
@@ -584,6 +636,9 @@ export const useScore = () => useJobMutation<void>(() => api.score())
 export const useInvert = () => useJobMutation((b: InvertRequest) => api.invert(b))
 /** Latent-travel film through the timeline's keyframes (POST /api/film). */
 export const useFilm = () => useJobMutation((b: FilmRequest) => api.film(b))
+/** 🪐 "More like these" from a set of real images (POST /api/collection/sample). */
+export const useSampleCollection = () =>
+  useJobMutation((b: CollectionSampleRequest) => api.sampleCollection(b))
 export const useGenPrompt = () =>
   useJobMutation((b: GenPromptRequest) => api.genprompt(b))
 

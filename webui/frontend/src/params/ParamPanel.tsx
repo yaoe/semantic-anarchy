@@ -1,6 +1,7 @@
 import { useMemo, type ReactNode } from 'react'
 
-import { useConfig, useServers, useTasteBand } from '../api/queries'
+import { useConfig, useDistConfig, useServers, useTasteBand } from '../api/queries'
+import type { BackendId } from '../api/types'
 import { cn } from '../lib/utils'
 import { useUI } from '../store'
 import { Field } from './Field'
@@ -43,10 +44,12 @@ export function ParamPanel({ after }: { after?: Partial<Record<GroupId, ReactNod
   const { data: config } = useConfig()
   const { data: tasteband } = useTasteBand()
   const { data: servers } = useServers()
+  const backend = values.backend as BackendId
+  const { data: dist } = useDistConfig(backend, backend === 'sdxl' ? values.model : null)
 
   const ctx: Ctx = useMemo(
-    () => ({ values, config, tasteband, servers }),
-    [values, config, tasteband, servers],
+    () => ({ values, config, tasteband, servers, dist }),
+    [values, config, tasteband, servers, dist],
   )
 
   const byGroup = useMemo(() => {

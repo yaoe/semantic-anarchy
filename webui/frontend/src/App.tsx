@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 import { useCancel, useJobState, useRefreshOnJobFinish } from './api/queries'
 import type { TabKey } from './api/types'
 import { Gallery } from './features/gallery/Gallery'
+import { Lightbox } from './features/gallery/Lightbox'
 import { Filters } from './features/gallery/Filters'
 import { JobList } from './features/jobs/JobList'
 import { DistPicker } from './features/distribution/DistPicker'
@@ -16,6 +17,7 @@ import { AnimateBar } from './features/animate/AnimateBar'
 import { RefineBar } from './features/refine/RefineBar'
 import { AnalyzeBar } from './features/taste/AnalyzeBar'
 import { FitLink } from './features/fit/FitLink'
+import { UniverseBar } from './features/universes/UniverseBar'
 import { ScoreBar } from './features/taste/ScoreBar'
 import { WipeDialog } from './features/taste/WipeDialog'
 import { ParamPanel } from './params/ParamPanel'
@@ -163,6 +165,9 @@ export default function App() {
             }
           />
 
+          {/* Every aesthetic universe as a button: show it, sample more like it. */}
+          <UniverseBar />
+
           {ACTIONABLE.includes(tab) && toolsOpen ? (
             <div className="sa-panel flex shrink-0 flex-wrap items-end gap-2.5 px-3 py-2.5">
               <RefineBar />
@@ -186,6 +191,10 @@ export default function App() {
           <Gallery busy={busy} />
         </main>
       </div>
+
+      {/* The ONE fullscreen viewer. Every surface opens it with
+          openLightbox(rel, source) and registers the list ←/→ should walk. */}
+      <Lightbox />
     </div>
   )
 }

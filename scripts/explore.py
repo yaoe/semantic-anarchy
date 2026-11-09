@@ -59,17 +59,57 @@ def _load_anchor(png: Path) -> dict:
     return {k: data[k] for k in data.files}
 
 
-def replay_source_params(args, src: Path) -> dict:
-    """``--stay-local``: copy how ``src`` was rendered onto ``args``, and return
-    its sidecar, for what can't be copied (noise seed, distribution)."""
+RENDER_FIELDS = ("steps", "guidance", "scheduler", "neg_mode", "negative")
+
+
+def _source_size(src: Path):
+    """The source's TRUE pixel size (sidecars of old explore children recorded none)."""
+    try:
+        from PIL import Image
+        with Image.open(src) as im:
+            return im.size
+    except OSError:
+        return None
+
+
+def replay_source_params(args, src: Path, overwrite: bool = False) -> dict:
+    """Render the children the way ``src`` was rendered; return its sidecar.
+
+    An image's look is its conditioning *and* how it was rendered: the same
+    ``.npz`` through another checkpoint, size, scheduler or CFG negative is a
+    different picture -- coherent with its siblings, unlike its parent (the
+    "explore gives a consistent batch that looks nothing like the seed" bug).
+    So by default every render knob the user did NOT pass explicitly is copied
+    from the source: checkpoint, steps, guidance, scheduler, negative, and the
+    source's true pixel size. ``overwrite`` (``--stay-local``'s old meaning)
+    copies them even over explicit flags.
+    """
     try:
         meta = json.loads(src.with_suffix(".json").read_text())
     except (OSError, ValueError):
         print(f"[explore] {src.name} has no readable params; rendering with the defaults")
-        return {}
-    for field in ("steps", "guidance", "height", "width", "scheduler", "neg_mode", "negative"):
-        if meta.get(field) is not None:
-            setattr(args, field, meta[field])
+        meta = {}
+    copied = []
+    for field in RENDER_FIELDS:
+        val = meta.get(field)
+        if val is None:
+            continue
+        cur = getattr(args, field, None)
+        unset = cur is None or (field == "scheduler" and cur == "default")
+        if overwrite or unset:
+            if cur != val:
+                copied.append(f"{field}={val}")
+            setattr(args, field, val)
+    size = _source_size(src)
+    if size and (overwrite or (args.width is None and args.height is None)):
+        args.width, args.height = size
+        copied.append(f"size={size[0]}x{size[1]}")
+    model = meta.get("model")
+    if (model and not (args.ckpt or args.model) and Path(str(model)).is_file()):
+        args.ckpt = str(model)
+        copied.append(f"ckpt={Path(model).name}")
+    if copied:
+        print(f"[explore] rendering like {src.name}: " + ", ".join(copied))
     return meta
 
 
@@ -100,9 +140,14 @@ def main(argv=None) -> int:
     parser.add_argument("--mutate", type=float, default=0.15,
                         help="breed: mutation radius added to each child")
     parser.add_argument("--stay-local", action="store_true",
-                        help="render every child the way --src was rendered: its noise "
-                             "seed, size, steps, guidance, scheduler and negative, so the "
-                             "only thing that differs from the parent is the perturbation")
+                        help="also reuse --src's noise seed (and let its render settings "
+                             "win over explicit flags), so the only thing that differs "
+                             "from the parent is the perturbation")
+    parser.add_argument("--fresh-render", action="store_true",
+                        help="do NOT copy --src's render settings (checkpoint, size, steps, "
+                             "guidance, scheduler, negative); use the flags/defaults instead. "
+                             "Off by default: a child rendered differently from its parent "
+                             "stops looking like it")
     parser.add_argument("--n", type=int, default=6)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -116,8 +161,9 @@ def main(argv=None) -> int:
         raise SystemExit("[explore] breed mode needs --b <second parent image>")
     if not (args.model or args.ckpt):
         args.backend = _detect_backend(args.src)
-    source = replay_source_params(args, args.src) if args.stay_local else {}
-    child_seed = source.get("image_seed")
+    source = ({} if args.fresh_render
+              else replay_source_params(args, args.src, overwrite=args.stay_local))
+    child_seed = source.get("image_seed") if args.stay_local else None
     resolve_gen_defaults(args)
 
     seed = args.seed
@@ -142,7 +188,7 @@ def main(argv=None) -> int:
 
     dists = backend.load_dists(dist_prefix(args, str(args.dist)))
     anchor = _load_anchor(args.src)
-    anchor_dist = backend.distance(dists, anchor)
+    anchor_dist = backend.weirdness(dists, anchor)
     print(f"[explore] anchor distance from corpus center: {anchor_dist:.2f}")
 
     if args.mode == "neighborhood":
@@ -183,7 +229,7 @@ def main(argv=None) -> int:
         save_image(img, path)
         one = {k: np.asarray(v)[i] for k, v in named.items()}
         np.savez(path.with_suffix(".npz"), **one)
-        d = backend.distance(dists, one)
+        d = backend.weirdness(dists, one)
         meta = {
             "kind": "explore", "experiment": experiment,
             "mode": args.mode, "backend": args.backend,
@@ -201,6 +247,8 @@ def main(argv=None) -> int:
             "steps": args.steps, "guidance": args.guidance,
             "scheduler": args.scheduler, "neg_mode": args.neg_mode,
             "negative": effective_negative(backend, args.neg_mode),
+            "height": args.height, "width": args.width,
+            "render_from": (None if args.fresh_render else args.src.name),
             "batch_seed": seed,
             "image_seed": seed + i if child_seed is None else child_seed, "index": i,
             "distance": round(d, 3), "anchor_distance": round(anchor_dist, 3),

@@ -23,6 +23,15 @@ const ICON: Record<string, string> = {
  * form value — it survives a restart and applies to every action, so it lives
  * here rather than in params/schema.ts.
  */
+/** The checkpoint a mined corpus was encoded with: the `__<slug>` its file
+ *  name carries when it has one (a `.npz` picked directly can be another
+ *  checkpoint's), else the active checkpoint it was resolved for. */
+function encodedWith(d: { base: string; model: { name: string } } | undefined): string {
+  const tail = d?.base.split('/').pop() ?? ''
+  const i = tail.lastIndexOf('__')
+  return i > 0 ? tail.slice(i + 2).replace(/_(sd2|sdxl|flux2|krea2)$/, '') : (d?.model.name ?? '?')
+}
+
 export function DistPicker() {
   const backend = useUI((s) => s.params.backend) as BackendId
   const modelKey = useUI((s) => s.params.model)
@@ -59,9 +68,19 @@ export function DistPicker() {
             ? `fitted from ${data.fit.n_samples ?? meta.n_samples} images · ` +
               `${meta.feature_shape.join('×')}` +
               (data.fit.models?.length ? ` · ${data.fit.models.join(', ')}` : '')
-            : `${meta.n_samples} prompts · ${meta.feature_shape.join('×')} · encoded with ${data?.model.name}`}
+            : `${meta.n_samples} prompts · ${meta.feature_shape.join('×')} · encoded with ${encodedWith(data)}`}
       </p>
       {data?.fit?.note ? <p className="sa-hint">{data.fit.note}</p> : null}
+      {/* The same latents through another checkpoint are a different picture —
+          measured: the checkpoint is the single biggest reason "more of these"
+          stops looking like these. */}
+      {data?.fit?.models?.length && data.model.slug && !data.fit.models.includes(data.model.slug) ? (
+        <p className="sa-hint text-err">
+          these images were rendered with {data.fit.models.join(', ')}, but the checkpoint
+          above is {data.model.slug} — samples won’t look like them. Switch the checkpoint, or
+          use 🪐 sample-universe, which renders each image with its own.
+        </p>
+      ) : null}
       {/* A fit mined before the length split / radius band exists happily, but
           the knobs that read them silently do nothing — say so here rather than
           letting a run quietly ignore the setting you came for. A selection fit

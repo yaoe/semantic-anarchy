@@ -10,7 +10,7 @@
  * accepts has a home. `id` is the RunRequest field name; the handful of knobs
  * that are client-side only (aspect) carry `send: false`.
  */
-import type { Config, RunRequest, ServerRow, ServersResponse, TasteBand } from '../api/types'
+import type { Config, DistRow, RunRequest, ServerRow, ServersResponse, TasteBand } from '../api/types'
 import { evalExpr } from '../lib/calc'
 
 /* ------------------------------------------------------------------ types */
@@ -31,6 +31,8 @@ export interface Ctx {
   tasteband?: TasteBand
   /** GET /api/servers — where an sd15 job can run (local / ComfyUI boxes). */
   servers?: ServersResponse
+  /** The distribution this backend samples from (for the weirdness hint). */
+  dist?: DistRow
 }
 
 export type Dyn<T> = T | ((ctx: Ctx) => T)
@@ -157,9 +159,11 @@ function usesSamplerKnobs(v: Values): boolean {
  * Anything other than `generate` is always on plain temperature, because that
  * is the only action whose argv can carry the other two.
  */
-export function reachMode(v: Values): 'temperature' | 'shell' | 'band' {
+export function reachMode(v: Values): 'weirdness' | 'temperature' | 'shell' | 'band' {
   if (v.action !== 'generate') return 'temperature'
-  return v.reach === 'shell' || v.reach === 'band' ? v.reach : 'temperature'
+  if (v.reach === 'shell' || v.reach === 'band' || v.reach === 'temperature') return v.reach
+  // hybrid SLERPs real corpus chords: there is no deviation for weirdness to scale.
+  return v.sampler === 'hybrid' ? 'temperature' : 'weirdness'
 }
 
 /** Native resolution per backend — drives the aspect-ratio presets. */
@@ -512,6 +516,11 @@ export const PARAM_SCHEMA: ParamField[] = [
       const off = (values.temp_off ?? '').trim() === '' ? 1 : Number(values.temp_off)
       if (values.action === 'temp_sweep')
         return { text: `each swept temperature multiplies both: T·${on} on-manifold, T·${off} off.`, tone: 'dim' }
+      if (reachMode(values) === 'weirdness')
+        return {
+          text: `weirdness solves the overall scale, so only the RATIO matters here — ${on}:${off} on/off-manifold.`,
+          tone: 'dim',
+        }
       if (reachMode(values) !== 'temperature')
         return {
           text: `radius is pinned below, so only the RATIO matters here — ${on}:${off} on/off-manifold.`,
@@ -600,10 +609,18 @@ export const PARAM_SCHEMA: ParamField[] = [
     type: 'segmented',
     group: 'reach',
     span: 2,
-    default: 'temperature',
+    default: 'weirdness',
     send: false, // pure UI: it selects WHICH reach flag build_argv receives
     when: { action: GEN_ONLY },
     options: [
+      {
+        value: 'weirdness',
+        label: 'Weirdness',
+        title:
+          'How far from the prompt corpus, as the same d number the gallery shows. The ' +
+          'temperature is solved for whatever distribution is selected, so 1.7 means the ' +
+          'same on the corpus and on a fit of images that were themselves drawn at 1.7.',
+      },
       {
         value: 'temperature',
         label: 'Temperature',
@@ -636,8 +653,22 @@ export const PARAM_SCHEMA: ParamField[] = [
     when: { action: GEN_ONLY },
     hint: ({ values }) => {
       const m = reachMode(values)
+      if (m === 'weirdness')
+        return {
+          text:
+            'Weirdness = distance from the prompt corpus (the d on every card). The multiplier ' +
+            'that gets there is solved per distribution, so it never compounds.',
+          tone: 'dim',
+        }
       if (m === 'temperature')
-        return { text: 'Distance from the corpus centre is left to the draw itself.', tone: 'dim' }
+        return {
+          text:
+            values.reach === 'weirdness' && values.sampler === 'hybrid'
+              ? 'hybrid has no deviation to scale, so it stays on plain temperature.'
+              : 'Raw multiplier on THIS distribution’s spread — on a fit of images drawn at ' +
+                'T>1 it compounds. Weirdness avoids that.',
+          tone: 'dim',
+        }
       // hybrid's T is a jitter weight, not a scale factor, so it is the one
       // sampler a pinned radius does not cancel — the note must not claim it does.
       const tail =
@@ -659,6 +690,39 @@ export const PARAM_SCHEMA: ParamField[] = [
               `sphere. ${tail} Needs a fit mined with the radius band.`,
         tone: 'dim',
       }
+    },
+  },
+  {
+    id: 'weirdness',
+    type: 'number',
+    group: 'reach',
+    label: 'Weirdness',
+    step: 0.1,
+    placeholder: '1.7',
+    default: '1.7',
+    // Sent as null whenever hidden: a weirdness reaching argv overrides temperature.
+    hidden: '',
+    cast: 'number',
+    span: 2,
+    when: { action: GEN_ONLY },
+    visible: (v) => reachMode(v) === 'weirdness',
+    tooltip:
+      'target distance from the ROOT prompt corpus — the d number on every gallery card. ' +
+      '1.0 ≈ a real prompt, 1.3–2 = the interesting off-grid band, higher = noise. ' +
+      'The sampler’s temperature is solved so the batch lands here on average, measured ' +
+      'in the corpus’s frame even when the selected distribution is a 🧬 fit of generated ' +
+      'images (whose own spread already carries the temperature they were drawn at).',
+    hint: ({ dist, tasteband }) => {
+      const mw = dist?.fit?.member_weirdness
+      if (mw != null)
+        return {
+          text:
+            `this fit’s images sit at d≈${mw.toFixed(2)} — use that for “more like these”` +
+            (dist?.fit?.reference ? '' : ' (fit has no root corpus: measured in its own frame)'),
+        }
+      return tasteband?.count
+        ? { text: `your ★ keepers sit at d≈${tasteband.mean} (band ${tasteband.p25}–${tasteband.p75})`, tone: 'dim' }
+        : null
     },
   },
   {

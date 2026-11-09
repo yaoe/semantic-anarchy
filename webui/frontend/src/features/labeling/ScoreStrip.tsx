@@ -27,7 +27,8 @@ export function ScoreStrip({
   score: number | null
   fav: boolean
   onPick: (s: number) => void
-  onStar: () => void
+  /** Omit to drop the star button (the viewer has it in its action toolbar). */
+  onStar?: () => void
   disabled?: boolean
 }) {
   return (
@@ -63,14 +64,16 @@ export function ScoreStrip({
       ) : (
         <span className="w-[84px]" />
       )}
-      <button
-        className={cn('sa-btn w-[104px] !py-0 text-[13px]', fav && 'sa-btn-sel')}
-        disabled={disabled}
-        onClick={onStar}
-        title="star (s) — keeps the existing taste loop fed"
-      >
-        {fav ? '★ starred' : '☆ star'}
-      </button>
+      {onStar ? (
+        <button
+          className={cn('sa-btn w-[104px] !py-0 text-[13px]', fav && 'sa-btn-sel')}
+          disabled={disabled}
+          onClick={onStar}
+          title="star (s) — keeps the existing taste loop fed"
+        >
+          {fav ? '★ starred' : '☆ star'}
+        </button>
+      ) : null}
     </div>
   )
 }

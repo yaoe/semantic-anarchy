@@ -644,7 +644,7 @@ class SDModel:
     def refine_image(self, image, scale: float = 2.0, num_inference_steps: int = 50,
                      strength: float = 0.35, guidance_scale: float = 1.0,
                      seed: Optional[int] = None, cond=None, scheduler=None,
-                     size=None, interp: str = "lanczos"):
+                     size=None, interp: str = "lanczos", negative=None):
         """Upscale + add denoising steps to an existing image (img2img hires-fix).
 
         The image is Lanczos-upscaled to ``scale x`` then run through an img2img
@@ -661,6 +661,8 @@ class SDModel:
         ``size``: explicit ``(w, h)`` target, overriding ``scale`` -- how
             ``scripts/upscale.py`` pins a 16-px-aligned resolution.
         ``interp``: resampling filter for the enlarge (lanczos/bicubic/nearest).
+        ``negative``: the CFG negative embedding the ORIGINAL render used (None =
+            :meth:`negative_embedding`). A different negative is a different look.
         """
         import torch
         from diffusers import AutoPipelineForImage2Image
@@ -685,8 +687,11 @@ class SDModel:
                       num_inference_steps=num_inference_steps,
                       guidance_scale=guidance_scale)
         if guidance_scale > 1.0:
-            neg = torch.from_numpy(np.asarray(self.negative_embedding(), dtype=np.float32)).to(
-                self.device, dtype=param_dtype)
+            neg = np.asarray(self.negative_embedding() if negative is None else negative,
+                             dtype=np.float32)
+            neg = torch.from_numpy(neg).to(self.device, dtype=param_dtype)
+            if neg.ndim == 2:
+                neg = neg[None]
             kwargs["negative_prompt_embeds"] = neg
         if seed is not None:
             kwargs["generator"] = torch.Generator(device=self.device).manual_seed(seed)

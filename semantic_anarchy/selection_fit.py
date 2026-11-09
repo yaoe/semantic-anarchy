@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import zipfile
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -241,3 +242,36 @@ def save_fit(
     mined fit's without a pipeline ever being constructed.
     """
     return dist_backend(backend).save_dists(dists, backend_prefix(base, backend))
+
+
+def infer_reference(npz_paths: Iterable[str | Path]) -> list[str]:
+    """The distribution bases these latents were measured against, commonest first.
+
+    Every image sidecar records the ``dist`` it was sampled from (or explored
+    against). The commonest *readable* one is the fit's root corpus -- what "how
+    weird" is measured in once the fit itself is sampled. Empty if none says.
+    """
+    counts: dict[str, int] = {}
+    for npz in npz_paths:
+        try:
+            meta = json.loads(Path(npz).with_suffix(".json").read_text())
+        except (OSError, ValueError):
+            continue
+        d = meta.get("dist")
+        if d:
+            counts[str(d)] = counts.get(str(d), 0) + 1
+    return sorted(counts, key=counts.get, reverse=True)
+
+
+def attach_reference(dists: dict[str, EmbeddingDistribution], ref_base: str | Path,
+                     backend: str) -> bool:
+    """Give each fitted tensor the weirdness frame of ``ref_base`` (or of ITS root,
+    when ``ref_base`` is itself a fit of generated images). False if unreadable."""
+    try:
+        refs = dist_backend(backend).load_dists(backend_prefix(str(ref_base), backend))
+        for k, d in dists.items():
+            d.set_reference(refs[k])
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+        print(f"[fit] can't use {ref_base} as the weirdness reference ({exc})")
+        return False
+    return True

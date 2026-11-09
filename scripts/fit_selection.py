@@ -27,12 +27,15 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from semantic_anarchy.backend import dist_backend
 from semantic_anarchy.dist_paths import model_slug
 from semantic_anarchy.io_utils import find_image
 from semantic_anarchy.selection_fit import (
+    attach_reference, infer_reference,
     FIT_DIR, MIN_SAMPLES, fit_base, fit_latents, latents_for, save_fit,
     slug_name, stack_latents, write_manifest,
 )
@@ -79,6 +82,10 @@ def main(argv=None) -> int:
                              "of the selection")
     parser.add_argument("--max-corpus", type=int, default=256,
                         help="raw latents retained for the hybrid sampler")
+    parser.add_argument("--ref-dist", default=None,
+                        help="root corpus base that weirdness is measured against when "
+                             "this fit is sampled (default: the dist most of the "
+                             "images' sidecars name)")
     parser.add_argument("--note", default=None,
                         help="free text stored in the manifest (what this set is)")
     args = parser.parse_args(argv)
@@ -145,13 +152,28 @@ def main(argv=None) -> int:
         print(f"[fit] {k}: {d.n_samples} latents · {shape} · {axes} PCA axes · "
               f"{d.pca_variance_fraction():.1%} of the selection's variance")
 
+    # The weirdness frame: the corpus these images were drawn from, so sampling
+    # the fit at "weirdness 1.7" means the same as on the corpus (no compounding).
+    ref = next((r for r in ([args.ref_dist] if args.ref_dist else infer_reference(used))
+                if attach_reference(dists, r, args.backend)), None)
+    # How weird the picked images themselves are -- the natural "more like these"
+    # setting, offered by the sidebar as the weirdness default for this fit.
+    first = next(iter(dists))
+    member_w = float(np.median([dists[first].weirdness(x) for x in stacked[first]]))
+    if ref:
+        print(f"[fit] weirdness measured against {ref}; the picked images sit at "
+              f"{member_w:.2f}")
+    else:
+        print("[fit] no readable root corpus -- weirdness on this fit is relative "
+              "to the selection's own spread")
     written = save_fit(dists, base, args.backend)
     manifest = write_manifest(
         base, args.backend,
         [str(p.with_suffix("")) for p in used],
         name=name, note=args.note, models=models,
         skipped=[(str(p), why) for p, why in [*missing, *skipped]],
-        extra={"components": args.components or None,
+        extra={"components": args.components or None, "reference": ref,
+               "member_weirdness": round(member_w, 3),
                "feature_shape": [list(d.feature_shape) for d in dists.values()]},
     )
     print(f"[fit] fitted {n} latent(s) -> {', '.join(map(str, written))}")

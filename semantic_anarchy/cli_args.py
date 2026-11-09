@@ -8,6 +8,7 @@ that in one place.
 from __future__ import annotations
 
 import argparse
+from typing import Optional
 import sys
 
 import numpy as np
@@ -171,6 +172,33 @@ def sampler_kwargs(args, lengths=None) -> dict:
         temp_off=getattr(args, "temp_off", 1.0),
         lengths=lengths,
     )
+
+
+def apply_weirdness(args, dists: dict, lengths=None, log=print) -> Optional[dict]:
+    """``--weirdness W`` -> the ``args.temperature`` that lands this batch at W.
+
+    Weirdness is the RMS z-distance from the ROOT prompt corpus (the gallery's
+    ``d`` number), so it means the same on a mined corpus, a selection fit or an
+    evolved branch -- where a raw temperature compounds with whatever spread the
+    fitted images already carried. Solved on the first tensor and applied to all,
+    so a multi-tensor conditioning set stays sampled with one knob set. Returns
+    the solver's info dict (None when no weirdness was asked for).
+    """
+    w = getattr(args, "weirdness", None)
+    if w is None:
+        return None
+    name, dist = next(iter(dists.items()))
+    kw = sampler_kwargs(args, lengths)
+    t, info = dist.temperature_for(w, **kw)
+    args.temperature = round(t, 4)
+    frame = "root corpus" if dist.ref_mean is not None else "this distribution"
+    log(f"[weird] weirdness {w} -> temperature {args.temperature} on {name} "
+        f"(centre sits at {info['center']}, a unit draw adds {info['unit']}; "
+        f"measured against {frame})")
+    if info["clamped"]:
+        log(f"[weird] note: {w} is below this distribution's own centre "
+            f"({info['center']}), so every sample is the centre (T=0)")
+    return info
 
 
 def neg_dists_kwarg(args, dists) -> dict:

@@ -468,7 +468,8 @@ def describe_dist(backend: str, kind: str, path: Optional[str],
         "files": [{"path": str(f), "exists": f.is_file()} for f in files],
         "meta": dist_paths.dist_meta(_abs_base(base), backend) if ready else None,
         "fit": {k: man.get(k) for k in
-                ("name", "n_samples", "note", "created", "models")} if man else None,
+                ("name", "n_samples", "note", "created", "models", "reference",
+                  "member_weirdness")} if man else None,
         "model": {
             "path": model,
             "name": Path(model).name if Path(model).is_absolute() else model,
@@ -998,6 +999,7 @@ class RunRequest(BaseModel):
     model: Optional[str] = None       # sdxl model key (SDXL_MODELS)
     sampler: str = "diagonal"
     temperature: Optional[float] = None
+    weirdness: Optional[float] = None   # reach as distance from the ROOT corpus (solves T)
     n: Optional[int] = None
     seed: Optional[int] = None
     steps: Optional[int] = None
@@ -1204,7 +1206,11 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
                        *_experiment_flags(req.experiment, req.hypothesis)]
         if req.n is not None:
             argv += ["--n", str(req.n)]
-        if req.temperature is not None:
+        if req.weirdness is not None:
+            if not 0.0 <= req.weirdness <= 20.0:
+                raise HTTPException(400, "weirdness must be in [0, 20]")
+            argv += ["--weirdness", str(float(req.weirdness))]
+        elif req.temperature is not None:
             argv += ["--temperature", str(req.temperature)]
         if req.target_distance is not None:
             argv += ["--target-distance", str(req.target_distance)]
@@ -1232,7 +1238,8 @@ def build_argv(req: RunRequest) -> tuple[str, list[str]]:
                 argv += ["--init-strength", str(req.init_strength)]
         exp = labelset.clean_experiment_id(req.experiment)
         label = (f"generate · {req.backend} · {req.sampler} · "
-                 f"T={req.temperature or 1.0} · n={req.n or 8}"
+                 + (f"W={req.weirdness}" if req.weirdness is not None
+                    else f"T={req.temperature or 1.0}") + f" · n={req.n or 8}"
                  + (f" · {exp}" if exp else ""))
         return label, argv
 
@@ -1614,7 +1621,10 @@ def api_refine(req: RefineRequest) -> JSONResponse:
             raise HTTPException(400, f"{obackend} latents can't be replayed; use the FLUX engine")
         if req.interp not in INTERPS:
             raise HTTPException(400, f"bad interp {req.interp!r}")
-        model = _model_flags(RunRequest(action="refine", backend=obackend, server=LOCAL_SERVER))
+        # Same model as the original, not the sidebar's pick (see _source_checkpoint).
+        model = (_source_checkpoint(origin)
+                 or _model_flags(RunRequest(action="refine", backend=obackend,
+                                            server=LOCAL_SERVER)))
         argv = [PYTHON, "-u", "scripts/upscale.py", "--backend", obackend, *model,
                 "--src", str(src), "--factor", str(req.scale),
                 "--denoise", str(req.strength), "--interp", req.interp]
@@ -1710,6 +1720,15 @@ def _explorable_source(p: Path) -> Path:
         400, f"{p.name} has no conditioning sidecar (and no traceable original)")
 
 
+def _sidecar(img: Path) -> dict:
+    """An image's ``.json`` params, or {} when it has none / is unreadable."""
+    try:
+        meta = json.loads(img.with_suffix(".json").read_text())
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _source_checkpoint(src: Path) -> list[str]:
     """``--ckpt`` for the checkpoint that rendered ``src``, if it is still on disk."""
     try:
@@ -1736,14 +1755,20 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
             break
     lane, url = resolve_server(backend, req.server)
     model = _model_flags(RunRequest(action="explore", backend=backend, server=req.server))
+    # A child must be rendered the way its parent was -- same checkpoint, size,
+    # scheduler, steps, CFG and negative -- or it stops looking like it (the
+    # conditioning is only half of an image's look). explore.py copies every
+    # render knob it isn't handed explicitly from the source's sidecar, so this
+    # passes the SOURCE's checkpoint and no scheduler/steps/guidance of its own.
+    # A remote ComfyUI lane has its own checkpoint and keeps it.
+    if not url:
+        model = _source_checkpoint(src) or model
     # Measure the radius against whatever corpus is selected, like every other
     # sampling action, not always the repo's own outputs/dist.
-    if req.stay_local and not url:
-        model = _source_checkpoint(src) or model
     argv = [python_for(backend), "-u", "scripts/explore.py", "--backend", backend, *model,
             "--dist", resolve_dist_base(backend),
             "--mode", req.mode, "--src", str(src),
-            "--n", str(int(req.n)), "--scheduler", "ddim"]
+            "--n", str(int(req.n))]
     if req.stay_local:
         argv.append("--stay-local")
     if req.mode == "breed":
@@ -1764,9 +1789,15 @@ def api_explore(req: ExploreRequest) -> JSONResponse:
         label = f"explore · {backend} · {src.name} · r={req.radius}"
     # Backfill steps/guidance so SDXL never falls through to the turbo family
     # defaults (1 step / no CFG) -- children must render with real CFG.
+    # Explicit steps/guidance win; otherwise explore.py copies the source's. Only
+    # an sdxl source that recorded neither gets the model family's real-CFG
+    # defaults, so it never falls through to turbo's 1 step / no CFG.
+    recorded = _sidecar(src)
     d = SDXL_MODEL_DEFAULTS.get(SDXL_DEFAULT_MODEL, {}) if backend == "sdxl" else {}
-    steps = req.steps if req.steps is not None else d.get("steps")
-    guidance = req.guidance if req.guidance is not None else d.get("guidance")
+    steps = req.steps if req.steps is not None else (
+        None if recorded.get("steps") is not None else d.get("steps"))
+    guidance = req.guidance if req.guidance is not None else (
+        None if recorded.get("guidance") is not None else d.get("guidance"))
     if steps is not None:
         argv += ["--steps", str(int(steps))]
     if guidance is not None:
@@ -2295,7 +2326,7 @@ UNTAGGED = "__none__"
 #: Fields of the sidecar the labeling page shows above the image. Small type,
 #: collapsible — the label stays perceptual, not analytical.
 LABEL_KNOB_KEYS = (
-    "kind", "sampler", "temperature", "coherence", "components", "comp_lo",
+    "kind", "sampler", "weirdness", "temperature", "coherence", "components", "comp_lo",
     "equalize", "truncation", "steps", "guidance", "scheduler", "neg_mode",
     "target_distance", "min_distance", "mode", "radius", "step", "direction",
 )
@@ -3858,6 +3889,72 @@ def api_fit(req: FitRequest) -> JSONResponse:
         # the new fit without knowing the naming stack.
         "file": str(dist_paths.dist_files(target, backend)[0]),
     })
+
+
+# ---- 🪐 sampling inside an aesthetic universe -------------------------------
+# "More of THIS": a set of images (a tag/universe, a map selection, the Fit
+# selection) -> new images that belong with them. scripts/sample_collection.py
+# owns the method (see docs/reference/collection-sampling.md); this only
+# validates, writes the selection to a file and queues it.
+COLLECTION_DIR = OUTPUTS / "collections"
+MAX_COLLECTION_IMAGES = 2000
+_METHOD_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
+
+
+class CollectionSampleRequest(BaseModel):
+    rels: list[str]                    # the members (outputs-relative)
+    method: str = "auto"
+    spread: float = 0.5                # 0 = on the members, 1 = their own diversity, >1 = beyond
+    n: int = 8
+    name: Optional[str] = None         # the universe's name, if it has one (for the label)
+    experiment: Optional[str] = None
+    hypothesis: Optional[str] = None
+
+
+@app.post("/api/collection/sample")
+def api_collection_sample(req: CollectionSampleRequest) -> JSONResponse:
+    rels = list(dict.fromkeys(r for r in req.rels if r))
+    if not rels:
+        raise HTTPException(400, "nothing selected")
+    if len(rels) > MAX_COLLECTION_IMAGES:
+        raise HTTPException(400, f"{len(rels)} images — the cap is {MAX_COLLECTION_IMAGES}")
+    if not _METHOD_RE.match(req.method or ""):
+        raise HTTPException(400, f"bad method {req.method!r}")
+    if not 0.0 <= float(req.spread) <= 4.0:
+        raise HTTPException(400, "spread must be in [0, 4]")
+    if not 1 <= int(req.n) <= 64:
+        raise HTTPException(400, "n must be in [1, 64]")
+    paths, backends = [], {}
+    for rel in rels:
+        try:
+            p = _explorable_source(_resolve_output_image(rel))
+        except HTTPException:
+            continue                   # an upscale with no traceable original, a gone file
+        paths.append(str(p))
+        b = next((b for b in ("flux2", "krea2", "sdxl", "sd2") if f"anarchy_{b}_" in p.name), "sd15")
+        backends[b] = backends.get(b, 0) + 1
+    if not paths:
+        raise HTTPException(400, "none of these images carries conditioning latents")
+    backend = max(backends, key=backends.get)
+    if len(backends) > 1:
+        others = ", ".join(f"{k}×{v}" for k, v in backends.items() if k != backend)
+        raise HTTPException(400, f"the selection mixes backends ({others} alongside "
+                                 f"{backend}×{backends[backend]}) — pick one backend's images")
+    if backend != "sd15":
+        raise HTTPException(400, f"universe sampling is sd15-only for now ({backend} selected)")
+    COLLECTION_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    sources = COLLECTION_DIR / f"{stamp}-{len(paths)}.sources.json"
+    sources.write_text(json.dumps(paths, indent=1))
+    argv = [PYTHON, "-u", "scripts/sample_collection.py", "--backend", backend,
+            "--from-file", str(sources), "--method", req.method,
+            "--spread", str(float(req.spread)), "--n", str(int(req.n)),
+            "--dist", resolve_dist_base(backend),
+            *_experiment_flags(req.experiment, req.hypothesis)]
+    who = _clean_prompt(req.name)[:40] if req.name else f"{len(paths)} images"
+    label = f"universe · {who} · {req.method} · spread {req.spread} ×{req.n}"
+    job = RUNNER.submit("collection", label, argv)
+    return JSONResponse({"job_id": job.id, "label": label, "n_members": len(paths)})
 
 
 class FitDeleteRequest(BaseModel):

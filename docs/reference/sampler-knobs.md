@@ -19,6 +19,39 @@ samples = mu + temperature * dev          # distribution.py, sample()
 sampler has produced `dev`. Everything below follows from that plus one fact
 about `retarget`.
 
+## Weirdness: the default reach (temperature solved per distribution)
+
+`temperature` is an absolute multiplier on *the selected distribution's own*
+spread, so it compounds: images drawn from the corpus at T=1.7 carry that spread,
+a 🧬 fit to them inherits it, and T=1.7 on the fit lands at ~1.7×. Measured on
+the 43-image `selection-glitch` fit: members sit at weirdness 1.44, T=1.7 lands
+at 2.35.
+
+**Weirdness** = RMS z-distance from the ROOT prompt corpus — the `d` number on
+every gallery card. `EmbeddingDistribution.temperature_for(W, **sampler_kw)`
+solves `E[w²] = a + T²·b` (a = the centre's squared weirdness, b = a unit
+draw's, both measured on a 32-draw probe with the caller's exact sampler knobs
+and a private rng) → the T that lands the batch at W on average; below the
+centre it clamps to T=0. `--weirdness` in `generate.py` (via
+`cli_args.apply_weirdness`) overrides `--temperature`; hybrid refuses it (no
+deviation to scale) and the sidebar falls back to temperature there.
+
+The frame: a mined corpus is its own root (`ref_mean`/`ref_std` None). Fits of
+generated images carry their root's `ref_mean`/`ref_std` in the `.npz`:
+`fit_selection.py` takes `--ref-dist` or infers the commonest readable `dist`
+from the members' sidecars (`selection_fit.infer_reference`), and records
+`reference` + `member_weirdness` (median of the picked images — the natural
+"more like these" value, shown as the sidebar hint) in the manifest;
+`refit_from_elites` inherits its parent's frame. The sidecar `distance` from
+generate/explore/evolve is now `backend.weirdness` (root frame) — older
+fit-sampled images recorded it in the fit's own frame. Tests:
+`tests/test_weirdness.py`.
+
+Sidebar: `reach` gained `weirdness` as the default (store migration v6 moves
+anyone on plain temperature over at the same number — on the corpus a diagonal
+draw at T lands at weirdness ≈ T). Its field is `hidden: ''` so it can never
+reach argv from another mode.
+
 ## Reach: temperature, shell, band — pick one
 
 `retarget()` rescales a sample by `target / distance(sample)`. Distance is
