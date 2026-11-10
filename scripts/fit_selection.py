@@ -111,6 +111,9 @@ def main(argv=None) -> int:
         if npz is None:
             missing.append((raw, "no conditioning sidecar"))
             continue
+        if npz in npz_paths:    # an upscale picked alongside its own original
+            missing.append((raw, f"same latents as {npz.stem} (already in)"))
+            continue
         npz_paths.append(npz)
         try:
             meta = json.loads(npz.with_suffix(".json").read_text())

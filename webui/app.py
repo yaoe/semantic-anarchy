@@ -2456,10 +2456,12 @@ def _label_index() -> list:
             "distance": meta.get("distance"),
             "image_seed": meta.get("image_seed"),
             "parent": meta.get("refined_from") or meta.get("parent"),
-            # Does this image carry its own conditioning? One stat, cached with
-            # the rest of the row — it is what decides whether the image can go
-            # into a selection fit (an upscale carries none of its own).
-            "latents": (OUTPUTS / rel).with_suffix(".npz").is_file(),
+            # Can this image go into a selection fit? An upscale/refine carries
+            # no .npz of its own, but the fit follows its ``refined_from`` chain
+            # to the original's latents (``fitset.latents_for``), so it counts —
+            # checking only the image's own sidecar silently dropped every
+            # tagged upscale from the 🧬 Fit grid. Cached with the rest of the row.
+            "latents": fitset.latents_for(p) is not None,
             "knobs": {k: meta[k] for k in LABEL_KNOB_KEYS
                       if k in meta and meta[k] is not None},
         }
@@ -3841,9 +3843,16 @@ def api_fit(req: FitRequest) -> JSONResponse:
     target = _fit_target(req.name)
     base = str(target.relative_to(REPO)) if REPO in target.parents else str(target)
 
-    paths, backends = [], {}
+    # An upscale contributes its original's latents (fit_selection follows the
+    # refined_from chain), so an original picked alongside its own upscale is
+    # ONE sample, not two — dedupe on the .npz the fit will actually read.
+    paths, backends, seen = [], {}, set()
     for rel in rels:
         p = _resolve_output_image(rel)
+        npz = fitset.latents_for(p)
+        if npz is None or npz in seen:
+            continue
+        seen.add(npz)
         paths.append(str(p))
         b = _fit_backend_of(p.relative_to(OUTPUTS.resolve()).as_posix())
         if b:
@@ -3860,8 +3869,9 @@ def api_fit(req: FitRequest) -> JSONResponse:
                                  f"{backend}×{backends[backend]}) — a fit is per "
                                  f"backend, so filter to one first")
     if len(paths) < fitset.MIN_SAMPLES:
-        raise HTTPException(400, f"{len(paths)} image(s) selected — a fit needs at "
-                                 f"least {fitset.MIN_SAMPLES}")
+        raise HTTPException(400, f"{len(paths)} distinct latent(s) selected (an "
+                                 f"upscale shares its original's) — a fit needs "
+                                 f"at least {fitset.MIN_SAMPLES}")
 
     existing = dist_paths.dist_files(target, backend)
     if not req.overwrite and any(f.is_file() for f in existing):

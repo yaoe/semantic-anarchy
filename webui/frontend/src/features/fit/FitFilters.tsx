@@ -236,7 +236,8 @@ export function FitFilters({ matched }: { matched?: number }) {
 
         <span className="ml-auto flex items-center gap-2 text-[12px] text-dim">
           {/* "abstract 12" but 5 match: name the other filters as the reason.
-              (Images without latents, e.g. upscales, never match.) */}
+              (Upscales count via their original's latents; an image whose
+              chain leads to no .npz never matches.) */}
           {fit.tag && matched != null && otherFilters && matched < tagCount ? (
             <button
               className="sa-btn sa-btn-sm"

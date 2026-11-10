@@ -58,9 +58,12 @@ estimate of the spread behind it.
   *backends* are rejected up front (different shapes, and the minority would be
   silently dropped).
 - **Upscales carry no latents of their own.** `latents_for` follows the
-  `refined_from` chain back to the ancestor that does — but the candidate list
-  filters them out by default, because that ancestor is usually already in the
-  gallery and would otherwise be counted twice.
+  `refined_from` chain back to the ancestor that does, and the candidate grid
+  (`_label_index`'s `latents` flag) uses the same walk — so a tagged FLUX
+  upscale shows up in its universe. (It used to check only the image's own
+  `.npz`, which silently emptied universes tagged on upscales.) Double counting
+  is handled at fit time instead: `api_fit` and `fit_selection.py` dedupe on the
+  resolved `.npz`, so an original picked alongside its upscale is one sample.
 - **The fit runs on the single GPU worker queue** even though it needs no GPU,
   so it waits behind whatever is rendering. It is seconds of work; the wait can
   be minutes. Worth revisiting only if it becomes annoying.
